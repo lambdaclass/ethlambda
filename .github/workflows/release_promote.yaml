@@ -1,7 +1,8 @@
 name: Release promotion
 
 # Promotes a tested release candidate to its final version: the candidate's
-# images are re-published as `X.Y.Z` and `latest`. Nothing is recompiled. A
+# images are re-published as `X.Y.Z` and `latest` (ethrex embedded), and as
+# `X.Y.Z-minimal` and `latest-minimal` (without it). Nothing is recompiled. A
 # one-instruction `FROM <candidate>` / `ENV ETHLAMBDA_CHANNEL=stable` build keeps
 # the binary layers straight from the candidate, so the executable that ships is
 # byte-for-byte the one that was tested; only the image config gains the env var,
@@ -96,8 +97,15 @@ jobs:
           echo "Promoting $rc -> $final (+ latest)"
 
   promote:
-    name: Promote candidate images
+    name: Promote candidate images (${{ matrix.suffix || 'default' }})
     needs: resolve
+    # Both images a candidate publishes (release.yaml's candidate `variants`):
+    # the default one, ethrex embedded, and its `-minimal` twin, without it.
+    # Each is promoted under its own suffix: `X.Y.Z`/`latest` and
+    # `X.Y.Z-minimal`/`latest-minimal`.
+    strategy:
+      matrix:
+        suffix: ["", "-minimal"]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -108,6 +116,7 @@ jobs:
     env:
       RC_TAG: ${{ needs.resolve.outputs.rc_tag }}
       VERSION: ${{ needs.resolve.outputs.version }}
+      SUFFIX: ${{ matrix.suffix }}
     steps:
       - name: Log in to the Container registry
         uses: docker/login-action@v3.7.0
@@ -121,8 +130,8 @@ jobs:
 
       - name: Check the candidate image exists
         run: |
-          if ! docker buildx imagetools inspect "$IMAGE:$RC_TAG" > /dev/null; then
-            echo "::error::$IMAGE:$RC_TAG not found; was the candidate's release run green?"
+          if ! docker buildx imagetools inspect "$IMAGE:$RC_TAG$SUFFIX" > /dev/null; then
+            echo "::error::$IMAGE:$RC_TAG$SUFFIX not found; was the candidate's release run green?"
             exit 1
           fi
 
@@ -130,11 +139,11 @@ jobs:
       - name: Re-stamp the candidate as stable
         run: |
           set -euo pipefail
-          printf 'FROM %s\nENV ETHLAMBDA_CHANNEL=stable\n' "$IMAGE:$RC_TAG" > Dockerfile.promote
+          printf 'FROM %s\nENV ETHLAMBDA_CHANNEL=stable\n' "$IMAGE:$RC_TAG$SUFFIX" > Dockerfile.promote
           docker buildx build -f Dockerfile.promote \
             --platform linux/amd64,linux/arm64 \
-            -t "$IMAGE:$VERSION" \
-            -t "$IMAGE:latest" \
+            -t "$IMAGE:$VERSION$SUFFIX" \
+            -t "$IMAGE:latest$SUFFIX" \
             --push .
 
       # The re-stamped image is a new manifest, so the candidate's attestation
@@ -143,8 +152,8 @@ jobs:
         id: image
         run: |
           set -euo pipefail
-          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}')
-          echo "$IMAGE:$VERSION -> $digest"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION$SUFFIX" --format '{{.Manifest.Digest}}')
+          echo "$IMAGE:$VERSION$SUFFIX -> $digest"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Attest build provenance
@@ -155,8 +164,12 @@ jobs:
           push-to-registry: true
 
   verify:
-    name: Verify promotion
+    name: Verify promotion (${{ matrix.suffix || 'default' }})
     needs: [resolve, promote]
+    # The same two images `promote` publishes.
+    strategy:
+      matrix:
+        suffix: ["", "-minimal"]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -164,6 +177,7 @@ jobs:
       attestations: read
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
+      SUFFIX: ${{ matrix.suffix }}
     steps:
       - name: Log in to the Container registry
         uses: docker/login-action@v3.7.0
@@ -175,18 +189,18 @@ jobs:
       - name: Assert latest resolves to the promoted version
         run: |
           set -euo pipefail
-          latest=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Manifest.Digest}}')
-          pinned=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}')
-          echo "latest=$latest  $VERSION=$pinned"
+          latest=$(docker buildx imagetools inspect "$IMAGE:latest$SUFFIX" --format '{{.Manifest.Digest}}')
+          pinned=$(docker buildx imagetools inspect "$IMAGE:$VERSION$SUFFIX" --format '{{.Manifest.Digest}}')
+          echo "latest$SUFFIX=$latest  $VERSION$SUFFIX=$pinned"
           if [ "$latest" != "$pinned" ]; then
-            echo "::error::':latest' ($latest) does not match ':$VERSION' ($pinned)"
+            echo "::error::':latest$SUFFIX' ($latest) does not match ':$VERSION$SUFFIX' ($pinned)"
             exit 1
           fi
 
       - name: Assert the promoted image reports itself as stable
         run: |
           set -euo pipefail
-          reported=$(docker run --rm "$IMAGE:$VERSION" --version)
+          reported=$(docker run --rm "$IMAGE:$VERSION$SUFFIX" --version)
           echo "$reported"
           if [[ "$reported" != *"/v$VERSION-stable-"* ]]; then
             echo "::error::expected '/v$VERSION-stable-' in the version string"
@@ -196,7 +210,7 @@ jobs:
       - name: Assert the promoted image is attested
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh attestation verify "oci://$IMAGE:$VERSION" --repo "$GITHUB_REPOSITORY"
+        run: gh attestation verify "oci://$IMAGE:$VERSION$SUFFIX" --repo "$GITHUB_REPOSITORY"
 
   assert-latest-promoted:
     name: Assert release was promoted to latest

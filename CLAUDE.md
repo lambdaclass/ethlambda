@@ -1211,13 +1211,15 @@ incremental, and line-tables-only debuginfo, so rebuilds are much faster than
   which repeats them
 - `make test-node` excludes `ethlambda-ethrex`; `make test-ethrex` (own CI job) runs
   it plus the engine and binary with the feature on
-- Releases ship both builds per platform (`release.yaml`'s `build-binaries`
-  matrix): `ethlambda-<platform>` with ethrex embedded and
-  `ethlambda-minimal-<platform>` without, each checked for the `--ethrex.*`
-  flags (present or absent) before upload. Up to v1.0.0 `ethlambda-<platform>`
-  was the build without ethrex. Docker images are the minimal build; the
-  Homebrew bottle is `ethlambda-macos-aarch64`, so the tap formula must build
-  with `include-ethrex` too (`RELEASE.md`, step 6)
+- Every release artifact embeds ethrex and has a `-minimal` twin without it:
+  binaries `ethlambda-<platform>`/`ethlambda-minimal-<platform>` (each checked
+  for the `--ethrex.*` flags, present or absent, before upload), images
+  `<tag>`/`<tag>-minimal` (`release.yaml`, `release_promote.yaml` and
+  `docker_publish.yaml` variants `default` and `minimal`, beside `shadow`), and
+  Homebrew formulas `ethlambda`/`ethlambda-minimal` (`RELEASE.md`, step 6).
+  Up to v1.0.0 every artifact was the build without ethrex. The crate's own
+  default features stay without it, so `cargo build` and the test halves do
+  not compile ethrex
 
 ### Aggregator Flag Required for Finalization
 - At least one node **must** be started with `--is-aggregator` to finalize blocks

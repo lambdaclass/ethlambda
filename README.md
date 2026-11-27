@@ -174,7 +174,9 @@ docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT --
 <summary>Running without an execution client</summary>
 
 The node without ethrex, as described above: no shared network, no JWT secret
-and no `--execution-*` flags.
+and no `--execution-*` flags. From the first release after v1.0.0, use the
+`latest-minimal` tag here: `latest` embeds ethrex and starts it when no
+`--execution-endpoint` is given.
 
 ```sh
 docker pull ghcr.io/lambdaclass/ethlambda:latest
@@ -482,6 +484,11 @@ following tags:
 | `devnetX` | Stable image for a specific devnet (e.g. `devnet4`) |
 | `unstable` | Built from the latest main commit |
 | `sha-XXXXXXX` | Specific commit |
+
+Each tag embeds ethrex as the beacon node's execution client, like
+`ethlambda-<platform>`, and has a `-minimal` twin without it (e.g.
+`latest-minimal`), like `ethlambda-minimal-<platform>`. Images up to v1.0.0
+were all the build without ethrex.
 
 Release binaries and images carry GitHub build provenance attestations;
 [`RELEASE.md`](./RELEASE.md#verifying-a-release) shows how to verify them.

@@ -38,7 +38,7 @@ jobs:
           status=0
           IFS=',' read -ra TAG_ARRAY <<< "${TAGS_INPUT}"
           for t in "${TAG_ARRAY[@]}"; do
-            if [[ "$t" =~ ^(latest|unstable|sha-.*|v?[0-9]+\.[0-9]+\.[0-9]+.*)$ ]]; then
+            if [[ "$t" =~ ^((latest|unstable)(-minimal|-shadow)?|sha-.*|v?[0-9]+\.[0-9]+\.[0-9]+.*)$ ]]; then
               echo "::error::'$t' is reserved for the release pipeline or added automatically; see RELEASE.md"
               status=1
             fi
@@ -55,16 +55,24 @@ jobs:
             name: amd64
           - runner: ubuntu-22.04-arm
             name: arm64
-        # Each tag is published twice: once as the regular image and once as a
-        # Shadow-simulator-compatible image (tag suffixed "-shadow"). The shadow
-        # build args mirror the `shadow-docker-build` Makefile target. LOCKED=
-        # builds the shadow variant unlocked (the quinn-udp [patch] is absent
-        # from Cargo.lock; see Dockerfile), so -shadow images are not
-        # reproducible and should not be treated as equivalent-security
-        # artifacts to the regular tags.
+        # Each tag is published three times, as release.yaml publishes its own:
+        # the regular image, with ethrex embedded as the beacon node's execution
+        # client (`include-ethrex`); the same build without it (tag suffixed
+        # "-minimal"); and a Shadow-simulator-compatible image (tag suffixed
+        # "-shadow"). The variant names are also the registry cache tags both
+        # workflows share, so each must build what release.yaml builds under
+        # that name. The shadow build args mirror the `shadow-docker-build`
+        # Makefile target. LOCKED= builds the shadow variant unlocked (the
+        # quinn-udp [patch] is absent from Cargo.lock; see Dockerfile), so
+        # -shadow images are not reproducible and should not be treated as
+        # equivalent-security artifacts to the regular tags.
         variant:
           - name: default
             suffix: ""
+            build_args: |
+              FEATURES=include-ethrex
+          - name: minimal
+            suffix: "-minimal"
             build_args: ""
           - name: shadow
             suffix: "-shadow"
@@ -150,10 +158,11 @@ jobs:
           FIRST_TAG="${TAG_ARRAY[0]}"
           SHORT="${SHORT_SHA::7}"
 
-          # Publish each tag twice: the regular image and its "-shadow" twin.
-          # These suffixes must stay in sync with the `variant` matrix suffixes
-          # in the build-image job above: a new variant must be added in both.
-          for suffix in "" "-shadow"; do
+          # Publish each tag three times: the regular image, its "-minimal"
+          # and its "-shadow" twin. These suffixes must stay in sync with the
+          # `variant` matrix suffixes in the build-image job above: a new
+          # variant must be added in both.
+          for suffix in "" "-minimal" "-shadow"; do
             # First tag also gets an immutable sha-<sha> tag.
             docker buildx imagetools create \
               -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${FIRST_TAG}${suffix} \
