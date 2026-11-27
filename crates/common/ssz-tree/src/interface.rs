@@ -56,17 +56,14 @@ impl<T: Value, U: UpdateMap<T>> Interface<T, U> {
         if index >= self.len {
             return None;
         }
-        if self.updates.get(index).is_none() {
+        let (tree, depth) = (&self.tree, self.depth);
+        Some(self.updates.get_or_insert_with(index, || {
             // Pending pushes are always in `updates`, so this is a committed
             // element.
-            let value = self
-                .tree
-                .get(index, self.depth)
+            tree.get(index, depth)
                 .expect("an index below the committed length is in the tree")
-                .clone();
-            self.updates.insert(index, value);
-        }
-        self.updates.get_mut(index)
+                .clone()
+        }))
     }
 
     /// Buffers `value` as the new value of the element at `index`, without
@@ -143,10 +140,17 @@ impl<T: Value, U: UpdateMap<T>> Interface<T, U> {
 
     pub(crate) fn iter_from(&self, start: usize) -> Iter<'_, T, U> {
         let start = start.min(self.len);
+        let mut pending = if self.updates.is_empty() {
+            Vec::new()
+        } else {
+            self.updates.sorted_refs()
+        };
+        let before = pending.partition_point(|&(index, _)| index < start);
+        pending.drain(..before);
         Iter {
             tree: TreeIter::new(&self.tree, self.depth, start),
-            updates: &self.updates,
-            no_updates: self.updates.is_empty(),
+            pending: pending.into_iter().peekable(),
+            buffer: std::marker::PhantomData,
             index: start,
             committed_len: self.committed_len,
             end: self.len,

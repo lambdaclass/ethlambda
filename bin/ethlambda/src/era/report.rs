@@ -1,5 +1,7 @@
 //! The JSON a `replay-era` run leaves behind for CI to archive.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 /// What one end-of-era check concluded.
@@ -33,6 +35,10 @@ pub(super) struct EraReport {
     /// Wall time spent applying blocks (decode plus state transition).
     pub(super) apply_secs: f64,
     pub(super) mean_ms_per_block: f64,
+    /// Seconds the state transition spent in each of its phases over the
+    /// applied blocks (`lean_beacon_stf_phase_seconds`), so a change to one
+    /// phase is visible next to the signature checks that dominate the total.
+    pub(super) stf_phase_seconds: BTreeMap<String, f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) max_blocks: Option<u64>,
     pub(super) oracle: Vec<OracleCheck>,
@@ -51,6 +57,7 @@ impl EraReport {
             elapsed_secs: 0.0,
             apply_secs: 0.0,
             mean_ms_per_block: 0.0,
+            stf_phase_seconds: BTreeMap::new(),
             max_blocks,
             oracle: Vec::new(),
             error: None,
