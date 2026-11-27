@@ -475,7 +475,14 @@ signature is checked; past either, a vote gets its first verdict at once.
 Released votes are checked again on a permit pool of their own, so a big
 release takes no permit from the votes arriving meanwhile, and each keeps its
 place under both caps until that check answers, since its batch may wait for
-a permit while the next releases come in. A vote whose block
+a permit while the next releases come in. Votes for a block this node has
+not stored at all take at most half of each cap: any peer can name a
+root nobody signed, and since no import releases it, its votes would sit
+until their deadline and end in an IGNORE that costs the peer nothing. A
+vote for a block this node has stored names one it was handed and is still
+importing, nearly always after checking its proposer's signature, and those
+are nearly every early vote an honest network sends, so a peer flooding
+made-up roots cannot crowd them out. A vote whose block
 was imported but whose state has left the cache is checked once more at once
 and not parked, since no release would come for it. Unlike lighthouse, a vote for a block this
 node has never seen does not start a lookup for that block: it waits for

@@ -40,6 +40,11 @@
 //!   second check has answered: its batch may wait for a recheck permit, and
 //!   releases can follow one another faster than the batches run, so a cap
 //!   counting only the votes still parked would bound nothing.
+//! - **A share for made-up roots.** Votes for a block this node has not
+//!   stored at all take at most half of each cap
+//!   ([`MAX_PARKED_UNKNOWN_BLOCK_VOTES`],
+//!   [`MAX_PARKED_UNKNOWN_BLOCK_AGGREGATES`]), so a peer naming roots that
+//!   never import cannot crowd out the votes for a block being imported.
 //!
 //! The import signal can win the race against the verdict it releases: the
 //! check reads the store on a blocking thread, the import caches the state
@@ -52,7 +57,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use ethlambda_state_transition::beacon::gossip::Outcome;
+use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome};
 use ethlambda_types::beacon::primitives::Root;
 
 use crate::beacon::verdict::{GossipId, Validated};
@@ -72,6 +77,31 @@ pub(crate) const MAX_PARKED_VOTES: usize = 16_384;
 /// network sends about a thousand aggregates a slot, so this holds two slots'
 /// worth.
 pub(crate) const MAX_PARKED_AGGREGATES: usize = 2_048;
+
+/// How many of the parked votes may be for a block this node has not
+/// stored: first answered `Ignore(UnknownBlock)`. Half of
+/// [`MAX_PARKED_VOTES`].
+///
+/// Such a vote can name any root at all, and its first verdict is an
+/// `IGNORE`, which costs its sender nothing, reported only at its deadline
+/// since no import releases a made-up root. So a peer resending votes for
+/// roots nobody signed could keep both caps full and have every honest vote
+/// for a block still importing reported at once, the loss this queue is
+/// there to prevent. A vote first answered `Ignore(StateUnavailable)` names
+/// a block this node has stored itself, which a peer cannot make up by
+/// sending votes (a block is stored, nearly always, only once its proposer's
+/// signature checks out), and it is checked again if that block imports in
+/// time, where a forged one is REJECTed and its sender's peer score pays for
+/// it. Those are nearly all the early votes an honest network sends, and
+/// this cap keeps the other half of each cap for them. Half rather than less,
+/// so a block that reaches this node late can still have a slot's worth of
+/// aggregates parked for it.
+pub(crate) const MAX_PARKED_UNKNOWN_BLOCK_VOTES: usize = MAX_PARKED_VOTES / 2;
+
+/// How many of the parked aggregates may be for a block this node has not
+/// stored: half of [`MAX_PARKED_AGGREGATES`], for the reasons
+/// [`MAX_PARKED_UNKNOWN_BLOCK_VOTES`] gives.
+pub(crate) const MAX_PARKED_UNKNOWN_BLOCK_AGGREGATES: usize = MAX_PARKED_AGGREGATES / 2;
 
 /// How long after its arrival a parked vote may still wait for its block.
 /// See the module documentation for why it must stay under 3.5 s with
@@ -107,6 +137,12 @@ impl ParkedVote {
     fn is_aggregate(&self) -> bool {
         is_aggregate(&self.object)
     }
+
+    /// Whether its block was not stored at its first check, which
+    /// [`MAX_PARKED_UNKNOWN_BLOCK_VOTES`] caps.
+    fn is_for_unknown_block(&self) -> bool {
+        self.outcome == Outcome::Ignore(IgnoreReason::UnknownBlock)
+    }
 }
 
 /// Whether `object` is an aggregate, which [`MAX_PARKED_AGGREGATES`] caps.
@@ -122,10 +158,10 @@ struct Count {
 }
 
 impl Count {
-    /// Whether one more vote, an aggregate when `aggregate`, still fits under
-    /// [`MAX_PARKED_VOTES`] and [`MAX_PARKED_AGGREGATES`].
-    fn has_room(self, aggregate: bool) -> bool {
-        self.votes < MAX_PARKED_VOTES && !(aggregate && self.aggregates >= MAX_PARKED_AGGREGATES)
+    /// Whether one more vote, an aggregate when `aggregate`, still fits
+    /// under `max_votes` and `max_aggregates`.
+    fn has_room(self, aggregate: bool, max_votes: usize, max_aggregates: usize) -> bool {
+        self.votes < max_votes && !(aggregate && self.aggregates >= max_aggregates)
     }
 
     fn add(&mut self, aggregate: bool) {
@@ -146,7 +182,8 @@ pub(crate) enum Parking {
     /// Its root was already announced: check it again now. It is held, as a
     /// released vote is, until [`ParkedVotes::answered`].
     Ready(ParkedVote),
-    /// The queue is full: report its first verdict now.
+    /// The queue is full, or the share of it votes for an unknown block may
+    /// take: report its first verdict now.
     Full(ParkedVote),
 }
 
@@ -156,6 +193,9 @@ pub(crate) struct ParkedVotes {
     by_root: HashMap<Root, Vec<ParkedVote>>,
     /// The votes in `by_root`.
     parked: Count,
+    /// Of `parked`, those for a block this node had not stored
+    /// ([`ParkedVote::is_for_unknown_block`]).
+    unknown_block: Count,
     /// The votes parked, plus those released (or sent straight to their
     /// second check, [`Parking::Ready`]) whose second check has not answered
     /// yet: what the caps bound. A released vote is still in memory, in a
@@ -172,16 +212,42 @@ impl ParkedVotes {
     /// Park `vote` under `root`, the block it votes for.
     pub(crate) fn park(&mut self, root: Root, vote: ParkedVote) -> Parking {
         let aggregate = vote.is_aggregate();
-        if !self.held.has_room(aggregate) {
+        if !self
+            .held
+            .has_room(aggregate, MAX_PARKED_VOTES, MAX_PARKED_AGGREGATES)
+        {
+            return Parking::Full(vote);
+        }
+        if self.recently_ready.contains(&root) {
+            self.held.add(aggregate);
+            return Parking::Ready(vote);
+        }
+        let unknown_block = vote.is_for_unknown_block();
+        if unknown_block
+            && !self.unknown_block.has_room(
+                aggregate,
+                MAX_PARKED_UNKNOWN_BLOCK_VOTES,
+                MAX_PARKED_UNKNOWN_BLOCK_AGGREGATES,
+            )
+        {
             return Parking::Full(vote);
         }
         self.held.add(aggregate);
-        if self.recently_ready.contains(&root) {
-            return Parking::Ready(vote);
+        self.parked.add(aggregate);
+        if unknown_block {
+            self.unknown_block.add(aggregate);
         }
         self.by_root.entry(root).or_default().push(vote);
-        self.parked.add(aggregate);
         Parking::Parked
+    }
+
+    /// `vote` has left `by_root`: take it off the parked counts.
+    fn unpark(&mut self, vote: &ParkedVote) {
+        let aggregate = vote.is_aggregate();
+        self.parked.remove(aggregate);
+        if vote.is_for_unknown_block() {
+            self.unknown_block.remove(aggregate);
+        }
     }
 
     /// `root` has a post-state now: take every vote parked under it, and
@@ -197,7 +263,7 @@ impl ParkedVotes {
         }
         let votes = self.by_root.remove(&root).unwrap_or_default();
         for vote in &votes {
-            self.parked.remove(vote.is_aggregate());
+            self.unpark(vote);
         }
         votes
     }
@@ -215,7 +281,7 @@ impl ParkedVotes {
             !votes.is_empty()
         });
         for vote in &expired {
-            self.parked.remove(vote.is_aggregate());
+            self.unpark(vote);
             self.held.remove(vote.is_aggregate());
         }
         expired
@@ -259,7 +325,6 @@ impl ParkedVotes {
 
 #[cfg(test)]
 mod tests {
-    use ethlambda_state_transition::beacon::gossip::IgnoreReason;
     use ethlambda_types::beacon::containers::electra::SingleAttestation;
     use ethlambda_types::beacon::containers::{AttestationData, Checkpoint};
     use libp2p::PeerId;
@@ -326,8 +391,14 @@ mod tests {
                 aggregate: Box::new(aggregate),
                 attesting_indices: Vec::new(),
             },
-            outcome: Outcome::Ignore(IgnoreReason::UnknownBlock),
+            outcome: Outcome::Ignore(IgnoreReason::StateUnavailable),
         }
+    }
+
+    /// `vote` as first answered for a block this node had not stored.
+    fn for_unknown_block(mut vote: ParkedVote) -> ParkedVote {
+        vote.outcome = Outcome::Ignore(IgnoreReason::UnknownBlock);
+        vote
     }
 
     fn attesters(votes: &[ParkedVote]) -> Vec<u64> {
@@ -494,6 +565,57 @@ mod tests {
                 Parking::Parked
             ));
         }
+    }
+
+    /// Votes for a block this node has not stored, whose root any peer can
+    /// make up, take at most half of each cap: past it the next one is
+    /// handed back, while a vote for a stored block still parks. A released
+    /// root's votes stop counting against that share.
+    #[test]
+    fn votes_for_an_unknown_block_have_a_smaller_share_of_their_own() {
+        let now = Instant::now();
+        let mut parked = ParkedVotes::default();
+        let (made_up, stored) = (Root::repeat_byte(1), Root::repeat_byte(2));
+        for aggregator in 0..MAX_PARKED_UNKNOWN_BLOCK_AGGREGATES as u64 {
+            assert!(matches!(
+                parked.park(made_up, for_unknown_block(aggregate(aggregator, now))),
+                Parking::Parked
+            ));
+        }
+        assert!(matches!(
+            parked.park(made_up, for_unknown_block(aggregate(u64::MAX, now))),
+            Parking::Full(_)
+        ));
+        assert!(matches!(
+            parked.park(stored, aggregate(u64::MAX, now)),
+            Parking::Parked
+        ));
+
+        let first = MAX_PARKED_UNKNOWN_BLOCK_AGGREGATES as u64;
+        for attester in first..MAX_PARKED_UNKNOWN_BLOCK_VOTES as u64 {
+            assert!(matches!(
+                parked.park(made_up, for_unknown_block(vote(attester, now))),
+                Parking::Parked
+            ));
+        }
+        assert!(matches!(
+            parked.park(made_up, for_unknown_block(vote(u64::MAX, now))),
+            Parking::Full(_)
+        ));
+        assert!(matches!(
+            parked.park(stored, vote(u64::MAX, now)),
+            Parking::Parked
+        ));
+
+        let released = parked.take_ready(made_up);
+        assert_eq!(released.len(), MAX_PARKED_UNKNOWN_BLOCK_VOTES);
+        assert!(matches!(
+            parked.park(
+                Root::repeat_byte(3),
+                for_unknown_block(aggregate(u64::MAX, now))
+            ),
+            Parking::Parked
+        ));
     }
 
     #[test]

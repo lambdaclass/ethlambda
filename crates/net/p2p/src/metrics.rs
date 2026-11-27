@@ -583,7 +583,7 @@ static LEAN_BEACON_GOSSIP_PARKED_VOTES_TOTAL: LazyLock<IntCounterVec> = LazyLock
 });
 
 /// Count one vote of topic `kind` through the parked-vote queue (see
-/// `beacon::parked_votes`): `parked`, `full` (refused by the cap, so it got
+/// `beacon::parked_votes`): `parked`, `full` (refused by a cap, so it got
 /// its verdict at once), `rechecked` (checked again once its block's state was
 /// ready) or `expired` (never ready in time, so it got its first verdict).
 pub(crate) fn inc_parked_votes(kind: &str, result: &str) {
