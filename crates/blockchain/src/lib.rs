@@ -1877,18 +1877,6 @@ impl BlockChainServer {
                     let evidence =
                         data_availability_for(&self.store, &beacon_block, &self.custody_columns);
                     timings.da_check_end = Some(Instant::now());
-                    // Only a block with data to wait for has made data
-                    // available; a gloas block or one with no commitments is
-                    // answered `NotRequired`. Exhaustive, so a new kind of
-                    // evidence has to say which it is.
-                    timings.da_columns_required = match &evidence {
-                        Some(
-                            fork_choice::DataAvailability::Columns(_)
-                            | fork_choice::DataAvailability::ColumnsVerified
-                            | fork_choice::DataAvailability::Blobs { .. },
-                        ) => true,
-                        Some(fork_choice::DataAvailability::NotRequired) | None => false,
-                    };
                     match evidence {
                         Some(evidence) => evidence,
                         None => {
@@ -1946,7 +1934,7 @@ impl BlockChainServer {
                 // Per pass, like every import-pass mark: a block held here and
                 // re-imported later must not report the earlier pass's
                 // transition as this one's.
-                (timings.stf_speculative_start, timings.stf_speculative_end) = (None, None);
+                (timings.cl_start, timings.cl_end) = (None, None);
                 timings.speculation = None;
                 // Likewise the `el_start` and `el_end` rows: only this
                 // pass's answer, if it got one.
@@ -1985,8 +1973,8 @@ impl BlockChainServer {
                 // block `on_block` refuses before its transition, which then
                 // fails there without running one.
                 if speculation.is_some() {
-                    timings.stf_speculative_start = Some(transition_start);
-                    timings.stf_speculative_end = Some(transition_end);
+                    timings.cl_start = Some(transition_start);
+                    timings.cl_end = Some(transition_end);
                 }
                 let verdict = match task {
                     None => Ok(fork_choice::PayloadValidity::NotRequired),
@@ -2110,7 +2098,7 @@ impl BlockChainServer {
                 // Drop any hand-off span left by an insert outside this call,
                 // so the one taken below is this block's alone.
                 let _ = self.store.take_state_handoff();
-                timings.stf_start = Some(Instant::now());
+                timings.store_start = Some(Instant::now());
                 let imported = fork_choice::on_block_speculative(
                     &mut self.store,
                     beacon_block,
@@ -2120,7 +2108,7 @@ impl BlockChainServer {
                     &committees,
                     speculation,
                 );
-                timings.stf_end = Some(Instant::now());
+                timings.store_end = Some(Instant::now());
                 (timings.writer_wait_start, timings.writer_wait_end) =
                     match self.store.take_state_handoff() {
                         Some((start, end)) => (Some(start), Some(end)),
@@ -2380,7 +2368,7 @@ impl BlockChainServer {
 
     /// The roots on the head's chain from the head back to the lowest slot
     /// among `imported`: the blocks of a cascade the new head includes, for
-    /// its `attestable` rows. A handful of point lookups, one per slot the
+    /// their `fc_head_*` rows. A handful of point lookups, one per slot the
     /// cascade spans, and none when it imported nothing.
     fn head_chain_since(&self, imported: &[(u64, H256, &'static str)]) -> HashSet<H256> {
         let mut on_head = HashSet::new();
@@ -6211,45 +6199,6 @@ mod tests {
         );
     }
 
-    /// `da_columns_required` says the check found columns to require, not
-    /// merely that it ran.
-    #[tokio::test]
-    async fn the_columns_required_flag_follows_the_commitments() {
-        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
-        store
-            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
-            .expect("insert");
-        store
-            .insert_state(H256::ZERO, bare_state())
-            .expect("insert");
-        store
-            .set_time_ms(seconds_to_milliseconds(
-                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
-            ))
-            .unwrap();
-        let mut server = beacon_server(store);
-        server.custody_columns = CUSTODY.to_vec();
-
-        let bare = fulu_block_with_commitments(&server.store, 0);
-        let (timings, _) = server.process_block(bare, ImportTimings::default()).await;
-        assert!(timings.da_check_end.is_some(), "inside the window");
-        assert!(!timings.da_columns_required, "nothing to make available");
-
-        let with_columns = fulu_block_with_commitments(&server.store, 2);
-        let root = with_columns.message_hash_tree_root();
-        for index in CUSTODY {
-            let sidecar = sidecar_for(&with_columns, index);
-            server
-                .store
-                .put_data_column_sidecar(with_columns.slot(), &root, index, sidecar.to_ssz())
-                .unwrap();
-        }
-        let (timings, _) = server
-            .process_block(with_columns, ImportTimings::default())
-            .await;
-        assert!(timings.da_columns_required, "columns were required");
-    }
-
     #[tokio::test]
     async fn a_lean_block_arrival_judges_the_gate_without_waiting_for_the_tick() {
         // The lean half of the beacon test above: lean duties read the gate in
@@ -6758,8 +6707,7 @@ mod tests {
         else {
             panic!("an asked block records the engine pair");
         };
-        let (Some(start), Some(end)) = (timings.stf_speculative_start, timings.stf_speculative_end)
-        else {
+        let (Some(start), Some(end)) = (timings.cl_start, timings.cl_end) else {
             panic!("the premise: a speculation was computed");
         };
         assert!(
@@ -6792,7 +6740,7 @@ mod tests {
 
         assert_eq!(new_payload_v4_requests(&mock), 1, "asked exactly once");
         assert!(
-            timings.stf_speculative_start.is_some(),
+            timings.cl_start.is_some(),
             "the premise: a speculation was computed while the request was in flight"
         );
         assert_engine_pair_spans_the_speculation(&timings);
@@ -6853,7 +6801,7 @@ mod tests {
 
         assert_eq!(new_payload_v4_requests(&mock), 1, "asked exactly once");
         assert!(
-            timings.stf_speculative_start.is_some(),
+            timings.cl_start.is_some(),
             "the premise: a speculation was computed while the request was in flight"
         );
         assert_engine_pair_spans_the_speculation(&timings);
@@ -6866,7 +6814,7 @@ mod tests {
     }
 
     /// Without an execution client the transition is still computed ahead of
-    /// `on_block`, so the `stf` pair that follows holds the store writes
+    /// `on_block`, so the `store` pair that follows holds the store writes
     /// alone. Nobody was asked, so nothing is counted as a speculation.
     #[tokio::test]
     async fn a_block_nobody_is_asked_about_gets_its_transition_ahead_of_on_block() {
@@ -6890,8 +6838,7 @@ mod tests {
 
         let (timings, result) = server.process_block(block, ImportTimings::default()).await;
 
-        let (Some(transition_end), Some(store_start)) =
-            (timings.stf_speculative_end, timings.stf_start)
+        let (Some(transition_end), Some(store_start)) = (timings.cl_end, timings.store_start)
         else {
             panic!("the transition ran ahead of `on_block`, and `on_block` ran");
         };

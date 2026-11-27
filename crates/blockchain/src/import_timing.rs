@@ -50,13 +50,15 @@
 //!   locally built one) starts at the pull, since no earlier moment is
 //!   knowable.
 //!
-//! The beacon `stf` span is `fork_choice::on_block`, which ends by handing the
+//! A beacon block's state transition is two pairs: `cl`, the transition
+//! computed ahead of `fork_choice::on_block`, and `store`, that call, which
+//! writes the block and its post-state. The call ends by handing the
 //! post-state to the storage crate's background writer and blocks while that
-//! writer's queue is full. That wait is nested inside the `stf` pair and is
-//! recorded as its own `writer_wait` pair. The `stf` row reports its pair
-//! minus the wait (saturating), so `stf` is state-transition work and the
-//! rows still sum to the end-to-end time. A block with no recorded wait, which
-//! includes every lean block, reports `stf` unchanged.
+//! writer's queue is full. That wait is nested inside the `store` pair and is
+//! recorded as its own `writer_wait` pair. The `stf` row reports `cl` plus
+//! `store` minus the wait (saturating), so `stf` is state-transition work and
+//! the rows still sum to the end-to-end time. Lean's `stf` row is its own
+//! `stf` pair, with no wait recorded.
 //!
 //! One consequence worth keeping in mind when reading the numbers: a gossip
 //! block's total and a fetched block's total do not start at the same point in
@@ -109,8 +111,7 @@ pub struct VerifyTimings {
 }
 
 /// What became of the state transition a beacon import computed while the
-/// execution client's verdict was in flight (see
-/// [`ImportTimings::stf_speculative_start`]).
+/// execution client's verdict was in flight (see [`ImportTimings::cl_start`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeculationOutcome {
     /// Handed to `fork_choice::on_block_speculative` with a verdict that lets it
@@ -204,11 +205,6 @@ pub struct ImportTimings {
     /// Beacon: the custody-column availability check itself, not the wait.
     pub da_check_start: Option<Instant>,
     pub da_check_end: Option<Instant>,
-    /// Beacon: the check found columns to require (a block with commitments
-    /// inside the availability window). A gloas block or one with no
-    /// commitments is checked too, but has nothing to make available, so its
-    /// end must not be named as if it did.
-    pub da_columns_required: bool,
 
     // --- Hold: custody columns have not all arrived (beacon). ---
     pub columns_wait_start: Option<Instant>,
@@ -221,13 +217,13 @@ pub struct ImportTimings {
     ///
     /// This pair spans the whole question, from building the request to the
     /// later of the answer and the end of the transition that ran meanwhile
-    /// (see [`Self::stf_speculative_start`]). That transition lies inside it,
-    /// and the `engine` row reports the pair minus it, the way `stf` excludes
+    /// (see [`Self::cl_start`]). That transition lies inside it, and the
+    /// `engine` row reports the pair minus it, the way `stf` excludes
     /// `writer_wait`, so the overlap is counted once, under `stf`. Both ends
-    /// are the same instant, a recorded zero, when there was no request to
-    /// send (no execution client, or a block with no payload in it: pre-merge
-    /// or gloas). How long the execution client itself took is
-    /// `lean_engine_new_payload_seconds`, not this.
+    /// are the same instant, a recorded zero taken before the transition,
+    /// when there was no request to send (no execution client, or a block
+    /// with no payload in it: pre-merge or gloas). How long the execution
+    /// client itself took is `lean_engine_new_payload_seconds`, not this.
     pub engine_start: Option<Instant>,
     pub engine_end: Option<Instant>,
     /// Beacon: the execution client's answer, for the `el_start` and
@@ -242,42 +238,48 @@ pub struct ImportTimings {
     pub verify_crypto_start: Option<Instant>,
     pub verify_crypto_end: Option<Instant>,
 
-    /// The state transition. On beacon this is `fork_choice::on_block`, which
-    /// bundles the transition, the state root and the state write, so
-    /// `db_write` stays `None` there.
-    ///
-    /// This pair brackets the whole call, writer wait included. The `stf` row
-    /// reports it minus [`Self::writer_wait_start`]..[`Self::writer_wait_end`].
+    /// Lean: the state transition, inside `store::on_block`.
     pub stf_start: Option<Instant>,
     pub stf_end: Option<Instant>,
 
-    /// Beacon: a state transition computed while the execution client's
-    /// verdict was still in flight, whether the import then used it or not.
+    /// Beacon: the block's state transition, computed ahead of
+    /// `fork_choice::on_block`, whether the import then used it or not: while
+    /// the execution client's verdict is in flight, when there is a request
+    /// to send, and on its own otherwise.
     ///
-    /// It runs before the `stf` pair above and overlaps the `engine_newPayload`
-    /// round trip, so it is neither inside `stf_start`..`stf_end` nor a
-    /// section of its own: the `stf` row adds it, since it is state-transition
-    /// work. A discarded one is added too, so the transition an `INVALIDATED`
-    /// verdict makes `on_block` run again shows as the second transition it
-    /// is, and a held block still shows the one it paid for. The `engine` pair
-    /// spans this one and its row subtracts it, so the rows still sum to the
-    /// end-to-end time instead of counting the overlap twice. Computed for
-    /// every block, a request or not: without one (no execution client, or
-    /// no payload to ask about) nothing overlaps, the `engine` pair is a zero
-    /// taken before it, and `on_block` still takes it in place of its own.
+    /// A request's round trip overlaps it, so it lies inside the `engine`
+    /// pair: the `stf` row adds it and the `engine` row subtracts it, so the
+    /// rows still sum to the end-to-end time instead of counting the overlap
+    /// twice. A discarded one is added too, so the transition an
+    /// `INVALIDATED` verdict makes `on_block` run again shows as the second
+    /// transition it is, and a held block still shows the one it paid for.
     /// `None` only for a block `fork_choice::speculate_transition` declined,
     /// which `on_block` then refuses before any transition.
-    pub stf_speculative_start: Option<Instant>,
-    pub stf_speculative_end: Option<Instant>,
-    /// Beacon: what became of that speculative transition, set by
-    /// [`Self::record_speculation`]. Not a mark, like [`Self::source`]: it
-    /// travels with them so the import's log line can say whether its `stf`
-    /// row holds a transition that was discarded and run again.
+    pub cl_start: Option<Instant>,
+    pub cl_end: Option<Instant>,
+
+    /// Beacon: `fork_choice::on_block`, after the verdict: the store writes
+    /// and fork-choice bookkeeping that must wait for it, given the
+    /// transition `cl` computed. It writes the post-state too, so `db_write`
+    /// stays `None` on beacon. An `INVALIDATED` verdict makes it run the
+    /// transition again, with an `invalid()` engine.
+    ///
+    /// This pair brackets the whole call, writer wait included. The `stf` row
+    /// reports it minus [`Self::writer_wait_start`]..[`Self::writer_wait_end`],
+    /// plus the `cl` pair.
+    pub store_start: Option<Instant>,
+    pub store_end: Option<Instant>,
+
+    /// Beacon: what became of the `cl` transition when the execution client
+    /// was asked, set by [`Self::record_speculation`]. Not a mark, like
+    /// [`Self::source`]: it travels with them so the import's log line can
+    /// say whether its `stf` row holds a transition that was discarded and
+    /// run again.
     pub speculation: Option<SpeculationOutcome>,
 
     /// Beacon: the blocking hand-off of the post-state to the storage crate's
     /// background writer, which waits while the writer's queue is full. It
-    /// lies inside the `stf` pair; only the report separates the two.
+    /// lies inside the `store` pair; only the report separates the two.
     pub writer_wait_start: Option<Instant>,
     pub writer_wait_end: Option<Instant>,
 
@@ -389,6 +391,7 @@ impl ImportTimings {
             &mut self.fc_head_end,
             &mut self.db_write_end,
             &mut self.stf_end,
+            &mut self.store_end,
         ]
         .into_iter()
         .filter(|slot| slot.is_some())
@@ -447,24 +450,31 @@ impl ImportTimings {
     /// Every section, in the order a block crosses them, whether or not it
     /// crossed this one.
     ///
-    /// The `stf` row excludes `writer_wait` when one was recorded, since the
-    /// wait is nested inside the `stf` pair; that keeps the rows summing to
-    /// the end-to-end time and `stf` meaning state-transition work. The
-    /// speculative transition moves the same way, out of the `engine` pair it
-    /// ran inside and into `stf`.
+    /// The `stf` row is the import's state-transition work: lean's `stf`
+    /// pair, or beacon's `store` pair plus its `cl` pair. It excludes
+    /// `writer_wait` when one was recorded, since the wait is nested inside
+    /// the `store` pair; that keeps the rows summing to the end-to-end time.
+    /// The `cl` transition moves the same way, out of the `engine` pair it
+    /// ran inside, when a request overlapped it, and into `stf`.
     fn rows(&self) -> Vec<Row> {
-        let mut stf = Row::new("stf", self.stf_start, self.stf_end);
+        // A block has one pair or the other: lean's transition, or beacon's
+        // `on_block` after it.
+        let mut stf = Row::new(
+            "stf",
+            self.stf_start.or(self.store_start),
+            self.stf_end.or(self.store_end),
+        );
         let writer_wait = Row::new("writer_wait", self.writer_wait_start, self.writer_wait_end);
         if let (Some(total), Some(wait)) = (stf.elapsed, writer_wait.elapsed) {
             stf.elapsed = Some(total.saturating_sub(wait));
         }
         let mut engine = Row::new("engine", self.engine_start, self.engine_end);
-        // Also when the import stopped before running its own transition (a
-        // held block), so the speculation it paid for is not lost.
-        if let Some(spec) = span(self.stf_speculative_start, self.stf_speculative_end) {
-            stf.elapsed = Some(stf.elapsed.unwrap_or_default() + spec);
-            stf.end = stf.end.or(self.stf_speculative_end);
-            engine.elapsed = engine.elapsed.map(|total| total.saturating_sub(spec));
+        // Also when the import stopped before `on_block` (a held block), so
+        // the transition it paid for is not lost.
+        if let Some(cl) = span(self.cl_start, self.cl_end) {
+            stf.elapsed = Some(stf.elapsed.unwrap_or_default() + cl);
+            stf.end = stf.end.or(self.cl_end);
+            engine.elapsed = engine.elapsed.map(|total| total.saturating_sub(cl));
         }
         vec![
             Row::new("decode", self.decode_start, self.decode_end),
@@ -558,7 +568,8 @@ impl BlockImportReport {
     /// reports imported too (lean's `store::on_block` returns early with only
     /// the guards marked), and a re-delivery is not a second import.
     pub fn imported_here(&self) -> bool {
-        self.outcome == "imported" && self.timings.stf_start.is_some()
+        let transitioned = self.timings.stf_start.or(self.timings.store_start);
+        self.outcome == "imported" && transitioned.is_some()
     }
 
     /// This report as `block_events` rows (`docs/telemetry.md`).
@@ -566,46 +577,33 @@ impl BlockImportReport {
     /// Only a final pass is written: one that imported the block here, or
     /// failed it. A held block's timings travel with it, so writing every held
     /// pass too would repeat its early rows. Not every mark is the final
-    /// pass's own: `received`, `decode_end`, `queue_end`, `defer_*`, `admit_*`
+    /// pass's own: `import_start`, `decode_*`, `queue_*`, `defer_*`, `admit_*`
     /// and the `*_wait_start` marks survive a hold, while `guards_*`,
     /// `da_check_*` and everything after them are overwritten by each pass, so
     /// they describe the last pass only. The population is the histogram's: a
     /// source with no metric label writes no rows.
     ///
-    /// Silver's stage names stand in for ours where the meaning matches; the
-    /// two that claim success are only used for an imported block. Beacon's
-    /// `attestable` is not written here at all: Silver's means the new head
-    /// is published, and beacon recomputes the head once per arrival, after
-    /// the cascade (see [`CascadeTelemetry`]). Lean updates its head per
-    /// block, so its `fc_head` end is its `attestable`.
+    /// Every row is a section's `_start` or `_end`. The whole import is one
+    /// too, `import_start`..`import_end` (the log line's end to end), and
+    /// `import_end` carries the outcome in `verdict`, `Imported` or `Failed`,
+    /// as `el_end` carries the execution client's. Beacon's `fc_head_*` rows
+    /// are not written here: beacon recomputes the head once per arrival,
+    /// after the cascade (see [`CascadeTelemetry`]).
     pub fn telemetry_events(&self) -> Vec<BlockEvent> {
         let Some(source) = self.timings.source_label() else {
             return Vec::new();
         };
-        let imported = match self.outcome {
-            "imported" if self.imported_here() => true,
-            "failed" => false,
+        let outcome = match self.outcome {
+            "imported" if self.imported_here() => "Imported",
+            "failed" => "Failed",
             _ => return Vec::new(),
         };
         let t = &self.timings;
-        // Only a check that found columns to require made data available; for
-        // the others it ran and found nothing to require.
-        let da_check_end = if t.da_columns_required {
-            "da_available"
-        } else {
-            "da_check_end"
-        };
-        let (stf_end, fc_head_end) = if imported {
-            ("stf_done", "attestable")
-        } else {
-            ("stf_end", "fc_head_end")
-        };
-        // No `queue_start` row: it is always another row's instant, the
-        // hand-off that ends `decode` on gossip, or `received` itself on a
-        // block that was not decoded here.
-        let mut marks = vec![
-            ("received", t.first_instant()),
+        let marks = [
+            ("import_start", t.first_instant()),
+            ("decode_start", t.decode_start),
             ("decode_end", t.decode_end),
+            ("queue_start", t.queue_start),
             ("queue_end", t.queue_end),
             ("defer_start", t.defer_start),
             ("defer_end", t.defer_end),
@@ -620,36 +618,34 @@ impl BlockImportReport {
             ("cascade_wait_start", t.cascade_wait_start),
             ("cascade_wait_end", t.cascade_wait_end),
             ("da_check_start", t.da_check_start),
-            (da_check_end, t.da_check_end),
+            ("da_check_end", t.da_check_end),
             ("columns_wait_start", t.columns_wait_start),
             ("columns_wait_end", t.columns_wait_end),
             ("verify_struct_start", t.verify_structural_start),
             ("verify_struct_end", t.verify_structural_end),
             ("verify_crypto_start", t.verify_crypto_start),
             ("verify_crypto_end", t.verify_crypto_end),
-            // Beacon: the consensus half of the `engine_newPayload` question,
-            // the block's transition computed while the request (`el_start`
-            // .. `el_end`) is in flight. It runs before `stf_start` and the
-            // import may use it in place of its own transition, so without
-            // these rows `stf_start`..`stf_done` reads as the whole transition
-            // while missing most of it. Written whether or not it was used, as
-            // the log line's `stf` row counts it.
-            ("cl_start", t.stf_speculative_start),
-            ("cl_end", t.stf_speculative_end),
+            // Beacon: the consensus half, the block's transition computed
+            // ahead of `on_block`, while the request (`el_start`..`el_end`)
+            // is in flight when there is one. Written whether or not it was
+            // used, as the log line's `stf` row counts it.
+            ("cl_start", t.cl_start),
+            ("cl_end", t.cl_end),
+            // Lean's transition.
             ("stf_start", t.stf_start),
-            (stf_end, t.stf_end),
+            ("stf_end", t.stf_end),
+            // Beacon: `on_block` after the verdict, given that transition.
+            ("store_start", t.store_start),
+            ("store_end", t.store_end),
             ("writer_wait_start", t.writer_wait_start),
             ("writer_wait_end", t.writer_wait_end),
             ("db_write_start", t.db_write_start),
             ("db_write_end", t.db_write_end),
             ("fc_head_start", t.fc_head_start),
-            (fc_head_end, t.fc_head_end),
+            ("fc_head_end", t.fc_head_end),
             ("block_atts_start", t.block_atts_start),
             ("block_atts_end", t.block_atts_end),
         ];
-        if !imported {
-            marks.push(("failed", t.last_instant()));
-        }
         let mut events: Vec<BlockEvent> = marks
             .into_iter()
             .filter_map(|(stage, at)| Some(self.event(stage, at?, source, None)))
@@ -657,6 +653,9 @@ impl BlockImportReport {
         if let Some(answer) = t.engine_answer {
             events.push(self.event("el_start", answer.sent, source, None));
             events.push(self.event("el_end", answer.answered, source, Some(answer.verdict)));
+        }
+        if let Some(end) = t.last_instant() {
+            events.push(self.event("import_end", end, source, Some(outcome)));
         }
         events
     }
@@ -947,10 +946,11 @@ pub struct CascadeTelemetry {
 
 impl CascadeTelemetry {
     /// The arrival-scope sections, filed under the arriving block when the
-    /// arriving block was imported here, and an `attestable` row at the head
-    /// recomputation's end for every block imported here that the new head
-    /// includes (`on_head`). A block imported onto a losing branch never
-    /// became attestable, so it writes none.
+    /// arriving block was imported here, and the head recomputation again as
+    /// `fc_head_start`..`fc_head_end` under every block imported here that the
+    /// new head includes (`on_head`): the head computation that made it
+    /// attestable, as lean's own `fc_head` pair is. A block imported onto a
+    /// losing branch never became attestable, so it writes none.
     pub fn events(
         &self,
         cascade: &CascadeTimings,
@@ -980,16 +980,14 @@ impl CascadeTelemetry {
             );
         }
         // Beacon only: lean recomputes no head per arrival, and its
-        // `attestable` is the block's own `fc_head` end.
+        // `fc_head` pair comes with the block's own rows.
         if cascade.head_ok
-            && let Some(head_end) = cascade.head_end
+            && let (Some(head_start), Some(head_end)) = (cascade.head_start, cascade.head_end)
         {
-            events.extend(
-                self.imported
-                    .iter()
-                    .filter(|(_, root, _)| on_head(root))
-                    .map(|&(slot, root, source)| row("attestable", head_end, slot, root, source)),
-            );
+            for &(slot, root, source) in self.imported.iter().filter(|(_, root, _)| on_head(root)) {
+                events.push(row("fc_head_start", head_start, slot, root, source));
+                events.push(row("fc_head_end", head_end, slot, root, source));
+            }
         }
         events
     }
@@ -1178,11 +1176,17 @@ mod tests {
         // Beacon: the last section is block_atts, and there is no db_write or
         // fc_head to confuse it with.
         let mut beacon = ImportTimings::default();
-        (beacon.stf_start, beacon.stf_end) = pair(base, 0, 90);
+        (beacon.store_start, beacon.store_end) = pair(base, 0, 90);
         (beacon.block_atts_start, beacon.block_atts_end) = pair(base, 90, 15);
         beacon.absorb_tail(tail_end);
         assert_eq!(beacon.block_atts_end, Some(tail_end));
-        assert_eq!(beacon.stf_end, Some(base + Duration::from_millis(90)));
+        assert_eq!(beacon.store_end, Some(base + Duration::from_millis(90)));
+
+        // A beacon import that failed in `on_block`: the tail extends `store`.
+        let mut failed = ImportTimings::default();
+        (failed.store_start, failed.store_end) = pair(base, 0, 90);
+        failed.absorb_tail(tail_end);
+        assert_eq!(failed.store_end, Some(tail_end));
     }
 
     fn row_elapsed(timings: &ImportTimings, name: &str) -> Option<Duration> {
@@ -1197,7 +1201,7 @@ mod tests {
     fn the_stf_row_excludes_the_writer_wait() {
         let base = Instant::now();
         let mut timings = ImportTimings::default();
-        (timings.stf_start, timings.stf_end) = pair(base, 0, 90);
+        (timings.store_start, timings.store_end) = pair(base, 0, 90);
         (timings.writer_wait_start, timings.writer_wait_end) = pair(base, 60, 30);
 
         assert_eq!(
@@ -1221,7 +1225,7 @@ mod tests {
     fn an_absent_writer_wait_leaves_stf_unchanged() {
         let base = Instant::now();
         let mut timings = ImportTimings::default();
-        (timings.stf_start, timings.stf_end) = pair(base, 0, 90);
+        (timings.store_start, timings.store_end) = pair(base, 0, 90);
 
         assert_eq!(
             row_elapsed(&timings, "stf"),
@@ -1239,8 +1243,8 @@ mod tests {
         let base = Instant::now();
         let mut timings = ImportTimings::default();
         (timings.engine_start, timings.engine_end) = pair(base, 0, 105);
-        (timings.stf_speculative_start, timings.stf_speculative_end) = pair(base, 5, 70);
-        (timings.stf_start, timings.stf_end) = pair(base, 105, 20);
+        (timings.cl_start, timings.cl_end) = pair(base, 5, 70);
+        (timings.store_start, timings.store_end) = pair(base, 105, 20);
 
         assert_eq!(
             row_elapsed(&timings, "engine"),
@@ -1284,7 +1288,7 @@ mod tests {
         // the block was held without a transition of its own.
         let base = Instant::now();
         let mut timings = ImportTimings::default();
-        (timings.stf_speculative_start, timings.stf_speculative_end) = pair(base, 0, 70);
+        (timings.cl_start, timings.cl_end) = pair(base, 0, 70);
         (timings.engine_start, timings.engine_end) = pair(base, 0, 370);
 
         assert_eq!(
@@ -1300,19 +1304,25 @@ mod tests {
     #[test]
     fn an_engine_with_nothing_to_wait_for_is_a_recorded_zero() {
         // No request sent: the row is present and zero, so every beacon block
-        // observes it.
+        // observes it, and the transition computed after it all goes to `stf`.
         let base = Instant::now();
         let mut timings = ImportTimings::default();
         (timings.engine_start, timings.engine_end) = (Some(base), Some(base));
+        (timings.cl_start, timings.cl_end) = pair(base, 0, 70);
+        (timings.store_start, timings.store_end) = pair(base, 70, 5);
 
         assert_eq!(row_elapsed(&timings, "engine"), Some(Duration::ZERO));
+        assert_eq!(
+            row_elapsed(&timings, "stf"),
+            Some(Duration::from_millis(75))
+        );
     }
 
     #[test]
     fn a_writer_wait_longer_than_stf_saturates_stf_to_zero() {
         let base = Instant::now();
         let mut timings = ImportTimings::default();
-        (timings.stf_start, timings.stf_end) = pair(base, 0, 10);
+        (timings.store_start, timings.store_end) = pair(base, 0, 10);
         (timings.writer_wait_start, timings.writer_wait_end) = pair(base, 0, 25);
 
         assert_eq!(row_elapsed(&timings, "stf"), Some(Duration::ZERO));
@@ -1487,7 +1497,6 @@ mod tests {
             guards_end: at(base, 3),
             da_check_start: at(base, 3),
             da_check_end: at(base, 4),
-            da_columns_required: true,
             engine_start: at(base, 4),
             engine_end: at(base, 40),
             engine_answer: Some(EngineAnswer {
@@ -1495,8 +1504,8 @@ mod tests {
                 answered: base + Duration::from_millis(40),
                 verdict: "Valid",
             }),
-            stf_start: at(base, 40),
-            stf_end: at(base, 45),
+            store_start: at(base, 40),
+            store_end: at(base, 45),
             block_atts_start: at(base, 45),
             block_atts_end: at(base, 46),
             ..ImportTimings::default()
@@ -1504,28 +1513,31 @@ mod tests {
     }
 
     #[test]
-    fn an_imported_block_uses_silvers_names_where_they_match() {
+    fn every_stage_is_a_section_start_or_end() {
         let base = Instant::now();
         let report = report(beacon_gossip(base));
 
         assert_eq!(
             stages(&report),
             [
-                "received",
+                "import_start",
+                "decode_start",
                 "decode_end",
+                "queue_start",
                 "queue_end",
                 "guards_start",
                 "guards_end",
                 "da_check_start",
-                "da_available",
-                "stf_start",
-                "stf_done",
+                "da_check_end",
+                "store_start",
+                "store_end",
                 "block_atts_start",
-                // Beacon `attestable` waits for the head recomputation, which
-                // is per arrival: `CascadeTelemetry` writes it.
+                // Beacon's `fc_head` pair waits for the head recomputation,
+                // which is per arrival: `CascadeTelemetry` writes it.
                 "block_atts_end",
                 "el_start",
                 "el_end",
+                "import_end",
             ]
         );
         let events = report.telemetry_events();
@@ -1536,6 +1548,9 @@ mod tests {
         let verdict = events.iter().find(|event| event.stage == "el_end").unwrap();
         assert_eq!(verdict.verdict, Some("Valid"));
         assert_eq!(verdict.at, base + Duration::from_millis(40));
+        let end = events.last().unwrap();
+        assert_eq!(end.verdict, Some("Imported"));
+        assert_eq!(end.at, base + Duration::from_millis(46), "the last instant");
     }
 
     /// The rows bracket the request, not the `engine` section: that section
@@ -1566,30 +1581,30 @@ mod tests {
         assert_eq!(at_of("el_end"), at(base, 20));
     }
 
-    /// The transition computed while the request was in flight gets rows of
-    /// its own, ahead of `stf_start`: a used one leaves `stf_start`..`stf_done`
-    /// only the rest of the import, so without them a reader of the rows loses
-    /// the transition itself.
+    /// The transition computed ahead of `on_block` gets rows of its own,
+    /// ahead of `store_start`: `store_start`..`store_end` holds only the rest
+    /// of the import, so without them a reader of the rows loses the
+    /// transition itself.
     #[test]
     fn an_overlapped_transition_writes_its_own_rows() {
         let base = Instant::now();
         let report = report(ImportTimings {
-            stf_speculative_start: at(base, 5),
-            stf_speculative_end: at(base, 35),
+            cl_start: at(base, 5),
+            cl_end: at(base, 35),
             speculation: Some(SpeculationOutcome::Used),
             ..beacon_gossip(base)
         });
 
         let stages = stages(&report);
         let position = |name| stages.iter().position(|stage| *stage == name);
-        let (Some(spec_start), Some(spec_end), Some(stf_start)) = (
+        let (Some(cl_start), Some(cl_end), Some(store_start)) = (
             position("cl_start"),
             position("cl_end"),
-            position("stf_start"),
+            position("store_start"),
         ) else {
             panic!("missing a transition row: {stages:?}");
         };
-        assert!(spec_start < spec_end && spec_end < stf_start, "{stages:?}");
+        assert!(cl_start < cl_end && cl_end < store_start, "{stages:?}");
 
         let events = report.telemetry_events();
         let at_of = |stage| {
@@ -1609,34 +1624,21 @@ mod tests {
     fn a_discarded_speculation_is_written_with_the_failed_import() {
         let base = Instant::now();
         let mut failed = report(ImportTimings {
-            stf_speculative_start: at(base, 5),
-            stf_speculative_end: at(base, 35),
+            cl_start: at(base, 5),
+            cl_end: at(base, 35),
             speculation: Some(SpeculationOutcome::DiscardedInvalidated),
             ..beacon_gossip(base)
         });
         failed.outcome = "failed";
 
         let stages = stages(&failed);
-        for name in ["cl_start", "cl_end", "stf_start", "stf_end"] {
+        for name in ["cl_start", "cl_end", "store_start", "store_end"] {
             assert!(stages.contains(&name), "missing {name}: {stages:?}");
         }
     }
 
     #[test]
-    fn a_block_with_nothing_to_make_available_does_not_claim_it_was() {
-        let base = Instant::now();
-        let report = report(ImportTimings {
-            da_columns_required: false,
-            ..beacon_gossip(base)
-        });
-
-        let stages = stages(&report);
-        assert!(stages.contains(&"da_check_end"));
-        assert!(!stages.contains(&"da_available"));
-    }
-
-    #[test]
-    fn a_fetched_block_is_received_at_its_hand_off() {
+    fn a_fetched_block_starts_at_its_hand_off() {
         let base = Instant::now();
         let fetched = report(ImportTimings {
             source: Some(BlockSource::Sync),
@@ -1645,33 +1647,31 @@ mod tests {
             ..beacon_gossip(base)
         });
 
-        assert_eq!(stages(&fetched)[..2], ["received", "queue_end"]);
+        assert_eq!(
+            stages(&fetched)[..3],
+            ["import_start", "queue_start", "queue_end"]
+        );
         let events = fetched.telemetry_events();
         assert_eq!(events[0].at, base + Duration::from_millis(1));
         assert!(events.iter().all(|event| event.source == "sync"));
     }
 
     #[test]
-    fn a_failed_import_keeps_our_names_and_adds_failed() {
+    fn a_failed_import_ends_with_its_outcome() {
         let base = Instant::now();
         let mut failed = report(beacon_gossip(base));
         failed.outcome = "failed";
 
-        let stages = stages(&failed);
-        for name in ["stf_end", "block_atts_end", "failed"] {
+        let events = failed.telemetry_events();
+        let stages: Vec<_> = events.iter().map(|event| event.stage).collect();
+        for name in ["store_end", "block_atts_end"] {
             assert!(stages.contains(&name), "missing {name}");
         }
-        for name in ["stf_done", "attestable"] {
-            assert!(!stages.contains(&name), "{name} claims a success");
-        }
-        let failed_at = failed
-            .telemetry_events()
-            .into_iter()
-            .find(|event| event.stage == "failed")
-            .unwrap()
-            .at;
+        let end = events.last().unwrap();
+        assert_eq!(end.stage, "import_end");
+        assert_eq!(end.verdict, Some("Failed"));
         assert_eq!(
-            failed_at,
+            end.at,
             base + Duration::from_millis(46),
             "the last instant recorded"
         );
@@ -1726,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lean_block_becomes_attestable_at_its_head_update() {
+    fn a_lean_block_writes_its_own_head_update() {
         let base = Instant::now();
         let lean = report(ImportTimings {
             source: Some(BlockSource::Gossip),
@@ -1744,12 +1744,16 @@ mod tests {
         });
 
         let events = lean.telemetry_events();
-        let attestable = events
+        let head = events
             .iter()
-            .find(|event| event.stage == "attestable")
+            .find(|event| event.stage == "fc_head_end")
             .unwrap();
-        assert_eq!(attestable.at, base + Duration::from_millis(36));
-        assert!(events.iter().all(|event| event.verdict.is_none()));
+        assert_eq!(head.at, base + Duration::from_millis(36));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.verdict.is_none() || event.stage == "import_end")
+        );
     }
 
     fn arrival_cascade(base: Instant) -> CascadeTimings {
@@ -1767,7 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn an_imported_arrival_files_its_rows_and_every_import_becomes_attestable() {
+    fn an_imported_arrival_files_its_rows_and_every_import_gets_the_head() {
         let base = Instant::now();
         let arriving = H256::repeat_byte(3);
         let child = H256::repeat_byte(4);
@@ -1790,22 +1794,24 @@ mod tests {
                 ("get_head_end", 7, [3; 32], "gossip"),
                 ("fcu_start", 7, [3; 32], "gossip"),
                 ("fcu_end", 7, [3; 32], "gossip"),
-                ("attestable", 7, [3; 32], "gossip"),
-                ("attestable", 8, [4; 32], "sync"),
+                ("fc_head_start", 7, [3; 32], "gossip"),
+                ("fc_head_end", 7, [3; 32], "gossip"),
+                ("fc_head_start", 8, [4; 32], "sync"),
+                ("fc_head_end", 8, [4; 32], "sync"),
             ]
         );
         let head_end = base + Duration::from_millis(52);
         assert!(
             events
                 .iter()
-                .filter(|event| event.stage == "attestable")
+                .filter(|event| event.stage == "fc_head_end")
                 .all(|event| event.at == head_end)
         );
     }
 
     /// A re-delivered block the store already holds reports imported without
     /// running anything: no arrival rows under it. A child it released and
-    /// that did import is still attestable.
+    /// that did import still gets the head that included it.
     #[test]
     fn a_re_delivered_arrival_files_nothing_under_itself() {
         let base = Instant::now();
@@ -1820,12 +1826,13 @@ mod tests {
                 .iter()
                 .map(|event| (event.stage, event.slot))
                 .collect::<Vec<_>>(),
-            [("attestable", 8)]
+            [("fc_head_start", 8), ("fc_head_end", 8)]
         );
     }
 
     /// A block the cascade imported onto a branch the new head does not
-    /// include never became attestable, so only the head's chain gets the row.
+    /// include never became attestable, so only the head's chain gets the
+    /// rows.
     #[test]
     fn a_block_off_the_new_head_is_not_attestable() {
         let base = Instant::now();
@@ -1836,13 +1843,13 @@ mod tests {
             imported: vec![(7, canonical, "sync"), (7, side_fork, "gossip")],
         };
 
-        let attestable: Vec<_> = telemetry
+        let on_head: Vec<_> = telemetry
             .events(&arrival_cascade(base), |root| *root == canonical)
             .into_iter()
-            .filter(|event| event.stage == "attestable")
+            .filter(|event| event.stage == "fc_head_end")
             .map(|event| event.block_root)
             .collect();
-        assert_eq!(attestable, [[3; 32]]);
+        assert_eq!(on_head, [[3; 32]]);
     }
 
     /// A head computation that failed still spent its time, so the arrival's
@@ -1865,13 +1872,13 @@ mod tests {
             .map(|event| event.stage)
             .collect();
         assert!(stages.contains(&"get_head_end"));
-        assert!(!stages.contains(&"attestable"));
+        assert!(!stages.contains(&"fc_head_end"));
     }
 
-    /// Lean has no per-arrival head recomputation: its `attestable` comes
+    /// Lean has no per-arrival head recomputation: its `fc_head` pair comes
     /// with the block's own rows, so none is written here.
     #[test]
-    fn a_lean_cascade_writes_no_attestable() {
+    fn a_lean_cascade_writes_no_head_rows() {
         let base = Instant::now();
         let lean = CascadeTimings {
             source: Some(BlockSource::Gossip),

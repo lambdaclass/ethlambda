@@ -639,11 +639,12 @@ See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults,
 
 ## Block telemetry (`crates/common/telemetry`)
 
-`--telemetry.clickhouse-url` writes Silver's `block_events` rows (one per point in a block's
-life, per data column arrival) to ClickHouse over HTTP. A global sink, installed in `run_node`
+`--telemetry.clickhouse-url` writes `block_events` rows in Silver's table layout (one per
+section start or end in a block's life, `<section>_start`/`<section>_end`, and per data column)
+to ClickHouse over HTTP. A global sink, installed in `run_node`
 before `P2P::spawn`; `ethlambda_telemetry::emit(|| ...)` builds nothing when it is off. Rows
 come from `BlockImportReport::telemetry_events` (final pass only, `imported_here`),
-`CascadeTelemetry` (arrival rows, and beacon `attestable` at the per-arrival head
+`CascadeTelemetry` (arrival rows, and beacon `fc_head_*` at the per-arrival head
 recomputation), and p2p's column rows: `column_checks::column_rows` (after the check), and
 `passed_rows` called directly by the gossip-accept path and by this node's own fulu columns. See
 [`docs/telemetry.md`](docs/telemetry.md).
