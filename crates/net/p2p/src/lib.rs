@@ -1217,6 +1217,12 @@ pub(crate) const MESH_N: usize = 8;
 /// one two epochs later does exactly that.
 const PRUNE_BACKOFF: Duration = Duration::from_secs(60);
 
+/// The most messages one inbound gossipsub RPC may carry, and so also the most
+/// this node asks one peer for with IWANT in a heartbeat: the second must not
+/// exceed the first, or a peer that answers in one RPC is refused for doing
+/// what was asked (see `max_control_messages_sent` in [`gossipsub_config`]).
+const MAX_GOSSIP_MESSAGES_PER_RPC: usize = 500;
+
 /// The gossipsub parameters both wires share.
 ///
 /// `mesh_n` 8, low 6, high 12, the 700ms heartbeat, and the 6/3 history already
@@ -1256,7 +1262,15 @@ pub(crate) fn gossipsub_config(
         // Since libp2p-gossipsub 0.50, an RPC over this limit fails to decode
         // and its inbound stream is closed; earlier releases processed
         // messages up to the limit and dropped the rest.
-        .max_publish_messages(500)
+        .max_publish_messages(MAX_GOSSIP_MESSAGES_PER_RPC)
+        // How many message ids this node asks one peer for with IWANT in a
+        // heartbeat, and names per topic in one IHAVE. go-libp2p-pubsub
+        // (Prysm) answers an IWANT with every message it named in one RPC,
+        // split only by size, so asking for more than the cap above would
+        // have that answer refused whole: its stream closed, and every id in
+        // it left a broken promise that scoring charges to an honest peer.
+        // Lighthouse pairs the two limits the same way.
+        .max_control_messages_sent(MAX_GOSSIP_MESSAGES_PER_RPC)
         // libp2p-gossipsub 0.50 refuses an RPC whose subscriptions and control
         // messages add up to more than this, 16 KiB by default, as a decode
         // error that closes the stream it came on. A beacon peer on every
@@ -4535,6 +4549,17 @@ mod tests {
         let config = gossipsub_config(Duration::from_secs(1), true);
         assert!(config.unsubscribe_backoff() >= peers_backoff);
         assert!(config.unsubscribe_backoff() >= config.prune_backoff());
+    }
+
+    /// An honest go-libp2p-pubsub peer answers an IWANT with every message it
+    /// named in one RPC, and gossipsub refuses an RPC over
+    /// `max_publish_messages` whole. Asking one peer for more ids in a
+    /// heartbeat than that cap would have the answer refused and the peer
+    /// charged for the promises it did keep.
+    #[test]
+    fn an_iwant_never_asks_for_more_than_one_rpc_may_carry() {
+        let config = gossipsub_config(Duration::from_secs(1), true);
+        assert!(config.max_control_messages_sent() <= config.max_publish_messages());
     }
 
     /// Every beacon topic under `fork_digest` for a node on every subnet: the
