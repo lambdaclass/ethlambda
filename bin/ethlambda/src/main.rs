@@ -73,7 +73,7 @@ use ethlambda_types::{
         BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, phase0,
     },
     beacon::fork::ForkName,
-    beacon::primitives::Epoch,
+    beacon::primitives::{Epoch, ExecutionAddress},
     beacon::signing::compute_epoch_at_slot,
     genesis::{GenesisConfig, verify_state_genesis},
     state::{State, ValidatorPubkeyBytes},
@@ -514,6 +514,19 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             })
             .transpose()?,
     };
+    let fallback_fee_recipient = match &network {
+        Network::Lean(_) => None,
+        Network::Mainnet { mainnet, .. } => mainnet.fallback_fee_recipient,
+    };
+    // Accepted, like the validator client's `--suggested-fee-recipient`, but
+    // said loudly: a proposal that falls back to it logs only at debug, so
+    // this is the one place the burned fees are mentioned.
+    if fallback_fee_recipient == Some(ExecutionAddress::ZERO) {
+        error!(
+            "--fallback-fee-recipient is the zero address. Every locally built payload \
+             for a proposer no validator client named a fee recipient for burns its fees."
+        );
+    }
     let builder_fallback = match &network {
         Network::Lean(_) => ethlambda_rpc::FallbackThresholds::DEFAULT,
         Network::Mainnet { mainnet, .. } => ethlambda_rpc::FallbackThresholds {
@@ -916,7 +929,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         ethlambda_state_transition::beacon::sync_committee_pool::SharedSyncCommitteePool::default();
     // Filled by `prepare_beacon_proposer` and builder registrations, read by
     // block production and by the chain actor's `payload_attributes` event.
-    let fee_recipients = ethlambda_blockchain::FeeRecipients::default();
+    let fee_recipients = ethlambda_blockchain::FeeRecipients::with_fallback(fallback_fee_recipient);
     // Before the P2P actor starts, so its first column rows are not lost.
     if let Some(url) = telemetry_url {
         let url = url.into_inner();
@@ -961,6 +974,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let p2p_events = events.clone();
     let rpc_sync_status = sync_status.clone();
     let p2p_store = setup.store.clone();
+    // The payload builds the chain actor starts ahead of their slots, which
+    // block production collects.
+    let prepared_payloads = ethlambda_blockchain::PreparedPayloads::default();
+    let rpc_prepared_payloads = prepared_payloads.clone();
     let rpc_custody_columns = match &setup.chain {
         ChainActor::Beacon {
             custody_columns, ..
@@ -1009,6 +1026,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     fee_recipients: fee_recipients.clone(),
                     builder_market: builder_market.clone(),
                     always_prepare: always_prepare_payload,
+                    prepared_payloads,
                 },
                 &chain_group,
             )
@@ -1057,6 +1075,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 builder_market: builder_market.clone(),
                 sync_committee_pool: sync_committee_pool.clone(),
                 fee_recipients: fee_recipients.clone(),
+                prepared_payloads: rpc_prepared_payloads.clone(),
                 custody_columns: rpc_custody_columns.clone(),
                 engine: rpc_engine.clone(),
                 events: rpc_events,
@@ -2569,12 +2588,17 @@ async fn fetch_initial_beacon_state(
                 .expect("repair_head leaves the head naming a real block");
             let gap = current_slot.saturating_sub(head_slot);
 
+            // Both resuming returns cache the head's state first, so gossip
+            // validation can check a parentless block's signature from the
+            // first message on; see `Store::cache_head_state`.
             if gap <= MAX_RESUMABLE_DB_STATE_AGE {
                 info!(head_slot, current_slot, gap, "Resuming from existing DB");
+                store.cache_head_state()?;
                 return Ok(store);
             }
             if checkpoint_urls.is_empty() {
                 warn!(head_slot, current_slot, gap, "DB is stale; resuming anyway");
+                store.cache_head_state()?;
                 return Ok(store);
             }
             warn!(head_slot, current_slot, gap, "DB is stale; checkpoint sync");

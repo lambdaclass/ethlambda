@@ -826,11 +826,7 @@ async fn the_self_build_takes_its_fee_recipient_and_gas_target_from_the_preferen
     let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let proposer = world.prepared().proposer;
-    world
-        .fee_recipients
-        .lock()
-        .unwrap()
-        .insert(proposer, address(0xbb));
+    world.fee_recipients.insert(proposer, address(0xbb));
     world.prime_preferences(address(0xaa), 31_000_000);
 
     let reply = produce(&world, Some(&engine), true, &builder_config(0, 0)).await;
@@ -856,11 +852,7 @@ async fn without_preferences_the_self_build_falls_back_to_the_prepared_recipient
     let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     let proposer = world.prepared().proposer;
-    world
-        .fee_recipients
-        .lock()
-        .unwrap()
-        .insert(proposer, address(0xbb));
+    world.fee_recipients.insert(proposer, address(0xbb));
 
     let reply = produce(&world, Some(&engine), true, &builder_config(0, 0)).await;
 
@@ -876,7 +868,7 @@ async fn without_preferences_the_self_build_falls_back_to_the_prepared_recipient
         format!("0x{:x}", 30_000_000u64)
     );
 
-    // Neither: the zero address.
+    // Neither, and no `--fallback-fee-recipient`: the zero address.
     let world = World::proposing();
     let engine = fake_engine(GWEI, false).await;
     produce(&world, Some(&engine), true, &builder_config(0, 0)).await;

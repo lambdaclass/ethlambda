@@ -180,21 +180,17 @@ impl Validated {
 
     /// A copy of this object to send on if its stateful checks overrun
     /// [`STATEFUL_CHECK_DEADLINE`], when the object itself is still inside the
-    /// running check. Only a block or a column gets one: [`Self::forward`]
-    /// sends those on without a verdict (a block to the chain actor, whose
-    /// import judges it again; a column through [`column_checks`]), exactly as
-    /// it does on `Ignore(Overloaded)`. Every other kind is dropped on an
-    /// `Ignore`, so a copy would be dropped unused.
+    /// running check. Only a column gets one: [`Self::forward`] sends a
+    /// column on without a verdict, through [`column_checks`], exactly as it
+    /// does on `Ignore(Overloaded)`. Every other kind is dropped on an
+    /// `Ignore` (a block too, since its signature may not have been checked),
+    /// so a copy would be dropped unused.
     ///
-    /// Taken for every block and column, since a deadline cannot be known in
-    /// advance. A column is a few tens of kilobytes and a block one per slot,
-    /// which is small next to the KZG or signature checks the copy waits on.
+    /// Taken for every column, since a deadline cannot be known in advance. A
+    /// column is a few tens of kilobytes, which is small next to the KZG
+    /// checks the copy waits on.
     fn unjudged_copy(&self) -> Option<Self> {
         match self {
-            Self::Block { block, block_root } => Some(Self::Block {
-                block: block.clone(),
-                block_root: *block_root,
-            }),
             Self::Column(sidecar) => Some(Self::Column(sidecar.clone())),
             _ => None,
         }
@@ -261,8 +257,16 @@ impl Validated {
     /// Hand this object on towards the chain actor, given its gossip
     /// `outcome`.
     ///
-    /// A block goes straight to the chain actor whatever the outcome, since
-    /// its import runs the state transition, which judges it again. A column
+    /// A block goes on only on `Accept` or `Queue`, the two outcomes that
+    /// mean its proposer signature verified (see
+    /// `gossip::block::queue_if_signed`). Its import runs the state transition,
+    /// which judges it again, but a block that has to wait first (for its
+    /// parent, then for its custody columns) is kept unjudged the whole time,
+    /// so one whose signature nobody checked must never reach the actor:
+    /// mainnet gossip carries altered copies of real blocks that no peer has
+    /// columns for. Anything else (`Overloaded` included) is dropped, and a
+    /// real block dropped here still arrives through a child's by-root fetch
+    /// or range sync. A column
     /// goes straight there only on `Accept`: the chain actor keeps a column
     /// without checking it, so one gossip did not finish judging goes through
     /// [`column_checks`] first. An aggregate goes on only on `Accept`, and
@@ -360,7 +364,7 @@ impl Validated {
             return;
         };
         match self {
-            Self::Block { block, .. } => {
+            Self::Block { block, .. } if matches!(outcome, Outcome::Accept | Outcome::Queue(_)) => {
                 // `decode_start` is the wire arrival, so the import's decode
                 // section spans the decode and gossip validation.
                 let arrival = BlockArrival {
@@ -369,9 +373,8 @@ impl Validated {
                     deferred_from: None,
                 };
                 // Only a block that passed validation is announced: one
-                // forwarded on `Queue` or `Ignore(Overloaded)` still imports,
-                // but `block_gossip` names blocks that passed the topic's
-                // rules.
+                // forwarded on `Queue` still imports, but `block_gossip`
+                // names blocks that passed the topic's rules.
                 let announcement = if outcome == Outcome::Accept {
                     BlockAnnouncement::Announce
                 } else {
@@ -442,7 +445,8 @@ impl Validated {
                     .new_proposer_preferences(proposal_slot)
                     .inspect_err(|err| warn!(%err, "Failed to report proposer preferences"));
             }
-            Self::Aggregate { .. }
+            Self::Block { .. }
+            | Self::Aggregate { .. }
             | Self::Attestation { .. }
             | Self::Envelope(_)
             // Their events went out above, in `publish_gossip_event`.
@@ -685,10 +689,10 @@ impl Handler<GossipVerdict> for P2PServer {
             }
             // The check still runs, holding its permit; its result will be
             // dropped. Its object goes on as it would on `Overloaded` (see
-            // `report_overloaded`): a block or a column through the copy
-            // taken for this, which `forward` sends on whatever the outcome,
-            // so a slow check of a valid block does not leave the chain actor
-            // to learn of it through a by-root fetch or range sync.
+            // `report_overloaded`): a column through the copy taken for
+            // this, which `forward` sends through `column_checks`, so a slow
+            // check of a valid column does not leave the chain actor to learn
+            // of it through a by-root fetch. A block is dropped, as there.
             Err(JobError::DeadlineExceeded) => {
                 warn!(
                     kind = id.kind,
@@ -793,8 +797,8 @@ fn pool_of(object: &Validated) -> &'static str {
 /// `Ignore(ValidationTimeout)` anyway. One mainnet slot: a check that has not
 /// finished by then is hung, and gossipsub would otherwise hold its message
 /// until the cache evicts it. Past it the check's own result is dropped, but
-/// a block or a column still goes on, as on `Ignore(Overloaded)` (see
-/// [`Validated::unjudged_copy`]).
+/// a column still goes on, as on `Ignore(Overloaded)` (see
+/// [`Validated::unjudged_copy`]); a block is dropped, as on that outcome.
 pub(crate) const STATEFUL_CHECK_DEADLINE: Duration = Duration::from_secs(12);
 
 /// Run `object`'s stateful checks off the actor, as a job owned by the p2p
@@ -810,13 +814,14 @@ pub(crate) const STATEFUL_CHECK_DEADLINE: Duration = Duration::from_secs(12);
 ///
 /// With every permit taken, the object is reported `Ignore(Overloaded)`
 /// instead of queued: queueing it would only make its verdict later than
-/// gossipsub's cache can wait for, so it never propagates unvalidated. A block
-/// still goes on towards the chain actor regardless: its import runs the
-/// state transition, which judges it again. A column goes through
-/// [`column_checks`] instead (see [`Validated::forward`]); dropping either
-/// here would leave the actor to learn of it only through a child's by-root
-/// fetch or range sync, both far slower than gossip. An aggregate or a subnet
-/// attestation is not forwarded on this outcome at all: see
+/// gossipsub's cache can wait for, so it never propagates unvalidated. A
+/// column still goes on, through [`column_checks`] (see
+/// [`Validated::forward`]); dropping it here would leave the actor to learn of
+/// it only through a by-root fetch, far slower than gossip. A block is
+/// dropped: its signature went unchecked, and [`Validated::forward`] keeps
+/// every such block off the chain actor. None was measured overloaded on the
+/// mainnet followers over the 24 hours before this changed. An aggregate or a
+/// subnet attestation is not forwarded on this outcome either: see
 /// [`Validated::forward`]'s own documentation for why. A check that overruns
 /// [`STATEFUL_CHECK_DEADLINE`] is treated the same way, with
 /// `Ignore(ValidationTimeout)`.
@@ -1147,8 +1152,9 @@ mod tests {
     /// `Ignore`/`Reject` too, since `forward`'s guard is the same `if let ...
     /// if outcome == Outcome::Accept` for all three) must never reach the
     /// chain actor.
-    /// `block_gossip` names blocks that passed validation, so a block
-    /// forwarded on any other verdict still imports but is not announced.
+    /// `block_gossip` names blocks that passed validation. A queued block is
+    /// still forwarded, to import once it can, but is not announced; one the
+    /// validation pool never judged (`Overloaded`) is not forwarded at all.
     #[tokio::test]
     async fn only_an_accepted_gossip_block_is_announced() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
@@ -1178,11 +1184,7 @@ mod tests {
             .collect();
         assert_eq!(
             announcements,
-            [
-                BlockAnnouncement::Announce,
-                BlockAnnouncement::Silent,
-                BlockAnnouncement::Silent
-            ]
+            [BlockAnnouncement::Announce, BlockAnnouncement::Silent]
         );
         chain.assert_no_unexpected();
     }
@@ -1203,6 +1205,32 @@ mod tests {
         );
 
         assert_nothing_sent(&chain).await;
+    }
+
+    /// A block reaches the chain actor only on the outcomes that mean its
+    /// signature verified: a block the validation pool had no permit for was
+    /// never judged at all, so it is dropped rather than handed on.
+    #[tokio::test]
+    async fn only_an_accepted_or_queued_block_is_forwarded() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let cases = [
+            (Outcome::Accept, true),
+            (Outcome::Queue(QueueReason::ParentNotReady), true),
+            (Outcome::Ignore(IgnoreReason::Overloaded), false),
+            (Outcome::Ignore(IgnoreReason::SignatureUnverified), false),
+            (Outcome::Reject(RejectReason::BadSignature), false),
+        ];
+        for (outcome, expected) in cases {
+            let chain = recording_chain(&mut server);
+            let object = Validated::Block {
+                block: Box::new(fulu_block(5, 1)),
+                block_root: Root::repeat_byte(5),
+            };
+            object.forward(&server, Instant::now(), outcome);
+            chain.settle().await;
+            let forwarded = !chain.take_all::<NewBlock>().is_empty();
+            assert_eq!(forwarded, expected, "{outcome:?}");
+        }
     }
 
     /// An accepted electra aggregate is what block production packs other
@@ -2123,18 +2151,18 @@ mod tests {
         server.child_handle().stop();
     }
 
-    /// A block whose check overruns its deadline still reaches the chain
-    /// actor, unannounced, as an overloaded one does; the check's late
-    /// `Accept` sends nothing more.
+    /// A block whose check overruns its deadline never reaches the chain
+    /// actor, as an overloaded one does not: its signature may be
+    /// unchecked. The check's late `Accept` sends nothing either.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_hung_block_check_still_forwards_the_block_once() {
+    async fn a_hung_block_check_forwards_nothing() {
         const KIND: &str = "test_hung_block_check";
         let block = || Validated::Block {
             block: Box::new(fulu_block(5, 1)),
             block_root: Root::repeat_byte(1),
         };
         let unjudged = block().unjudged_copy();
-        assert!(unjudged.is_some());
+        assert!(unjudged.is_none());
         let (server, chain) = run_checks(KIND, Duration::from_millis(50), unjudged, move || {
             std::thread::sleep(Duration::from_millis(500));
             (Outcome::Accept, block())
@@ -2145,20 +2173,21 @@ mod tests {
             metrics::beacon_gossip_verdicts(KIND, "ignore", "validation_timeout"),
             (1, 1)
         );
-        // Past the check's late return: still one verdict and one block.
+        // Past the check's late return: still one verdict, and no block.
         tokio::time::sleep(Duration::from_millis(800)).await;
-        chain.settle().await;
         assert_eq!(metrics::beacon_gossip_verdicts(KIND, "", "").0, 1);
-        let sent: Vec<NewBlock> = chain.take_all();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].announcement, BlockAnnouncement::Silent);
-        assert_eq!(chain.received().len(), 1);
+        assert_nothing_sent(&chain).await;
         server.child_handle().stop();
     }
 
-    /// Only a block or a column has a copy to send on without a verdict.
+    /// Only a column has a copy to send on without a verdict.
     #[test]
-    fn only_blocks_and_columns_have_an_unjudged_copy() {
+    fn only_columns_have_an_unjudged_copy() {
+        let block = Validated::Block {
+            block: Box::new(fulu_block(5, 1)),
+            block_root: Root::repeat_byte(1),
+        };
+        assert!(block.unjudged_copy().is_none());
         let aggregate = Validated::Aggregate {
             aggregate: Box::new(phase0_aggregate(5, 1)),
             attesting_indices: Vec::new(),

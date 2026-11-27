@@ -466,9 +466,12 @@ the chain actor writes, so no request waits on the actor.
   next slot's block is asked for. Entries more than an epoch old are dropped
   once a slot.
 - **`prepare_beacon_proposer`** records each validator's fee recipient, in
-  memory, so a restart forgets it and the node builds its own payloads for the
-  zero address until the next call. ethlambda's validator client repeats the
-  call every slot, as Lighthouse's does.
+  memory, so a restart forgets it and the node builds its own payloads for
+  `beacon --fallback-fee-recipient` (the zero address without it) until the
+  next call. ethlambda's validator client repeats the call every slot, as
+  Lighthouse's does. The fallback pays any proposer no validator client named
+  a recipient for, but does not register it: the `payload_attributes` event
+  still follows `prepare_beacon_proposer`.
 - **`register_validator`** takes a JSON array or an SSZ list of signed
   builder registrations. Registrations of validators the head state does not
   hold, or holds as exited, are dropped and counted
@@ -1158,10 +1161,11 @@ How `payload_attributes` behaves:
 - **What it carries** is what `produceBlockV3`/`produceBlockV4` would send the
   execution client for a block at `proposal_slot` on the current head, from
   the same code: the head state advanced to the slot, the fee recipient
-  (gloas: the proposer's signed preferences, else `prepare_beacon_proposer`'s,
-  else the zero address), and on gloas the parent payload fork choice selects
-  (the head's payload status, and for a head at the previous slot the PTC's
-  votes on its payload) and the preferences' gas target. `payload_attributes`
+  (on gloas the proposer's signed preferences first, then on every fork
+  `prepare_beacon_proposer`'s, else `--fallback-fee-recipient`, else the zero
+  address), and on gloas the parent payload fork choice selects (the head's
+  payload status, and for a head at the previous slot the PTC's votes on its
+  payload) and the preferences' gas target. `payload_attributes`
   is the execution API's `PayloadAttributesV3` (`V4` from gloas) in
   `snake_case` with quoted integers.
 - **When**: at two thirds of each slot (Lighthouse's default
@@ -1181,13 +1185,30 @@ How `payload_attributes` behaves:
   `prepare_beacon_proposer` or a builder registration, or every proposer with
   `beacon --always-prepare-payload`, which an external builder reading this
   stream (ethereum-package's buildoor) needs.
-- **Nothing reaches the execution client early.** Other clients send a
-  `forkchoiceUpdated` with these attributes at the same point, so the payload
-  is already building when `produceBlock` arrives; this node still starts the
-  build at `produceBlock`.
+- **The build starts here too.** With an execution client, the same
+  computation sends `forkchoiceUpdated` with these attributes, as other
+  clients do at the same point, and again whenever a re-check finds new
+  inputs. `produceBlockV3` and `produceBlockV4` then collect that build with
+  `getPayload` when their own attributes match it (same slot, parent payload
+  and attributes): at once, the execution client having had seconds to fill
+  it, unless a late re-check restarted it less than half a second before, in
+  which case they wait for the rest of that half second. Otherwise they start
+  the build themselves and collect it half a second later: asked at once,
+  geth and ethrex answer with the payload they started from, with few or none
+  of the pending transactions (lambdaclass/ethlambda#894). The update carries
+  the same safe and finalized hashes as the head's own `forkchoiceUpdated`
+  (the finalized block as safe too when the head moved since the build's head
+  was read), and one the execution client has not answered by the proposal
+  slot's start, or by the time its inputs change, is abandoned.
 
 Event payloads are built only while at least one client is connected, whatever
-topics that client asked for; with none, the stream costs nothing.
+topics that client asked for; with none, the stream costs nothing. A proposal
+on a node with an execution client is computed either way, for its build, as
+long as some validator client registered a proposer here (or
+`--always-prepare-payload` is set). Its event is then kept, and a client that
+subscribes later in the window gets it at the next re-check, as it would
+from a node that computes only for subscribers; each set of inputs' event
+is sent once.
 
 ## Metrics & Debug Server (`:5054`)
 
