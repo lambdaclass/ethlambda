@@ -46,6 +46,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::beacon::validator::head;
+use crate::metrics::{self, PqCommitteeProof};
 
 /// Start proving PQ aggregates at every aggregator's cutoff, if the network
 /// schedules PQ. Stops with `shutdown`.
@@ -109,6 +110,7 @@ async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
         return;
     };
     let deadline = Instant::now() + Duration::from_millis(budget);
+    let slot_start = slot_start_ms(config, slot);
     let store = store.clone();
     let spawned = Instant::now();
     let job = tokio::task::spawn_blocking(move || {
@@ -150,8 +152,21 @@ async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
             let committee_started = Instant::now();
             let result = prove_committee(&store, &state, group);
             let took_ms = committee_started.elapsed().as_millis() as u64;
+            let on_time = Instant::now() < deadline;
+            // Every proof made, late ones too: a late one is what the seat's
+            // window could not hold.
+            if let Ok((aggregate, proving)) = &result {
+                let proof = PqCommitteeProof {
+                    proving: *proving,
+                    ready_offset: Duration::from_millis(now_ms().saturating_sub(slot_start)),
+                    signatures: aggregate.attesting_indices.len(),
+                    proof_bytes: aggregate.proof.len(),
+                };
+                metrics::observe_pq_committee_proof(position, &proof);
+            }
             match result {
-                Ok((aggregate, prove_ms)) if Instant::now() < deadline => {
+                Ok((aggregate, proving)) if on_time => {
+                    let prove_ms = proving.as_millis() as u64;
                     proved += 1;
                     prove_ms_total += prove_ms;
                     info!(
@@ -167,7 +182,8 @@ async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
                     store.pq_aggregate_pool().insert((*aggregate).clone());
                     store.pq_signature_pool().insert_proven(aggregate);
                 }
-                Ok((aggregate, prove_ms)) => {
+                Ok((aggregate, proving)) => {
+                    let prove_ms = proving.as_millis() as u64;
                     late += 1;
                     prove_ms_total += prove_ms;
                     warn!(
@@ -195,6 +211,17 @@ async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
                 }
             }
         }
+        let unproved = committees - already_proven - proved - failed - late;
+        let outcomes = [
+            ("proved", proved),
+            ("late", late),
+            ("failed", failed),
+            ("already_proven", already_proven),
+            ("unproved", unproved),
+        ];
+        for (outcome, count) in outcomes {
+            metrics::inc_pq_committee_proofs(position, outcome, count as u64);
+        }
         // One line for the seat's whole proving pass: what leanVM was asked
         // for, what it cost, and what the budget left undone.
         info!(
@@ -206,7 +233,7 @@ async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
             already_proven,
             failed,
             late,
-            unproved = committees - already_proven - proved - failed - late,
+            unproved,
             queued_ms,
             state_ms,
             prove_ms = prove_ms_total,
@@ -223,13 +250,13 @@ async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
 /// positions, signatures in committee order, which is the order
 /// `get_attestation_statements` lists their keys in.
 ///
-/// Also returns how long the proof itself took, in milliseconds: the rest
-/// of the call is reading the committee and assembling the statements.
+/// Also returns how long the proof itself took: the rest of the call is
+/// reading the committee and assembling the statements.
 fn prove_committee(
     store: &Store,
     state: &BeaconState,
     group: CommitteeSignatures,
-) -> Result<(Arc<PooledPqAggregate>, u64), String> {
+) -> Result<(Arc<PooledPqAggregate>, Duration), String> {
     let committees = store.committee_cache();
     let epoch_committees = committees.committees(state, group.data.target.epoch);
     let committee = epoch_committees
@@ -267,7 +294,7 @@ fn prove_committee(
         &[signatures],
     )
     .map_err(|err| err.to_string())?;
-    let prove_ms = proving.elapsed().as_millis() as u64;
+    let proving = proving.elapsed();
     attesting_indices.sort_unstable();
     let aggregate = Arc::new(PooledPqAggregate {
         attestation,
@@ -277,7 +304,7 @@ fn prove_committee(
             .try_into()
             .map_err(|_| "the proof exceeds MAX_STARK_PROOF_SIZE".to_string())?,
     });
-    Ok((aggregate, prove_ms))
+    Ok((aggregate, proving))
 }
 
 fn now_ms() -> u64 {
@@ -311,7 +338,111 @@ fn next_slot_to_seal(config: &Config, now_ms: u64) -> Slot {
 
 #[cfg(test)]
 mod tests {
+    use ethlambda_metrics::series_value;
+    use ethlambda_state_transition::beacon::helpers::pq::initialize_aggregation_committee_window;
+    use ethlambda_state_transition::beacon::helpers::test_state::with_validators_at;
+    use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint};
+    use ethlambda_types::beacon::primitives::Root;
+
     use super::*;
+    use crate::test_utils::beacon_store_at;
+
+    /// A seat's proving pass leaves its work on `/metrics`: the proof's
+    /// proving time, readiness, signatures and size under the seat's
+    /// position, and each committee it was due to prove under its outcome.
+    /// The next seat, with nothing new to prove, counts the committee as
+    /// already proven and times nothing.
+    #[tokio::test]
+    async fn a_seats_proving_pass_is_timed_and_counted() {
+        let mut state = with_validators_at(ForkName::Pq, 256);
+        // The builder leaves the aggregation committees empty; the fork
+        // upgrade fills them like this.
+        let window = initialize_aggregation_committee_window(&state).unwrap();
+        let BeaconState::Pq(inner) = &mut state else {
+            unreachable!("built at PQ")
+        };
+        inner.aggregation_committee_window = window;
+        let slot = state.slot();
+        let epoch = compute_epoch_at_slot(slot);
+        let (store, _root) = beacon_store_at(state.clone());
+        // A wall clock between 5 and 6 s into `slot`: before seat 0's
+        // broadcast at 7.2 s and seat 1's at 7.8 s, so both have time left.
+        let mut config = Config::mainnet();
+        config.genesis_time = (now_ms() - 5_000 - slot * config.slot_duration_ms) / 1000;
+
+        let committee = 0;
+        let aggregators = get_aggregation_committee(&state, slot, committee).unwrap();
+        let members = store
+            .committee_cache()
+            .committees(&state, epoch)
+            .committee(slot, committee)
+            .unwrap()
+            .to_vec();
+        let data = AttestationData {
+            slot,
+            index: 0,
+            beacon_block_root: Root::repeat_byte(1),
+            source: state.current_justified_checkpoint(),
+            target: Checkpoint {
+                epoch,
+                root: Root::repeat_byte(2),
+            },
+        };
+        {
+            let mut pool = store.pq_signature_pool();
+            for &aggregator in aggregators.iter().take(2) {
+                assert!(pool.subscribe(slot, slot, committee, aggregator));
+            }
+            for &attester_index in &members {
+                let attestation = pq::SingleAttestation {
+                    committee_index: committee,
+                    attester_index,
+                    data,
+                    signature: Default::default(),
+                };
+                assert!(pool.insert(slot, &attestation));
+            }
+        }
+
+        let count = |outcome: &str, position: u64| {
+            let series = format!(
+                r#"lean_beacon_pq_committee_proofs_total{{outcome="{outcome}",position="{position}"}}"#
+            );
+            series_value(&series).unwrap_or(0.0)
+        };
+        let timed = |position: u64| {
+            let series =
+                format!(r#"lean_beacon_pq_committee_proof_seconds_count{{position="{position}"}}"#);
+            series_value(&series).unwrap_or(0.0)
+        };
+        let signatures_before =
+            series_value("lean_beacon_pq_committee_proof_signatures_sum").unwrap_or(0.0);
+
+        prove_seat(&store, &config, slot, 0).await;
+        assert_eq!(store.pq_aggregate_pool().candidates(slot).len(), 1);
+        assert_eq!(count("proved", 0), 1.0);
+        for outcome in ["late", "failed", "already_proven", "unproved"] {
+            assert_eq!(count(outcome, 0), 0.0, "{outcome}");
+        }
+        assert_eq!(timed(0), 1.0);
+        let ready = series_value(
+            r#"lean_beacon_pq_committee_proof_ready_offset_seconds_sum{position="0"}"#,
+        )
+        .unwrap();
+        assert!((5.0..7.2).contains(&ready), "ready {ready} s into the slot");
+        let signatures =
+            series_value("lean_beacon_pq_committee_proof_signatures_sum").unwrap_or(0.0);
+        assert_eq!(signatures - signatures_before, members.len() as f64);
+        assert_eq!(
+            series_value("lean_beacon_pq_committee_proof_size_bytes_count"),
+            Some(1.0)
+        );
+
+        prove_seat(&store, &config, slot, 1).await;
+        assert_eq!(count("already_proven", 1), 1.0);
+        assert_eq!(count("proved", 1), 0.0);
+        assert_eq!(timed(1), 0.0);
+    }
 
     #[test]
     fn each_seat_proves_between_its_cutoff_and_its_broadcast() {

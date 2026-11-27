@@ -1770,6 +1770,82 @@ pub fn observe_beacon_aggregate_end_to_end(duration: Duration) {
     LEAN_BEACON_AGGREGATE_END_TO_END_SECONDS.observe(duration.as_secs_f64());
 }
 
+/// Record one merge of a PQ block's attestation proofs, when it ends: how
+/// long leanVM took, how many child proofs it folded, and the merged proof's
+/// size when there is one.
+///
+/// `phase` is `ahead` for a packing started ahead of the slot and
+/// `production` for one block production ran itself. A merge that failed or
+/// outlived its budget is observed like any other: its cost is still cost,
+/// and [`inc_pq_merges`] says what became of it.
+pub fn observe_pq_merge(
+    phase: &str,
+    elapsed: Duration,
+    children: usize,
+    proof_bytes: Option<usize>,
+) {
+    static LEAN_BEACON_PQ_MERGE_SECONDS: std::sync::LazyLock<HistogramVec> =
+        std::sync::LazyLock::new(|| {
+            register_histogram_vec!(
+                "lean_beacon_pq_merge_seconds",
+                "Time leanVM took to merge a PQ block's attestation proofs into one, by phase",
+                &["phase"],
+                vec![
+                    0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0
+                ]
+            )
+            .unwrap()
+        });
+    static LEAN_BEACON_PQ_MERGE_CHILDREN: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_beacon_pq_merge_children",
+                "Child proofs one merge of a PQ block's attestation proofs folded",
+                vec![2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0]
+            )
+            .unwrap()
+        });
+    static LEAN_BEACON_PQ_MERGED_PROOF_SIZE_BYTES: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_beacon_pq_merged_proof_size_bytes",
+                "Bytes size of a PQ block's merged attestation proof",
+                vec![
+                    131072.0, 163840.0, 196608.0, 229376.0, 262144.0, 327680.0, 393216.0, 524288.0,
+                    786432.0, 1048576.0
+                ]
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_PQ_MERGE_SECONDS
+        .with_label_values(&[phase])
+        .observe(elapsed.as_secs_f64());
+    LEAN_BEACON_PQ_MERGE_CHILDREN.observe(children as f64);
+    if let Some(bytes) = proof_bytes {
+        LEAN_BEACON_PQ_MERGED_PROOF_SIZE_BYTES.observe(bytes as f64);
+    }
+}
+
+/// Count one packing that had several proofs to merge, by phase (see
+/// [`observe_pq_merge`]) and by what became of the merge: `merged`, `failed`,
+/// `late` (it outlived its budget) or `skipped` (no time left for it, or
+/// another merge held leanVM). All but `merged` pack one committee's
+/// attestation in place of everything selected.
+pub fn inc_pq_merges(phase: &str, outcome: &str) {
+    static LEAN_BEACON_PQ_MERGES_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_beacon_pq_merges_total",
+                "Packings of a PQ block's attestations with several proofs to merge, by phase and outcome",
+                &["phase", "outcome"]
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_PQ_MERGES_TOTAL
+        .with_label_values(&[phase, outcome])
+        .inc();
+}
+
 /// Count one `engine_getBlobsV2` attempt for a held fulu block, by what came
 /// back: `hit` (every blob), `miss` (the execution client answered `null`, so
 /// at least one blob is not in its pool) or `error` (transport, timeout or a

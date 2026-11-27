@@ -328,8 +328,14 @@ pub fn process_stark(
     for attestation in body.attestations.iter() {
         statements.extend(get_attestation_statements(state, attestation, committees)?);
     }
+    let verifying = std::time::Instant::now();
+    let proven = verify_aggregates(&statements, &body.proof);
+    // A block without attestations has nothing to verify: not a sample.
+    if !statements.is_empty() {
+        crate::metrics::observe_pq_proof_verification("block", verifying.elapsed());
+    }
     verify(
-        verify_aggregates(&statements, &body.proof),
+        proven,
         "process_stark: stark.VerifyAggregates(statements, body.proof)",
     )
 }
@@ -1203,6 +1209,12 @@ mod tests {
             proof: proof.try_into().expect("far below MAX_STARK_PROOF_SIZE"),
             ..pq::BeaconBlockBody::empty()
         };
+        // Each verification is timed as a block's, a refused proof's too.
+        let timed = || {
+            let series = r#"lean_beacon_pq_proof_verification_seconds_count{kind="block"}"#;
+            ethlambda_metrics::series_value(series).unwrap_or(0.0)
+        };
+        let before = timed();
         // The reference encoding: the signatures, in statement order.
         let proof = signatures.concat();
         assert!(process_stark(&state, &body_with(proof.clone()), &committees).is_ok());
@@ -1213,6 +1225,7 @@ mod tests {
         reversed.reverse();
         let reversed = reversed.concat();
         assert!(process_stark(&state, &body_with(reversed), &committees).is_err());
+        assert!(timed() - before >= 3.0);
     }
 
     /// A full-committee attestation to `data_slot` voting for the head and

@@ -397,6 +397,33 @@ static LEAN_BEACON_GOSSIP_VALIDATION_SECONDS: LazyLock<HistogramVec> = LazyLock:
     .unwrap()
 });
 
+/// Record how far into its vote's slot a PQ attestation or aggregate reached
+/// this node, by topic kind (`beacon_attestation`,
+/// `beacon_aggregate_and_proof`: the `kind` values of
+/// `lean_beacon_gossip_validation_seconds`).
+///
+/// The bounds follow a 12-second slot: attestations are due by 4.8 s, and the
+/// four aggregator seats broadcast at 7.2, 7.8, 8.4 and 9.0 s.
+pub fn observe_pq_gossip_arrival_offset(kind: &str, offset: std::time::Duration) {
+    static LEAN_BEACON_PQ_GOSSIP_ARRIVAL_OFFSET_SECONDS: LazyLock<HistogramVec> = LazyLock::new(
+        || {
+            register_histogram_vec!(
+                "lean_beacon_pq_gossip_arrival_offset_seconds",
+                "How far into its vote's slot a PQ attestation or aggregate arrived on gossip, by topic kind",
+                &["kind"],
+                vec![
+                    0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 4.8, 6.0, 7.2, 7.5, 7.8, 8.1, 8.4,
+                    8.7, 9.0, 9.5, 10.0, 12.0, 24.0
+                ]
+            )
+            .unwrap()
+        },
+    );
+    LEAN_BEACON_PQ_GOSSIP_ARRIVAL_OFFSET_SECONDS
+        .with_label_values(&[kind])
+        .observe(offset.as_secs_f64());
+}
+
 static LEAN_BEACON_GOSSIP_VERDICT_EXPIRED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "lean_beacon_gossip_verdict_expired_total",
