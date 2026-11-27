@@ -55,10 +55,12 @@ pub const BLOCK_IMPORT_PHASES: &[&str] = &[
     "cascade_wait",
     "da_check",
     "columns_wait",
-    "engine",
+    "cl",
+    "el_wait",
     "verify_struct",
     "verify_crypto",
     "stf",
+    "store",
     "writer_wait",
     "db_write",
     "fc_head",
@@ -668,9 +670,10 @@ static LEAN_BLOCK_IMPORT_PHASE_SECONDS: std::sync::LazyLock<HistogramVec> =
             // sections may ever be compared against which.
             //
             // Above half a second the edges step by 1.5x and 1.33x rather than
-            // doubling. That is where a mainnet block's `stf`, `block_atts`,
-            // `queue` and `total` all sit, and with doubling edges a 16%
-            // drop in the mean `stf` left its percentiles interpolated inside
+            // doubling. That is where a mainnet block's state transition,
+            // `block_atts`, `queue` and `total` all sit, and with doubling
+            // edges a 16% drop in the mean `stf` (since split into `cl` and
+            // `store` on beacon) left its percentiles interpolated inside
             // the same two buckets. The ladder also puts an edge on one
             // mainnet slot. It stops at 32 s, so a longer section (in
             // practice a `parent_wait`) lands in `+Inf`.
@@ -1617,7 +1620,7 @@ pub fn inc_engine_speculation(outcome: &str) {
 ///
 /// For a pre-gloas block the import computes the state transition meanwhile,
 /// so this is not what the import waited: that is
-/// `lean_block_import_phase_seconds`'s `engine` phase, only the request's
+/// `lean_block_import_phase_seconds`'s `el_wait` phase, only the request's
 /// construction whenever the answer was in before the transition finished.
 /// This is the execution
 /// client's own processing time. `outcome` is `valid`, `optimistic`,

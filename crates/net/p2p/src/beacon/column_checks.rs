@@ -153,7 +153,7 @@ pub(crate) fn passed_rows_under(
     validated_at: Instant,
 ) -> Vec<BlockEvent> {
     let validated = column_event(
-        "column_validated",
+        "column_end",
         sidecar,
         block_root,
         arrival.source(),
@@ -162,7 +162,7 @@ pub(crate) fn passed_rows_under(
     match arrival {
         ColumnArrival::Received { at, .. } => vec![
             BlockEvent {
-                stage: "column_recv",
+                stage: "column_start",
                 at,
                 ..validated
             },
@@ -187,7 +187,7 @@ pub(crate) fn column_rows(
         ChainVerdict::AwaitParent => match arrival {
             ColumnArrival::Received { source, at } => {
                 let root = sidecar.block_root().0;
-                vec![column_event("column_recv", sidecar, root, source, at)]
+                vec![column_event("column_start", sidecar, root, source, at)]
             }
             ColumnArrival::Recheck => Vec::new(),
         },
@@ -477,7 +477,7 @@ fn precheck_group(
 ///
 /// Writes each sidecar's `block_events` rows ([`column_rows`]), stamped with
 /// the moment the sub-batch's verdicts were in: a kept sidecar's
-/// `column_validated` is when its sub-batch finished, not when the block's
+/// `column_end` is when its sub-batch finished, not when the block's
 /// last one did.
 fn verify_batch(batch: Vec<Pending>, arrival: ColumnArrival) -> GroupVerdicts {
     let items: Vec<_> = batch.iter().map(|(sidecar, kzg)| (sidecar, kzg)).collect();
@@ -1289,13 +1289,13 @@ pub(crate) mod tests {
 
         assert_eq!(
             rows(column_rows(&sidecar, fresh, ChainVerdict::Keep, checked)),
-            [("column_recv", arrived), ("column_validated", checked)]
+            [("column_start", arrived), ("column_end", checked)]
         );
         let awaiting = column_rows(&sidecar, fresh, ChainVerdict::AwaitParent, checked);
         assert_eq!(
             awaiting,
             [BlockEvent {
-                stage: "column_recv",
+                stage: "column_start",
                 at: arrived,
                 slot: 5,
                 block_root: [9; 32],
@@ -1313,7 +1313,7 @@ pub(crate) mod tests {
                 ChainVerdict::Keep,
                 checked
             )),
-            [("column_validated", checked)]
+            [("column_end", checked)]
         );
     }
 
@@ -1341,7 +1341,7 @@ pub(crate) mod tests {
 
         let rows = passed_rows(&sidecar, ColumnArrival::received("by_root", at), at);
         let event = rows[0];
-        assert_eq!(event.stage, "column_recv");
+        assert_eq!(event.stage, "column_start");
         assert_eq!(event.slot, 5);
         assert_eq!(event.block_root, [9; 32]);
         assert_eq!(event.column_index, Some(48));

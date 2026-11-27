@@ -13,15 +13,16 @@ const LIVE_SLOTS: u64 = 2;
 /// One point in a block's life on this node: a row of `block_events`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockEvent {
-    /// Silver's stage name where the meaning matches, `<section>_start` or
-    /// `<section>_end` for ethlambda's other sections.
+    /// `<section>_start` or `<section>_end`: which section of the block's
+    /// life on this node this row starts or ends.
     pub stage: &'static str,
     pub at: Instant,
     pub slot: u64,
     pub block_root: [u8; 32],
     /// How the block or column reached this node.
     pub source: &'static str,
-    /// The execution client's verdict, on `el_verdict` rows only.
+    /// An outcome, on two stages only: the execution client's verdict on
+    /// `el_end`, and the import's (`Imported` or `Failed`) on `import_end`.
     pub verdict: Option<&'static str>,
     /// The data column's index, on `column_*` rows only.
     pub column_index: Option<u64>,
@@ -182,7 +183,7 @@ mod tests {
 
     fn event(at: Instant, slot: u64) -> BlockEvent {
         BlockEvent {
-            stage: "received",
+            stage: "import_start",
             at,
             slot,
             block_root: [0xab; 32],
@@ -216,7 +217,7 @@ mod tests {
             row["event_date_time"],
             (GENESIS_MS + 2 * SLOT_MS + 300) * 1_000_000
         );
-        assert_eq!(row["stage"], "received");
+        assert_eq!(row["stage"], "import_start");
         assert_eq!(row["slot"], 2);
         assert_eq!(
             row["slot_start_date_time"],

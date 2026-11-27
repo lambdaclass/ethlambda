@@ -150,7 +150,7 @@ fn error_text(text: &str) -> String {
 /// can quote the node's own text, the whole of an unexpected string among
 /// it, so it is bounded and written out like a failed answer's body before
 /// it reaches an error and the log line that prints it.
-fn decode_text(err: &serde_json::Error) -> String {
+pub(crate) fn decode_text(err: &serde_json::Error) -> String {
     error_text(&err.to_string())
 }
 
@@ -215,6 +215,15 @@ fn is_media_type(content_type: &str, media_type: &str) -> bool {
 fn builder_config(boost_factor: Option<u64>, min_bid: u64) -> String {
     let factor = boost_factor.unwrap_or(0);
     format!(r#"{{"min_bid":"{min_bid}","builder_boost_factor":"{factor}","builders":[]}}"#)
+}
+
+/// A block request's `&graffiti=` parameter, or nothing when the request
+/// carries no graffiti, so the beacon node applies its own default.
+fn graffiti_param(request: &BlockRequest) -> String {
+    request
+        .graffiti
+        .map(|graffiti| format!("&graffiti={}", encode_hex(&graffiti.0)))
+        .unwrap_or_default()
 }
 
 /// A [`BeaconNodeApi`] backed by one beacon node's standard REST Beacon API.
@@ -816,10 +825,10 @@ impl HttpBeaconNode {
     /// container the bytes are.
     async fn produce_gloas_block(&self, request: &BlockRequest) -> Result<ProducedBlock> {
         let path = format!(
-            "/eth/v4/validator/blocks/{}?randao_reveal={}&graffiti={}&include_payload=true",
+            "/eth/v4/validator/blocks/{}?randao_reveal={}{}&include_payload=true",
             request.slot,
             encode_hex(&request.randao_reveal.0),
-            encode_hex(&request.graffiti.0),
+            graffiti_param(request),
         );
         let response = self
             .post_json_for_ssz(
@@ -1003,10 +1012,11 @@ impl BeaconNodeApi for HttpBeaconNode {
 
     /// Fetches the network's configuration, as far as this client reads it.
     ///
-    /// The spec endpoint returns every configuration value as a quoted
-    /// string. Only the keys [`config_from_spec_response`] names are read
-    /// (the fork schedule, the slot duration, the duty offsets and
-    /// `SHARD_COMMITTEE_PERIOD`); the rest of `Config` keeps its mainnet
+    /// The spec endpoint returns every scalar configuration value as a quoted
+    /// string, and a schedule as a list of objects. Only the keys
+    /// [`config_from_spec_response`] names are read (the fork schedule, the
+    /// slot duration, the duty offsets, `SHARD_COMMITTEE_PERIOD` and
+    /// `GAS_LIMIT_SCHEDULE`); the rest of `Config` keeps its mainnet
     /// defaults, so nothing in this client may rely on those.
     async fn spec(&self) -> Result<Config> {
         let response: DataResponse<serde_json::Value> = self.get("/eth/v1/config/spec").await?;
@@ -1083,6 +1093,7 @@ impl BeaconNodeApi for HttpBeaconNode {
                     index: entry.index,
                     pubkey: parse_pubkey(&entry.validator.pubkey)?,
                     status: entry.status,
+                    slashed: entry.validator.slashed,
                 })
             })
             .collect()
@@ -1158,10 +1169,10 @@ impl BeaconNodeApi for HttpBeaconNode {
             return self.produce_gloas_block(request).await;
         }
         let path = format!(
-            "/eth/v3/validator/blocks/{}?randao_reveal={}&graffiti={}&builder_boost_factor={}",
+            "/eth/v3/validator/blocks/{}?randao_reveal={}{}&builder_boost_factor={}",
             request.slot,
             encode_hex(&request.randao_reveal.0),
-            encode_hex(&request.graffiti.0),
+            graffiti_param(request),
             request.builder_boost_factor.unwrap_or(0),
         );
         // SSZ or JSON, the fork and blindedness settled either way; see
@@ -1614,6 +1625,30 @@ impl BeaconNodeApi for HttpBeaconNode {
             return Err(Error::BeaconNodeSyncing);
         }
         parse_root(&response.data.root)
+    }
+
+    async fn canonical_block_root(&self, slot: Slot) -> Result<Option<Root>> {
+        // A 404 is this endpoint's "no block at that slot", per the
+        // specification.
+        let path = format!("/eth/v1/beacon/headers/{slot}");
+        let response: Option<crate::beacon_node::dto::BlockHeaderResponse> =
+            self.get_optional(&path, StatusCode::NOT_FOUND).await?;
+        let Some(response) = response else {
+            return Ok(None);
+        };
+        let answered = response.data.header.message.slot;
+        // A node may answer an empty slot with the last block before it
+        // rather than a 404. Either way the slot holds no block. A block from
+        // a later slot answers another question.
+        if answered < slot {
+            return Ok(None);
+        }
+        if answered > slot {
+            return Err(Error::InconsistentResponse(format!(
+                "asked for the block at slot {slot}, node answered with one at slot {answered}"
+            )));
+        }
+        parse_root(&response.data.root).map(Some)
     }
 
     /// The same partial-success reading as attestations: see
@@ -2094,6 +2129,42 @@ mod tests {
                 "{} lacks {expected}",
                 seen[0].0
             );
+        }
+    }
+
+    /// `graffiti` is in the query only when the request carries one, at every
+    /// fork, so a node can tell "not set" from "set to empty" and apply its own
+    /// default to the first.
+    #[tokio::test]
+    async fn the_graffiti_is_sent_only_when_one_is_set() {
+        use ethlambda_types::beacon::primitives::Bytes32;
+
+        let chosen = Bytes32::repeat_byte(0xab);
+        let expected = format!("&graffiti={}", encode_hex(&chosen.0));
+        for fork in [ForkName::Fulu, ForkName::Gloas] {
+            for (graffiti, sent) in [
+                (None, None),
+                (
+                    Some(Bytes32::ZERO),
+                    Some(format!("&graffiti=0x{}", "00".repeat(32))),
+                ),
+                (Some(chosen), Some(expected.clone())),
+            ] {
+                let served = serve(500, vec![], vec![]).await;
+                let request = BlockRequest {
+                    fork,
+                    graffiti,
+                    ..block_request(None)
+                };
+                let _ = served.node.produce_block(&request).await;
+                let seen = served.seen.lock().expect("lock");
+                assert_eq!(seen.len(), 1);
+                let uri = &seen[0].0;
+                match &sent {
+                    Some(param) => assert!(uri.contains(param), "{uri} lacks {param}"),
+                    None => assert!(!uri.contains("graffiti"), "{uri} at {fork:?}"),
+                }
+            }
         }
     }
 
@@ -2609,6 +2680,67 @@ mod tests {
         // The two examples are independent, so the bundle's commitments are
         // not the block's; it carries one per blob all the same.
         assert_eq!(bundle.blobs_bundle.commitments.len(), blobs.len());
+    }
+
+    /// The header endpoint's answer, in the shape the specification gives
+    /// it, read for its root. A 404, or a header for an earlier slot, is no
+    /// block at the slot; a header for a later one is an answer to another
+    /// question.
+    #[tokio::test]
+    async fn a_canonical_block_root_is_read_off_the_header_at_the_slot() {
+        let root = format!("0x{}", "ab".repeat(32));
+        let header = |slot: u64| {
+            serde_json::json!({
+                "execution_optimistic": false,
+                "finalized": false,
+                "data": {
+                    "root": root,
+                    "canonical": true,
+                    "header": {
+                        "message": {
+                            "slot": slot.to_string(),
+                            "proposer_index": "7",
+                            "parent_root": format!("0x{}", "00".repeat(32)),
+                            "state_root": format!("0x{}", "00".repeat(32)),
+                            "body_root": format!("0x{}", "00".repeat(32)),
+                        },
+                        "signature": format!("0x{}", "00".repeat(96)),
+                    },
+                },
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let json = vec![("content-type", "application/json")];
+
+        let served = serve(200, json.clone(), header(41)).await;
+        let answer = served.node.canonical_block_root(41).await.expect("answers");
+        assert_eq!(answer, Some(Root::from([0xab; 32])));
+        assert_eq!(
+            served.seen.lock().expect("lock")[0].0,
+            "/eth/v1/beacon/headers/41"
+        );
+
+        let served = serve(404, json.clone(), br#"{"code":404}"#.to_vec()).await;
+        assert_eq!(
+            served.node.canonical_block_root(41).await.expect("answers"),
+            None
+        );
+
+        let served = serve(200, json.clone(), header(40)).await;
+        assert_eq!(
+            served.node.canonical_block_root(41).await.expect("answers"),
+            None,
+            "the block before an empty slot"
+        );
+
+        let served = serve(200, json, header(42)).await;
+        let err = served
+            .node
+            .canonical_block_root(41)
+            .await
+            .expect_err("a header for a later slot");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
     }
 
     #[tokio::test]

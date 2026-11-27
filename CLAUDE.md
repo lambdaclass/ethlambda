@@ -10,7 +10,7 @@ Ethereum Beacon Chain (AKA Eth2), and `ethlambda node` runs Lean consensus.
 **Rust version:** 1.97.1 (edition 2024)
 **Test fixtures release:** Download latest production fixtures from leanSpec releases
 
-## Codebase Structure (16 workspace crates)
+## Codebase Structure (17 workspace crates)
 
 ```
 bin/ethlambda/              # Entry point, CLI, orchestration
@@ -45,8 +45,11 @@ crates/
     ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
     ├─ telemetry/           # ClickHouse block_events rows (opt-in)
     └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
+  execution/
+    └─ ethrex/              # [include-ethrex] ethrex in-process: bootstrap, --ethrex.* flags, eth_ server (docs/ethrex.md)
   net/
     ├─ api/                 # Actor protocol traits wiring BlockChain ↔ P2P, plus the shared sync-gate thresholds (`sync.rs`)
+    ├─ engine/              # Engine API client: JSON-RPC over HTTP, or typed in-process ethrex calls (include-ethrex)
     ├─ p2p/                 # libp2p: gossipsub + req-resp (Status, BlocksByRoot, BlocksByRange, gloas envelopes)
     │   ├─ src/gossipsub/   # Topic encoding, message handling
     │   ├─ src/req_resp/    # Request/response codec and handlers
@@ -101,9 +104,11 @@ make test                                    # All tests + forkchoice spec tests
 
 `make test` is `test-consensus` plus `test-node`, two halves CI runs as separate
 jobs so they build and run in parallel (the split was first forced by an older
-runner's disk, which no longer binds). `CONSENSUS_CRATES` in the Makefile names
-the first; `test-node` is the workspace minus it. Run one half directly when
-iterating on it. `test-node` also runs the benchmark smoke test
+runner's disk, which no longer binds), plus `test-ethrex`, the embedded execution
+client's tests with the `include-ethrex` feature on (a third job).
+`CONSENSUS_CRATES` in the Makefile names the first half; `test-node` is the
+workspace minus it and `ETHREX_CRATES`. Run one part directly when iterating on
+it. `test-node` also runs the benchmark smoke test
 (`bin/ethlambda/tests/benchmark_smoke.rs`), which drives the built binary.
 
 ### Docs-only changes skip CI
@@ -246,7 +251,7 @@ let _timing = metrics::time_state_transition();
 **All metrics use `ethlambda_metrics::*` re-exports** — the `ethlambda-metrics` crate re-exports
 prometheus types (`IntGauge`, `IntCounter`, `Histogram`, etc.) and provides `TimingGuard` + `gather_default_metrics()`.
 
-**Naming convention:** All metrics use `lean_` prefix (e.g., `lean_head_slot`, `lean_state_transition_time_seconds`).
+**Naming convention:** Node metrics use the `lean_` prefix (e.g., `lean_head_slot`, `lean_state_transition_time_seconds`); the validator client's (`crates/validator`) use `ethlambda_validator_` (e.g., `ethlambda_validator_validators_slashed`).
 
 ### Logging Patterns
 
@@ -357,6 +362,7 @@ actual_slot = finalized_slot + 1 + relative_index
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
   - Mesh size: 8 (6-12 bounds), heartbeat: 700ms
   - Beacon wire: `validate_messages()` is on, so every beacon message waits for a verdict (~4.2s before gossipsub's cache evicts it). Rules in `state_transition::beacon::gossip` (cheap half inline, stateful half on a bounded `spawn_blocking` task); plumbing in `p2p/src/beacon/verdict.rs`. Lean gossip still auto-forwards
+  - A subnet attestation or aggregate whose vote block is not imported yet (`UnknownBlock`/`StateUnavailable`) is parked with its verdict withheld (`p2p/src/beacon/parked_votes.rs`, lighthouse's reprocess queue) and checked once more when the chain actor's import sends `block_state_ready`; past 2.5 s, or with 16,384 held (parked, or released and not checked again yet; 2,048 of them aggregates; votes for a block not stored yet, whose root any peer can make up, at most half of each), it gets its first verdict instead. Rechecks run on their own permit pool (`recheck_permits`), not the attestation pool
   - Beacon peer scoring: lighthouse's parameters ported in `p2p/src/beacon/scoring.rs` (block, aggregate, 64 attestation subnets, exits, slashings; columns and sync contributions unscored), refreshed every slot from the head's active validator count. Mesh-delivery scoring (P3) is gated off while the head lags more than 4 slots and for an epoch after, because a catching-up node `Ignore`s every aggregate and would otherwise graylist its own mesh. Every held fork digest is parametrized before `transition::apply` joins it (gossipsub never scores a mesh grafted before its topic had parameters); the previous digest's weights are zeroed at the switch, and the switch restarts the P3 warmup. The swarm disconnects peers below the graylist (-16000) every 10 s, and peers gossipsub reported as `SlowPeer` in every check for a minute (a disabled gossipsub handler never drains its send queue, so the queue's message copies stay in memory until the connection closes). Gossipsub reports an expired forward like a full queue, so our own saturated uplink makes every peer look slow: a report counts only above `SLOW_PEER_REPORT_THRESHOLD` failures (Lighthouse's cut), and one check disconnects at most `MAX_SLOW_PEER_DISCONNECTS_PER_CHECK` peers. Lean runs unscored. See [`docs/beacon_wire.md`](docs/beacon_wire.md#peer-scoring)
   - Data columns: every check runs in p2p. A column gossip did not accept (`Queue`/`Overloaded`), every fetched column, and parked columns replayed after their parent imports go through the chain checks in `p2p/src/beacon/column_checks.rs`, grouped by block with each `(block, index)` kept once. A group's rules before the KZG proofs run through one `column::ChainPrechecks`, which judges what the block's sidecars share (the fulu signed header's rules, the gloas block lookup) once; the proofs then go through `column::kzg_verdicts` in sub-batches of at most 16 columns, each on its own `column_check_permits` permit, a failed batch re-verified column by column. Each sidecar gets the verdict `column::chain_checks_for` gives it alone. The chain actor stores what it gets unchecked; only debug builds re-run `chain_checks_for` there. A held fulu block's custody columns can also come from the execution client (`engine_getBlobsV2`, `crates/blockchain/src/beacon_blobs.rs`; asked only for a block at most `MAX_ASK_AGE_SLOTS` behind the clock, so not during range sync), put through the same `ChainPrechecks` and `kzg_verdicts` in the chain actor's blocking task (the spec lets a node skip that, this one does not: a stored column keeps every other copy out, and import trusts it), and handed to p2p as `SidecarOrigin::ExecutionLayer` through `check_data_column_sidecars`, which records them seen, publishes them on their subnets and forwards them; see `docs/beacon_engine.md`
   - Beacon subscribes seven global topics plus two node-id-derived subnet families: custody
@@ -372,7 +378,17 @@ actual_slot = finalized_slot + 1 + relative_index
     Bids and preferences are validated in p2p against one shared `BuilderMarket`
     (`state_transition::beacon::builder_market`) and never reach the chain actor, except that an
     accepted preference (gossip or API) is reported to it by proposal slot alone
-    (`new_proposer_preferences`), for `payload_attributes`. Gloas has its own rules for `beacon_block`,
+    (`new_proposer_preferences`), for `payload_attributes`. The four gloas topics' own publishes
+    read gossipsub's answer back (`SwarmHandle::publish_reporting`): `info` only once a peer has
+    the message, `warn` when none was handed it. A proposer preference publish waits for a peer,
+    as Prysm's does: in the epoch before a fork the node joins the new digest's topics at the same
+    moment as everyone else joining an epoch ahead, so its first publish can find no peer. The
+    market remembers what no peer was handed (`publish_owed`) and publishes it when a peer joins
+    its own topic under a held digest (gossipsub `Subscribed`, `on_peer_subscribed`) and at the
+    digest switch, while its slot is ahead. A
+    preference that reached one peer is never sent again (gossipsub's duplicate cache, `seen_ttl`
+    two epochs), so peers joining the topic later (Lighthouse before v8.3.0, two slots ahead)
+    get it only by relay, if at all. Gloas has its own rules for `beacon_block`,
     `data_column_sidecar` (fork enum `DataColumnSidecar`, fork from the topic's digest),
     aggregates (`SignedAggregateAndProof::Gloas`, aggregation-bits length bounded before
     expansion) and attestations (`verify_attestation_payload_status`). Deliberate
@@ -392,6 +408,27 @@ actual_slot = finalized_slot + 1 + relative_index
     **Known gap**: ethrex's `DiscoveryServer` cannot replace the served ENR at runtime, so its
     `eth2` entry keeps the startup digest until a restart; peers discovering the node after a
     boundary reject the record
+  - Validator custody (fulu `validator.md`; `p2p/src/beacon/validator_custody.rs`): the Beacon
+    API records every validator index named to `beacon_committee_subscriptions` and
+    `prepare_beacon_proposer` in `AttachedValidators` (`net/api`; expires after two silent
+    epochs), and the p2p actor, once an epoch, has a `spawn_blocking` task compute
+    `das::get_validators_custody_requirement` off the latest finalized state, as the spec
+    says (not the head: the record never falls, so a reorged-out branch must not raise it;
+    the balances come from the fork choice's `JustifiedBalances` snapshot for the
+    finalized checkpoint when cached, else the state it is built from (`checkpoint_state`,
+    advanced to the epoch's first slot, so both agree), which may need a rebuild, hence off
+    the actor; the outcome returns as `ValidatorCustodyComputed`). None with no attached validator in the registry, so a
+    plain follower is never raised to 8. It records the highest count in `Metadata`
+    (`Store::raise_validator_custody_count`, never lowered).
+    `beacon::startup_custody` starts the node at the larger of `--custody-group-count` and
+    that record. **The custody set is fixed per process** (`BeaconWire::custody_columns`, the
+    chain actor's, rpc's `CustodyColumns`): at runtime only `MetaData` v3's
+    `custody_group_count` rises (seq bump), never past the startup `sampling_size`, and a
+    larger requirement waits for a restart, so the node never advertises what it does not
+    hold. Same **known gap** as `eth2`: the ENR's `cgc` keeps its startup value. A start that
+    holds more groups than the directory's `CustodyRecord` moves `Status`'s
+    `earliest_available_slot` to the slot after the highest stored block (no backfill); the
+    record is written just before the chain actor spawns, so a failed start leaves it alone
   - `voluntary_exit`, `proposer_slashing`, `attester_slashing` and `bls_to_execution_change`
     validate in p2p like aggregates (`gossip::operations`, against the unadvanced head state,
     which must be electra or fulu: under a gloas head every operation is IGNOREd) and feed
@@ -400,7 +437,8 @@ actual_slot = finalized_slot + 1 + relative_index
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
   - Beacon adds `beacon_blocks_by_{range,root}/2` alongside its Status/Ping/MetaData/Goodbye set.
     Both serve from the checkpoint-anchored store, and `build_status` advertises it
-    (head, finalized checkpoint, and the anchor's slot as `earliest_available_slot`), so peers
+    (head, finalized checkpoint, and as `earliest_available_slot` the anchor's slot, or the
+    later slot a custody set grown at startup is complete from), so peers
     have a reason to ask. Asking runs too: a peer's Status starts a range session from the
     higher of `P2PServer::range_fetched_through` (the highest slot a range answer handed to
     the chain actor, since the store's head trails a delivered batch by the whole actor
@@ -531,7 +569,15 @@ the next fork the node cannot follow: the first refuses such an anchor with
 `UnsupportedFork`, the second warns once per scheduled fork for which
 `ForkName::is_followed` answers no (the one place that says which forks the
 node follows). The ignored-keys warning only ever names heze's keys and
-`GAS_LIMIT_SCHEDULE`/`INCLUSION_LIST_DUE_BPS`.
+`INCLUSION_LIST_DUE_BPS`. `GAS_LIMIT_SCHEDULE` (EIP-8261) is a `Config` field
+served on `/eth/v1/config/spec` and stored in a `Metadata` row of its own
+(`config_gas_limit_schedule`), not in `Metadata["config"]`'s encoding, where it
+takes zero bytes. That is the pattern for every `Config` key added after
+`DB_VERSION` 7 (`CONFIG_ROWS` in `store.rs`): no version bump, and a directory
+that predates the key resumes, with a beacon resume adding the config file's
+value (`Store::fill_missing_config_keys`) instead of failing. `ConfigFile::parse`
+refuses a schedule with an entry before `GLOAS_FORK_EPOCH`, two at one epoch,
+or more than 32 entries.
 Platåberget (the Glamsterdam testnet) is already past its `GLOAS_FORK_EPOCH`,
 so its checkpoint anchor is a gloas state: it is accepted, starts with no
 payload known (head EMPTY), and its first FULL child is held until the anchor's
@@ -639,11 +685,12 @@ See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults,
 
 ## Block telemetry (`crates/common/telemetry`)
 
-`--telemetry.clickhouse-url` writes Silver's `block_events` rows (one per point in a block's
-life, per data column arrival) to ClickHouse over HTTP. A global sink, installed in `run_node`
+`--telemetry.clickhouse-url` writes `block_events` rows in Silver's table layout (one per
+section start or end in a block's life, `<section>_start`/`<section>_end`, and per data column)
+to ClickHouse over HTTP. A global sink, installed in `run_node`
 before `P2P::spawn`; `ethlambda_telemetry::emit(|| ...)` builds nothing when it is off. Rows
 come from `BlockImportReport::telemetry_events` (final pass only, `imported_here`),
-`CascadeTelemetry` (arrival rows, and beacon `attestable` at the per-arrival head
+`CascadeTelemetry` (arrival rows, and beacon `fc_head_*` at the per-arrival head
 recomputation), and p2p's column rows: `column_checks::column_rows` (after the check), and
 `passed_rows` called directly by the gossip-accept path and by this node's own fulu columns. See
 [`docs/telemetry.md`](docs/telemetry.md).
@@ -796,7 +843,7 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   selects `BEACON_SPEC_PRESET` at startup), or `test-beacon-mainnet` /
   `test-beacon-minimal` for one. CI runs the two as a job each, so they run
   concurrently. `make test` covers the whole
-  workspace, in two halves, and still needs no fixture download: the
+  workspace, in two halves plus `test-ethrex`, and still needs no fixture download: the
   `beacon_spec_tests` target declares `required-features = ["beacon-spec-tests"]`
   so `cargo test` skips it, and the BLS and KZG fixture vectors, which are unit
   tests inside the module, are `#[cfg_attr(not(feature = ...), ignore)]` so they
@@ -959,7 +1006,11 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   protection records the slot, a gloas block whose bid is not
   `BUILDER_INDEX_SELF_BUILD` (`ProposalService::produce_and_sign`).
   `--gas-limit` sets the target gas limit the preferences
-  carry, which the node's own gloas payload is built toward.
+  carry, which the node's own gloas payload is built toward; without it, the
+  one the beacon node's `GAS_LIMIT_SCHEDULE` names for the proposal's epoch,
+  else 60M (the chain check re-reads the schedule every round from the first usable
+  node that serves a non-empty one, and hands it to `ProposerSettings`; an unusable
+  schedule is ignored with a warning, not an error that costs the node).
   Every slot it probes each beacon node's `/eth/v1/node/syncing` a sixth of a
   slot before the boundary, on its own task (`beacon_node::health`, records
   in `NodeHealth`, shared by the fallback): a slot in which every node that
@@ -982,7 +1033,14 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   unguarded. The client checks every beacon node against the chain it runs on
   (`chain_check`, `FallbackBeaconNode::establish`/`check_nodes`): the reference is
   the first node that answers at startup (startup waits, retrying every 2 s,
-  while none does), and a node whose genesis, preset, slot
+  while none does). Optional `--network` (resolved by the binary's `network`
+  module, as `beacon --network` is, into a `chain_check::ExpectedNetwork`)
+  narrows that to the first node on the named network by
+  `first_identity_difference` (preset, genesis, slot duration, genesis fork
+  version; `establish_on`), failing when every node answered off it; the fork
+  schedule is never held to it, only compared once an epoch
+  (`warn_if_schedule_differs`), so a stale binary cannot go offline at a fork.
+  A node whose genesis, preset, slot
   duration or any active fork's epoch and version differs is skipped by every call
   until a later check finds it compatible again. A background task re-asks
   every node every slot, judging and merging each answer as it arrives, at the
@@ -1143,6 +1201,17 @@ incremental, and line-tables-only debuginfo, so rebuilds are much faster than
 
 ## Common Gotchas
 
+### Embedded ethrex (`include-ethrex`)
+- In a feature build, `ethlambda beacon` without `--execution-endpoint` starts ethrex
+  in-process; with the endpoint it uses HTTP as before. A feature build has no
+  "no execution client" mode. See [`docs/ethrex.md`](docs/ethrex.md)
+- One ethrex tag for the whole workspace (`[workspace.dependencies]`), shared with
+  p2p's discovery. Bumping it means re-diffing ethrex's `init_l1`/`init_rpc_api`/
+  `init_network`/`server_shutdown` against `crates/execution/ethrex/src/lib.rs`,
+  which repeats them
+- `make test-node` excludes `ethlambda-ethrex`; `make test-ethrex` (own CI job) runs
+  it plus the engine and binary with the feature on
+
 ### Aggregator Flag Required for Finalization
 - At least one node **must** be started with `--is-aggregator` to finalize blocks
 - Without this flag, attestations pass signature verification and are logged as "Attestation processed", but the signature is never stored for aggregation (the `is_aggregator` gate in `on_gossip_attestation`, `store.rs`), so blocks are always built with `attestation_count=0`
@@ -1178,6 +1247,10 @@ behavior.
   reloaded on resume for the unfinalized window; the PTC vote vectors are
   reseeded empty and each payload gets a verdict seeded for the execution
   client to promote. Adding them did not bump `DB_VERSION`.
+- `Metadata` keys `validator_custody_count`, `custodied_group_count` and
+  `custody_since_slot` (validator custody, see Networking) are optional rows:
+  absent in an older directory, read as nothing recorded. Adding them did not
+  bump `DB_VERSION` either.
 - A restart of a beacon data directory currently hits
   `SpecAssert("block_root in store.unrealized_justifications")` in head
   computation until lambdaclass/ethlambda#628 (persists unrealized

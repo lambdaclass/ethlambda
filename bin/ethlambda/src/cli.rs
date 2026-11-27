@@ -193,8 +193,23 @@ pub(crate) enum Network {
     /// common flag.
     Mainnet {
         mainnet: MainnetOptions,
-        execution: Option<ExecutionOptions>,
+        execution: Execution,
     },
+}
+
+/// Which execution client a beacon node validates payloads against.
+#[derive(Debug)]
+pub(crate) enum Execution {
+    /// None: blocks import without any payload validation. Only a build
+    /// without `include-ethrex` can run this way, since that build's
+    /// fallback for an absent endpoint is the embedded client.
+    #[cfg(not(feature = "include-ethrex"))]
+    None,
+    /// A separate process, reached over its authenticated Engine API port.
+    External(ExecutionOptions),
+    /// ethrex, started in this process from the `--ethrex.*` flags.
+    #[cfg(feature = "include-ethrex")]
+    Embedded(Box<ethlambda_ethrex::EthrexArgs>),
 }
 
 /// The execution client pairing, present only when both flags were supplied.
@@ -262,11 +277,14 @@ impl From<NodeOptions> for Options {
 impl From<BeaconOptions> for Options {
     fn from(options: BeaconOptions) -> Self {
         let execution = match (options.execution_endpoint, options.execution_jwt_secret) {
-            (Some(endpoint), Some(jwt_secret)) => Some(ExecutionOptions {
+            (Some(endpoint), Some(jwt_secret)) => Execution::External(ExecutionOptions {
                 endpoint,
                 jwt_secret,
             }),
-            (None, None) => None,
+            #[cfg(not(feature = "include-ethrex"))]
+            (None, None) => Execution::None,
+            #[cfg(feature = "include-ethrex")]
+            (None, None) => Execution::Embedded(Box::new(options.ethrex)),
             // Unreachable: `requires` on each of the two flags is what rules a
             // half-configured Engine API out, so the parser answers a mismatch
             // with a usage error long before this conversion runs.
@@ -321,23 +339,41 @@ pub(crate) struct BeaconOptions {
     ///
     /// Paired with `--execution-jwt-secret`: supplying one without the other is
     /// a usage error, since an Engine API endpoint always requires
-    /// authentication. With neither, this node imports blocks without asking
-    /// any execution client about their payloads, which is what it did before
-    /// this flag existed.
+    /// authentication. With neither, a build with `include-ethrex` starts its
+    /// embedded ethrex, and any other build imports blocks without asking any
+    /// execution client about their payloads, which is what it did before this
+    /// flag existed.
     #[arg(long, requires = "execution_jwt_secret")]
+    // The `--ethrex.*` flags configure the embedded client, which an endpoint
+    // replaces, so giving both is a usage error rather than flags silently
+    // ignored. `EthrexArgs` is the group clap derives from that struct, which
+    // counts as present only for a flag given explicitly, not a default.
+    #[cfg_attr(feature = "include-ethrex", arg(conflicts_with = "EthrexArgs"))]
     pub(crate) execution_endpoint: Option<String>,
 
     /// File holding the 32-byte hex JWT secret shared with the execution
     /// client.
     #[arg(long, requires = "execution_endpoint")]
     pub(crate) execution_jwt_secret: Option<PathBuf>,
+
+    /// The embedded ethrex's flags, read only when no `--execution-endpoint`
+    /// is given.
+    #[cfg(feature = "include-ethrex")]
+    #[command(flatten)]
+    pub(crate) ethrex: ethlambda_ethrex::EthrexArgs,
 }
 
 /// Flags only the beacon chain takes.
 #[derive(Debug, clap::Args)]
 pub(crate) struct MainnetOptions {
     /// How many custody groups this node custodies, advertised as the ENR's
-    /// `cgc` and used to size its own custody set.
+    /// `cgc` and `MetaData`'s `custody_group_count`, and used to size its own
+    /// custody set.
+    ///
+    /// A floor rather than the whole answer: with validators attached, fulu's
+    /// validator custody can require more. The node records the highest count
+    /// its validators have required in the data directory and starts at the
+    /// larger of that and this flag (see `beacon::startup_custody`).
     ///
     /// Raising it makes this node useful to more peers and costs it storage and
     /// bandwidth in proportion: a node at `NUMBER_OF_CUSTODY_GROUPS` is a
@@ -352,8 +388,10 @@ pub(crate) struct MainnetOptions {
     ///
     /// Changing it changes which columns this node custodies, so sidecars
     /// already on disk belong to the old set. Nothing is corrupted by that,
-    /// but the node serves a set it has not finished filling until it has
-    /// backfilled the difference.
+    /// and nothing backfills the difference: a start that holds more groups
+    /// than the data directory did reports the slot after the highest block it
+    /// had stored as `Status`'s `earliest_available_slot`, and refuses column
+    /// ranges that start below it.
     #[arg(
         long = "custody-group-count",
         default_value_t = ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
@@ -669,7 +707,8 @@ pub(crate) struct DiscoveryConfig {
     /// Defaults to the bind address, which is the wildcard `0.0.0.0` and is not
     /// dialable as published. Set this to the address peers should reach this
     /// node on: `127.0.0.1` for a local devnet, or the host's public address.
-    /// discv5's PONG-based IP voting may still replace it at runtime.
+    /// An address set here is kept: discv5's PONG-based IP voting replaces
+    /// only the default, or an unspecified address given here.
     #[arg(long = "discovery.advertise-ip")]
     pub(crate) advertise_ip: Option<IpAddr>,
     /// How many peers this node holds.
@@ -749,6 +788,101 @@ impl CommonOptions {
         }
         Ok(())
     }
+
+    /// Reject an embedded ethrex socket that collides with one of this node's
+    /// own, or with another of ethrex's, before either binds.
+    ///
+    /// Separate from [`Self::validate_ports`] because ethrex's ports are only
+    /// known once its flags resolve, which needs the data directory and the
+    /// network. Port `0` is skipped for the reason given there. `p2p_ip` is
+    /// the address the swarm and discv5 bind (`run_node`'s `p2p_socket`);
+    /// the API and metrics servers bind `--http-address`. Two sockets on one
+    /// port clash only where their addresses can overlap (see
+    /// [`addresses_may_overlap`]), so ethrex's JSON-RPC server may share the
+    /// API's port on a different loopback address.
+    #[cfg(feature = "include-ethrex")]
+    pub(crate) fn validate_embedded_ports(
+        &self,
+        discovery_enabled: bool,
+        p2p_ip: IpAddr,
+        ethrex: &ethlambda_ethrex::EthrexConfig,
+    ) -> eyre::Result<()> {
+        use ethlambda_ethrex::Listener;
+        let ours = |flag, ip, port| Listener {
+            flag,
+            ip: Some(ip),
+            port,
+        };
+        let ours_tcp = [
+            ours("--gossipsub-port", p2p_ip, self.gossipsub_port),
+            ours("--api-port", self.http_address, self.api_port),
+            ours("--metrics-port", self.http_address, self.metrics_port),
+        ];
+        let mut ours_udp = vec![ours("--gossipsub-port", p2p_ip, self.gossipsub_port)];
+        if discovery_enabled {
+            ours_udp.push(ours("--discovery.port", p2p_ip, self.discovery.port));
+        }
+        check_no_clash("TCP", &ours_tcp, &ethrex.tcp_listeners())?;
+        check_no_clash("UDP", &ours_udp, &ethrex.udp_listeners())
+    }
+}
+
+/// Fails on the first of `theirs` that shares a non-zero port, at an address
+/// that may overlap, with any of `ours` or with an earlier entry of `theirs`.
+#[cfg(feature = "include-ethrex")]
+fn check_no_clash(
+    protocol: &str,
+    ours: &[ethlambda_ethrex::Listener],
+    theirs: &[ethlambda_ethrex::Listener],
+) -> eyre::Result<()> {
+    for (index, their) in theirs.iter().enumerate() {
+        if their.port == 0 {
+            continue;
+        }
+        let mut earlier = ours.iter().chain(&theirs[..index]);
+        let clash = earlier
+            .find(|other| other.port == their.port && addresses_may_overlap(other.ip, their.ip));
+        if let Some(other) = clash {
+            let (flag, port) = (their.flag, their.port);
+            eyre::bail!(
+                "{flag} ({port}) must differ from {}, or the two must bind addresses \
+                 that do not overlap: both bind {protocol} at {} and {}",
+                other.flag,
+                bind_address(other.ip),
+                bind_address(their.ip),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether sockets bound at `a` and `b` on one port can collide: the same
+/// address, a wildcard that covers the other, or an address not known in
+/// advance (`None`), which could be either.
+///
+/// `::` covers IPv4 as well, as a dual-stack socket does by default;
+/// `0.0.0.0` covers IPv4 only. An IPv4-mapped IPv6 address is the IPv4
+/// address it maps.
+#[cfg(feature = "include-ethrex")]
+fn addresses_may_overlap(a: Option<IpAddr>, b: Option<IpAddr>) -> bool {
+    let (Some(a), Some(b)) = (a, b) else {
+        return true;
+    };
+    let (a, b) = (a.to_canonical(), b.to_canonical());
+    let covers = |wildcard: IpAddr, other: IpAddr| match wildcard {
+        IpAddr::V6(ip) => ip.is_unspecified(),
+        IpAddr::V4(ip) => ip.is_unspecified() && other.is_ipv4(),
+    };
+    a == b || covers(a, b) || covers(b, a)
+}
+
+/// A bind address for an error message.
+#[cfg(feature = "include-ethrex")]
+fn bind_address(ip: Option<IpAddr>) -> String {
+    ip.map_or_else(
+        || "an address ethrex picks".to_string(),
+        |ip| ip.to_string(),
+    )
 }
 
 /// Shadow-simulator sim-cost + fake-XMSS flags. Compiled only under the
@@ -1378,6 +1512,29 @@ mod tests {
         assert!(beacon.execution_jwt_secret.is_some());
     }
 
+    /// An endpoint replaces the embedded client, so a flag that configures the
+    /// embedded one alongside it is refused rather than ignored. The pair
+    /// alone still parses (above), defaulted `--ethrex.http-addr` and all.
+    #[cfg(feature = "include-ethrex")]
+    #[test]
+    fn ethrex_flags_conflict_with_an_execution_endpoint() {
+        let mut args = beacon_args();
+        args.extend_from_slice(&[
+            "--execution-endpoint",
+            "http://127.0.0.1:8551",
+            "--execution-jwt-secret",
+            "jwt.hex",
+            "--ethrex.http-port",
+            "8545",
+        ]);
+        let err = try_parse_from(args).expect_err("--ethrex.* with an endpoint must not parse");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "an embedded-client flag beside an endpoint is a usage error: {err}"
+        );
+    }
+
     #[test]
     fn the_execution_flags_are_absent_by_default() {
         let beacon = parse_beacon(beacon_args());
@@ -1541,7 +1698,7 @@ mod tests {
 
         match options.network {
             Network::Mainnet {
-                execution: Some(execution),
+                execution: Execution::External(execution),
                 ..
             } => {
                 assert_eq!(execution.endpoint, "http://127.0.0.1:8551");
@@ -1549,5 +1706,159 @@ mod tests {
             }
             other => panic!("expected a paired execution client, got {other:?}"),
         }
+    }
+
+    /// Without an endpoint, what a beacon node falls back to depends on the
+    /// build: the embedded ethrex where it is compiled in, no execution
+    /// client otherwise.
+    #[test]
+    fn no_endpoint_falls_back_to_the_build_default() {
+        let options: Options = parse_beacon(beacon_args()).into();
+
+        let Network::Mainnet { execution, .. } = options.network else {
+            panic!("the beacon argv must resolve to the beacon chain");
+        };
+        #[cfg(feature = "include-ethrex")]
+        assert!(matches!(execution, Execution::Embedded(_)), "{execution:?}");
+        #[cfg(not(feature = "include-ethrex"))]
+        assert!(matches!(execution, Execution::None), "{execution:?}");
+    }
+
+    #[cfg(feature = "include-ethrex")]
+    #[test]
+    fn ethrex_flags_parse_on_the_beacon_command() {
+        let mut args = beacon_args();
+        args.extend(["--ethrex.http-port", "8545", "--ethrex.syncmode", "full"]);
+
+        let beacon = parse_beacon(args);
+        assert_eq!(beacon.ethrex.http_port, Some(8545));
+        assert!(beacon.ethrex.syncmode.is_some());
+    }
+
+    #[cfg(feature = "include-ethrex")]
+    #[test]
+    fn an_embedded_port_clashing_with_ours_is_refused() {
+        let mut args = beacon_args();
+        args.extend(["--ethrex.http-port", "5052"]);
+        let beacon = parse_beacon(args);
+        let config = beacon
+            .ethrex
+            .resolve(std::path::Path::new("/data"), "mainnet")
+            .expect("mainnet resolves");
+
+        let err = beacon
+            .common
+            .validate_embedded_ports(true, SWARM_IP, &config)
+            .expect_err("--ethrex.http-port 5052 is the default --api-port");
+        assert!(err.to_string().contains("--api-port"), "{err}");
+    }
+
+    #[cfg(feature = "include-ethrex")]
+    #[test]
+    fn embedded_ports_clashing_with_each_other_are_refused() {
+        let mut args = beacon_args();
+        args.extend(["--ethrex.http-port", "30303"]);
+        let beacon = parse_beacon(args);
+        let config = beacon
+            .ethrex
+            .resolve(std::path::Path::new("/data"), "mainnet")
+            .expect("mainnet resolves");
+
+        let err = beacon
+            .common
+            .validate_embedded_ports(true, SWARM_IP, &config)
+            .expect_err("--ethrex.http-port 30303 is ethrex's default p2p port");
+        assert!(err.to_string().contains("--ethrex.p2p-port"), "{err}");
+    }
+
+    /// The address `run_node` binds the swarm and discv5 at.
+    #[cfg(feature = "include-ethrex")]
+    const SWARM_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+    #[cfg(feature = "include-ethrex")]
+    fn resolve_ethrex(beacon: &BeaconOptions) -> ethlambda_ethrex::EthrexConfig {
+        beacon
+            .ethrex
+            .resolve(std::path::Path::new("/data"), "mainnet")
+            .expect("mainnet resolves")
+    }
+
+    #[cfg(feature = "include-ethrex")]
+    #[test]
+    fn one_port_on_two_distinct_addresses_is_no_clash() {
+        let mut args = beacon_args();
+        args.extend([
+            "--http-address",
+            "127.0.0.1",
+            "--ethrex.http-addr",
+            "127.0.0.2",
+            "--ethrex.http-port",
+            "5052",
+        ]);
+        let beacon = parse_beacon(args);
+
+        beacon
+            .common
+            .validate_embedded_ports(true, SWARM_IP, &resolve_ethrex(&beacon))
+            .expect("127.0.0.1:5052 and 127.0.0.2:5052 are different sockets");
+    }
+
+    #[cfg(feature = "include-ethrex")]
+    #[test]
+    fn a_wildcard_on_either_side_still_clashes() {
+        for (ours, theirs) in [("0.0.0.0", "127.0.0.2"), ("127.0.0.1", "0.0.0.0")] {
+            let mut args = beacon_args();
+            args.extend([
+                "--http-address",
+                ours,
+                "--ethrex.http-addr",
+                theirs,
+                "--ethrex.http-port",
+                "5052",
+            ]);
+            let beacon = parse_beacon(args);
+
+            let err = beacon
+                .common
+                .validate_embedded_ports(true, SWARM_IP, &resolve_ethrex(&beacon))
+                .expect_err("a wildcard bind covers the other address");
+            assert!(
+                err.to_string().contains("--api-port"),
+                "{ours} {theirs}: {err}"
+            );
+        }
+    }
+
+    #[cfg(feature = "include-ethrex")]
+    #[test]
+    fn which_bind_addresses_overlap() {
+        let ip = |text: &str| Some(text.parse::<IpAddr>().unwrap());
+
+        assert!(addresses_may_overlap(ip("127.0.0.1"), ip("127.0.0.1")));
+        assert!(!addresses_may_overlap(ip("127.0.0.1"), ip("127.0.0.2")));
+        assert!(addresses_may_overlap(ip("0.0.0.0"), ip("10.0.0.1")));
+        assert!(!addresses_may_overlap(ip("0.0.0.0"), ip("::1")));
+        assert!(addresses_may_overlap(ip("::"), ip("127.0.0.1")));
+        assert!(addresses_may_overlap(ip("::"), ip("0.0.0.0")));
+        assert!(addresses_may_overlap(
+            ip("::ffff:127.0.0.1"),
+            ip("127.0.0.1")
+        ));
+        assert!(addresses_may_overlap(None, ip("127.0.0.1")));
+    }
+
+    #[cfg(feature = "include-ethrex")]
+    #[test]
+    fn default_embedded_ports_do_not_clash() {
+        let beacon = parse_beacon(beacon_args());
+        let config = beacon
+            .ethrex
+            .resolve(std::path::Path::new("/data"), "mainnet")
+            .expect("mainnet resolves");
+
+        beacon
+            .common
+            .validate_embedded_ports(true, SWARM_IP, &config)
+            .expect("defaults are disjoint");
     }
 }

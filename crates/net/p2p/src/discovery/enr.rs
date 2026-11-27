@@ -127,7 +127,9 @@ pub(crate) fn node_id_from_peer_id(peer_id: &libp2p::PeerId) -> Option<[u8; 32]>
 /// Everything needed to build this node's ENR.
 pub(crate) struct LocalEnrParams {
     pub(crate) signer: SecretKey,
-    /// Address to advertise. discv5's PONG-based IP voting may replace it later.
+    /// Address to advertise. discv5's PONG-based IP voting may replace it
+    /// later, unless the operator supplied it and it is not the unspecified
+    /// address (see `spawn_discovery`).
     pub(crate) ip: IpAddr,
     /// UDP port the discv5 socket is bound to.
     pub(crate) discovery_port: u16,
@@ -149,11 +151,14 @@ pub(crate) struct LocalEnrParams {
     pub(crate) fork_id: EnrForkId,
     /// The `cgc` entry to publish, or `None` to omit it.
     ///
-    /// `Some(CUSTODY_REQUIREMENT)` on the beacon wire: it is the floor a peer
-    /// may demand, and this node's actual custody only ever meets or exceeds
-    /// it (`sampling_size` never samples fewer groups than that), so
-    /// advertising it never overstates what this node stores and serves.
-    /// `None` on lean, which has no data-availability domain.
+    /// On the beacon wire, the custody group count the node started with
+    /// (`--custody-group-count`, or the recorded validator custody count when
+    /// higher). This node's actual custody only ever meets or exceeds it
+    /// (`sampling_size` never samples fewer groups than that), so advertising
+    /// it never overstates what this node stores and serves. Fixed for the
+    /// process: ethrex's discovery server cannot replace the record, so a
+    /// runtime raise reaches `MetaData` only. `None` on lean, which has no
+    /// data-availability domain.
     pub(crate) custody_group_count: Option<u64>,
 }
 
@@ -162,9 +167,14 @@ impl LocalEnrParams {
     ///
     /// Its `tcp_port` is the real port the libp2p TCP transport is bound to, now
     /// that ethlambda has one.
+    ///
+    /// Its address is canonical, as `local_pairs` publishes it. IP voting
+    /// ignores a winning address of the other family than this one, so an
+    /// IPv4-mapped IPv6 address kept as given could never be replaced by the
+    /// IPv4 address peers report.
     pub(crate) fn local_node(&self) -> Node {
         Node::new(
-            self.ip,
+            self.ip.to_canonical(),
             self.discovery_port,
             self.p2p_port,
             public_key_from_signing_key(&self.signer),
@@ -574,5 +584,27 @@ mod tests {
         let record = build();
         let node = Node::from_enr(&record).expect("Node::from_enr accepts our ENR");
         assert_eq!(node.udp_port, 9010);
+    }
+
+    /// The discovery server's local node and the record must agree on the
+    /// address family: IP voting skips a winner of the other family, so a
+    /// mapped address left as IPv6 in the node could never be replaced.
+    #[test]
+    fn a_mapped_ipv4_address_is_the_ipv4_one_in_the_node_and_the_record() {
+        let params = LocalEnrParams {
+            signer: secp256k1::SecretKey::new(&mut rand::rngs::OsRng),
+            ip: "::ffff:0.0.0.0".parse().unwrap(),
+            discovery_port: 9010,
+            p2p_port: 9001,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 64,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
+        };
+
+        assert_eq!(params.local_node().ip, IpAddr::from(Ipv4Addr::UNSPECIFIED));
+        let record = build_local_enr(&params).expect("ENR builds");
+        assert_eq!(record.pairs().ip, Some(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(record.pairs().ip6, None);
     }
 }

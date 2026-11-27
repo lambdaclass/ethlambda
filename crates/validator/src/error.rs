@@ -210,6 +210,16 @@ pub enum Error {
     /// does when the doppelganger check stops. Never retryable.
     #[error("the beacon node chain check stopped: {reason}")]
     ChainCheckStopped { reason: String },
+    /// The chain reports these loaded validators slashed, and
+    /// `--shut-down-when-slashed` asked for that to stop the client. What it
+    /// stops with, and what `ethlambda validator` exits with
+    /// [`crate::slashed::EXIT_CODE`] for. Never retryable: every start finds
+    /// the same keys slashed, and the cause takes an operator to find.
+    #[error(
+        "validators {validators:?} are slashed, and --shut-down-when-slashed stops the client for \
+         it"
+    )]
+    ValidatorSlashed { validators: Vec<ValidatorIndex> },
 
     /// The slashing-protection record could not be opened, read or written,
     /// or refuses to start: a key with no record, another chain's record,
@@ -310,6 +320,7 @@ impl Error {
             | Self::DoppelgangerDetected { .. }
             | Self::DoppelgangerCheckStopped { .. }
             | Self::ChainCheckStopped { .. }
+            | Self::ValidatorSlashed { .. }
             | Self::SlashingProtection { .. }
             | Self::SlashingProtectionUnusable { .. }
             | Self::Io { .. }

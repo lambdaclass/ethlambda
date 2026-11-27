@@ -22,6 +22,29 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 
+# The in-process transport (`include-ethrex`): ethrex's own Engine API handler
+# types, called against an embedded node's RPC context.
+bytes = { version = "1", optional = true }
+ethrex-common = { workspace = true, optional = true }
+ethrex-rlp = { workspace = true, optional = true }
+ethrex-rpc = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+
+[features]
+# Adds `EngineClient::in_process`, which drives an ethrex embedded in this
+# process through typed handler calls instead of JSON-RPC over HTTP.
+# `serde_json/raw_value`: ethrex's handlers `parse` their params as raw JSON text.
+# `tokio/rt`: each call runs on tokio's blocking pool.
+include-ethrex = [
+    "dep:bytes",
+    "dep:ethrex-common",
+    "dep:ethrex-rlp",
+    "dep:ethrex-rpc",
+    "dep:tokio-util",
+    "serde_json/raw_value",
+    "tokio/rt",
+]
+
 [dev-dependencies]
 tokio = { workspace = true, features = [
     "io-util",
@@ -29,4 +52,6 @@ tokio = { workspace = true, features = [
     "net",
     "rt-multi-thread",
     "sync",
+    # Paused time, for the in-process transport's timeout ladder.
+    "test-util",
 ] }

@@ -666,6 +666,7 @@ fn epoch_node(pubkeys: &[BlsPubkey], hex: &[String], head: Root) -> MockBeaconNo
             index: index as u64,
             pubkey: *pubkey,
             status: "active_ongoing".to_string(),
+            slashed: false,
         })
         .collect();
     // The last epoch's refresh looks one ahead.

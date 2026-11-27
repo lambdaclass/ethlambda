@@ -44,8 +44,8 @@ use ethlambda_network_api::{
     ConnectedPeer, FetchRequest, GossipEventSink, InitBlockChain, MetaDataController,
     P2PToBlockChainRef, PeerDirection, PeerTableController, SidecarOrigin,
     block_chain_to_p2p::{
-        CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
-        PublishBlock,
+        BlockStateReady, CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation,
+        PublishAttestation, PublishBlock,
     },
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
@@ -284,6 +284,24 @@ const COLUMN_CHECK_PERMITS: usize = 16;
 /// `lean_beacon_gossip_validation_seconds{kind="beacon_aggregate_and_proof"}`
 /// has data from a follower.
 const ATTESTATION_VALIDATION_PERMITS: usize = 128;
+
+/// How many batches of parked votes may be checked again at once (see
+/// `beacon::parked_votes`).
+///
+/// A pool of its own, a quarter of [`ATTESTATION_VALIDATION_PERMITS`]: a
+/// block's votes are released together, and on the attestation pool a big
+/// release would take the permits of the votes arriving meanwhile, which
+/// would be ignored as overloaded. A batch waits for a permit here rather
+/// than failing without one.
+const RECHECK_PERMITS: usize = 32;
+
+/// Gossipsub's heartbeat. With [`GOSSIPSUB_HISTORY_LENGTH`] it bounds how long
+/// gossipsub holds a message awaiting its verdict, which parked votes must
+/// stay inside (see `beacon::parked_votes`).
+pub(crate) const GOSSIPSUB_HEARTBEAT: Duration = Duration::from_millis(700);
+
+/// How many heartbeats of message history gossipsub keeps.
+pub(crate) const GOSSIPSUB_HISTORY_LENGTH: usize = 6;
 
 /// How many `execution_payload_bid` and `proposer_preferences` stateful checks
 /// may run at once. A pool of its own, so a burst of bids (each costs a BLS
@@ -1258,9 +1276,9 @@ pub(crate) fn gossipsub_config(
         .mesh_n_high(12)
         // d_lazy
         .gossip_lazy(6)
-        .heartbeat_interval(Duration::from_millis(700))
+        .heartbeat_interval(GOSSIPSUB_HEARTBEAT)
         .fanout_ttl(Duration::from_secs(60))
-        .history_length(6)
+        .history_length(GOSSIPSUB_HISTORY_LENGTH)
         .history_gossip(3)
         .prune_backoff(PRUNE_BACKOFF)
         .unsubscribe_backoff(PRUNE_BACKOFF)
@@ -1548,6 +1566,17 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 genesis_validators_root: beacon.genesis_validators_root,
                 metadata_seq_number: 0,
                 custody_columns: beacon.custody_columns,
+                custody_group_count: beacon.custody_group_count,
+                custody_since_slot: beacon.custody_since_slot,
+                // The startup count's sampling size: the same computation
+                // `custody_columns` came from, so the ceiling a runtime raise
+                // respects is exactly the set this node holds.
+                validator_custody: beacon::validator_custody::ValidatorCustody::new(
+                    beacon.attached_validators,
+                    ethlambda_state_transition::beacon::das::sampling_size(
+                        beacon.custody_group_count,
+                    ),
+                ),
                 attestation_subnets: beacon.attestation_subnets,
                 sync_committee_subnets: std::collections::BTreeMap::new(),
                 metadata: MetaDataController::default(),
@@ -1693,6 +1722,7 @@ impl P2P {
             attestation_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 ATTESTATION_VALIDATION_PERMITS,
             )),
+            recheck_permits: Arc::new(tokio::sync::Semaphore::new(RECHECK_PERMITS)),
             payload_attestation_pool,
             builder_market,
             builder_validation_permits: Arc::new(tokio::sync::Semaphore::new(
@@ -1701,10 +1731,12 @@ impl P2P {
             sync_committee_pool,
             gossip_events,
             aggregator_subnets: HashMap::new(),
+            parked_votes: Default::default(),
             peer_scoring,
         };
         let scores_peers = server.peer_scoring.is_some();
         let discovery_enabled = server.discovery.is_some();
+        let runs_validator_custody = server.wire.beacon().is_some();
         let handle = server.start();
         // At once rather than a slot in: the swarm starts on placeholder
         // topic scores, and the head's are already known.
@@ -1720,6 +1752,14 @@ impl P2P {
             handle.context(),
             p2p_protocol::LeaveExpiredAggregatorSubnets,
         );
+        // Validator custody's first check, which then keeps itself scheduled.
+        if runs_validator_custody {
+            send_after(
+                Duration::ZERO,
+                handle.context(),
+                p2p_protocol::RefreshValidatorCustody,
+            );
+        }
         // The refresh timer's first tick. A peer is first due an interval
         // after its handshake, which `peer_heads` tracks per peer.
         send_after(
@@ -1904,6 +1944,9 @@ pub struct P2PServer {
     /// [`Self::gossip_validation_permits`]; see
     /// [`ATTESTATION_VALIDATION_PERMITS`].
     pub(crate) attestation_validation_permits: Arc<tokio::sync::Semaphore>,
+    /// Permits for batches of parked votes checked again once their block's
+    /// post-state is ready. See [`RECHECK_PERMITS`].
+    pub(crate) recheck_permits: Arc<tokio::sync::Semaphore>,
     /// Permits for sync committee message and contribution stateful gossip
     /// checks in flight on blocking threads. Separate from the other two
     /// pools; see [`SYNC_VALIDATION_PERMITS`].
@@ -1937,6 +1980,10 @@ pub struct P2PServer {
     /// advertised in `attnets`, and left once the slot has passed. The
     /// backbone subnets are separate and never left.
     pub(crate) aggregator_subnets: HashMap<u64, u64>,
+
+    /// Subnet attestations and aggregates whose verdict waits for the block
+    /// they vote for to have a post-state. See [`beacon::parked_votes`].
+    pub(crate) parked_votes: beacon::parked_votes::ParkedVotes,
 
     /// Gossipsub scoring's inputs and gate. `None` on lean, which runs
     /// without peer scoring. See [`beacon::scoring`].
@@ -2070,6 +2117,10 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn discover_peers(&self) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn leave_expired_aggregator_subnets(&self) -> Result<(), ActorError>;
+    /// Report the first verdict of the parked votes past their deadline; see
+    /// [`beacon::parked_votes`]. Scheduled only while votes are parked.
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn sweep_parked_votes(&self) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_beacon_range_batch(&self) -> Result<(), ActorError>;
     /// Apply the fork schedule at the wall-clock epoch. Sent once at startup and
@@ -2078,6 +2129,19 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn advance_fork_schedule(&self) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn refresh_peer_scoring(&self) -> Result<(), ActorError>;
+    /// Run validator custody when the wall clock has entered an epoch it has
+    /// not run in yet. Beacon only, checked once a slot; see
+    /// [`beacon::validator_custody::refresh`].
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn refresh_validator_custody(&self) -> Result<(), ActorError>;
+    /// A validator custody run's blocking task is done: act on what it
+    /// concluded. See [`beacon::validator_custody::finish`].
+    #[allow(dead_code)] // sent by the run's blocking task
+    fn validator_custody_computed(
+        &self,
+        epoch: u64,
+        run: beacon::validator_custody::CustodyRun,
+    ) -> Result<(), ActorError>;
     /// Re-ask the connected peers that are due for their `Status`; see
     /// [`peer_heads`].
     #[allow(dead_code)] // invoked via send_after, not called directly
@@ -2198,13 +2262,30 @@ impl P2PServer {
     }
 
     #[send_handler]
+    async fn handle_sweep_parked_votes(
+        &mut self,
+        _msg: p2p_protocol::SweepParkedVotes,
+        ctx: &Context<Self>,
+    ) {
+        if beacon::verdict::sweep_parked_votes(self) {
+            beacon::verdict::schedule_parked_vote_sweep(ctx);
+        }
+    }
+
+    #[send_handler]
     async fn handle_advance_fork_schedule(
         &mut self,
         _msg: p2p_protocol::AdvanceForkSchedule,
         ctx: &Context<Self>,
     ) {
+        let digest = self.wire.beacon().map(|wire| wire.fork_digest);
         if let Some(delay) = beacon::transition::advance(self) {
             send_after(delay, ctx.clone(), p2p_protocol::AdvanceForkSchedule);
+        }
+        // A switch is when every peer following the fork has joined the new
+        // digest's topics, so what reached no peer before can now.
+        if self.wire.beacon().map(|wire| wire.fork_digest) != digest {
+            beacon::builder_market::publish_owed_proposer_preferences(self).await;
         }
     }
 
@@ -2252,6 +2333,35 @@ impl P2PServer {
             send_after(slot, ctx.clone(), p2p_protocol::RefreshPeerScoring);
         }
         beacon::scoring::refresh(self);
+    }
+
+    /// Check once a slot whether a new epoch's validator custody run is due.
+    /// Beacon only: never scheduled on lean.
+    #[send_handler]
+    async fn handle_refresh_validator_custody(
+        &mut self,
+        _msg: p2p_protocol::RefreshValidatorCustody,
+        ctx: &Context<Self>,
+    ) {
+        let Some(wire) = self.wire.beacon() else {
+            return;
+        };
+        let slot = Duration::from_millis(wire.config.slot_duration_ms);
+        send_after(slot, ctx.clone(), p2p_protocol::RefreshValidatorCustody);
+        beacon::validator_custody::refresh(self, ctx);
+    }
+
+    /// A validator custody run's state read and computation, done off the
+    /// actor, came back.
+    #[send_handler]
+    async fn handle_validator_custody_computed(
+        &mut self,
+        msg: p2p_protocol::ValidatorCustodyComputed,
+        _ctx: &Context<Self>,
+    ) {
+        if let Wire::Beacon(wire) = &mut self.wire {
+            beacon::validator_custody::finish(wire, msg.epoch, msg.run);
+        }
     }
 
     /// Re-ask the connected peers whose `Status` is an interval old, so the
@@ -2341,13 +2451,13 @@ impl Handler<PublishExecutionPayloadEnvelope> for P2PServer {
 
 impl Handler<PublishExecutionPayloadBid> for P2PServer {
     async fn handle(&mut self, msg: PublishExecutionPayloadBid, _ctx: &Context<Self>) {
-        beacon::builder_market::publish_execution_payload_bid(self, msg.bid);
+        beacon::builder_market::publish_execution_payload_bid(self, msg.bid).await;
     }
 }
 
 impl Handler<PublishProposerPreferences> for P2PServer {
     async fn handle(&mut self, msg: PublishProposerPreferences, _ctx: &Context<Self>) {
-        beacon::builder_market::publish_proposer_preferences(self, msg.preferences);
+        beacon::builder_market::publish_proposer_preferences(self, msg.preferences).await;
     }
 }
 
@@ -2407,6 +2517,12 @@ impl Handler<CheckDataColumnSidecars> for P2PServer {
                 beacon::engine_columns::publish_and_forward(self, msg.sidecars)
             }
         }
+    }
+}
+
+impl Handler<BlockStateReady> for P2PServer {
+    async fn handle(&mut self, msg: BlockStateReady, ctx: &Context<Self>) {
+        beacon::verdict::release_parked_votes(self, ctx, msg.block_root);
     }
 }
 
@@ -3059,6 +3175,11 @@ async fn handle_behaviour_event(
                 message,
             )
             .await;
+        }
+        // A peer joined a topic: proposer preferences whose publish found no
+        // peer on it go out now. This is how a publish waits for a peer.
+        BehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Subscribed { topic, .. }) => {
+            return beacon::builder_market::on_peer_subscribed(server, topic.as_str()).await;
         }
         BehaviourEvent::Gossipsub(_) => return,
         BehaviourEvent::ReqResp(event) => match event {
@@ -3903,8 +4024,9 @@ pub(crate) mod test_support {
     use crate::{P2PServer, SwarmConfig, WireConfig, build_swarm};
 
     /// A chain actor stand-in recording what reaches it: each block's
-    /// announcement and each aggregate with its attesting indices. The rest
-    /// of the protocol is accepted and dropped.
+    /// announcement, each aggregate with its attesting indices, each column
+    /// batch and each proposer preferences report. The rest of the protocol is
+    /// accepted and dropped.
     #[derive(Default)]
     pub(crate) struct RecordingChain {
         pub(crate) announcements: std::sync::Mutex<Vec<ethlambda_network_api::BlockAnnouncement>>,
@@ -3917,6 +4039,8 @@ pub(crate) mod test_support {
         /// Each `new_data_column_sidecars` batch, in arrival order.
         pub(crate) sidecar_batches:
             std::sync::Mutex<Vec<Vec<ethlambda_types::beacon::containers::DataColumnSidecar>>>,
+        /// Each `new_proposer_preferences` proposal slot, in arrival order.
+        pub(crate) preference_slots: std::sync::Mutex<Vec<u64>>,
     }
 
     impl ethlambda_network_api::P2PToBlockChain for RecordingChain {
@@ -3985,8 +4109,9 @@ pub(crate) mod test_support {
         }
         fn new_proposer_preferences(
             &self,
-            _proposal_slot: u64,
+            proposal_slot: u64,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.preference_slots.lock().unwrap().push(proposal_slot);
             Ok(())
         }
     }
@@ -4061,6 +4186,9 @@ pub(crate) mod test_support {
                 genesis_time: config.genesis_time,
                 genesis_validators_root: Root::ZERO,
                 custody_columns: Vec::new(),
+                custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+                custody_since_slot: 0,
+                attached_validators: Default::default(),
                 attestation_subnets: Vec::new(),
             })),
         })
@@ -4174,6 +4302,9 @@ pub(crate) mod test_support {
             attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
+            recheck_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::RECHECK_PERMITS,
+            )),
             seen_sync_messages:
                 ethlambda_state_transition::beacon::gossip::sync_committee::SeenSyncCommitteeMessages::new(
                     crate::SEEN_SYNC_MESSAGES_CAPACITY,
@@ -4194,6 +4325,7 @@ pub(crate) mod test_support {
             sync_committee_pool: Default::default(),
             gossip_events: None,
             aggregator_subnets: HashMap::new(),
+            parked_votes: Default::default(),
             peer_scoring: None,
         }
     }
@@ -4631,6 +4763,9 @@ mod tests {
                     genesis_time: config.genesis_time,
                     genesis_validators_root: Root::ZERO,
                     custody_columns: Vec::new(),
+                    custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+                    custody_since_slot: 0,
+                    attached_validators: Default::default(),
                     attestation_subnets: Vec::new(),
                 })),
             })
@@ -4771,6 +4906,9 @@ mod tests {
                     genesis_time: 0,
                     genesis_validators_root: Root::ZERO,
                     custody_columns: Vec::new(),
+                    custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+                    custody_since_slot: 0,
+                    attached_validators: Default::default(),
                     attestation_subnets: Vec::new(),
                 })),
             })
@@ -5895,6 +6033,9 @@ mod tests {
                 genesis_time: 0,
                 genesis_validators_root: Root::ZERO,
                 custody_columns: Vec::new(),
+                custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+                custody_since_slot: 0,
+                attached_validators: Default::default(),
                 attestation_subnets: Vec::new(),
             })),
         })

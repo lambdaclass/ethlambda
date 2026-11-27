@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use ethlambda_types::{
@@ -14,7 +14,7 @@ use ethlambda_types::{
         },
     },
     beacon::operation::BeaconOperation,
-    beacon::primitives::ValidatorIndex,
+    beacon::primitives::{Epoch, ValidatorIndex},
     block::SignedBlock,
     primitives::H256,
 };
@@ -52,6 +52,11 @@ pub trait BlockChainToP2P: Send + Sync {
         sidecars: Vec<DataColumnSidecar>,
         origin: SidecarOrigin,
     ) -> Result<(), ActorError>;
+    /// A beacon block's post-state is now cached under `block_root`. The p2p
+    /// layer holds the subnet attestations and aggregates that voted for it
+    /// before it got there, since their checks read that state, and checks
+    /// them again now.
+    fn block_state_ready(&self, block_root: H256) -> Result<(), ActorError>;
 }
 
 /// Where the sidecars handed to [`BlockChainToP2P::check_data_column_sidecars`]
@@ -519,6 +524,10 @@ pub struct AdvertisedMetaData {
     pub attnets: Vec<u8>,
     /// `syncnets`: the sync committee subnets this node serves.
     pub syncnets: Vec<u8>,
+    /// `custody_group_count`: how many custody groups this node advertises
+    /// (`MetaData` v3), the same count as its ENR's `cgc` until validator
+    /// custody raises it at runtime.
+    pub custody_group_count: u64,
 }
 
 /// Shared, runtime-readable copy of the node's [`AdvertisedMetaData`].
@@ -546,6 +555,63 @@ impl MetaDataController {
             .read()
             .expect("metadata lock poisoned")
             .clone()
+    }
+}
+
+// --- Shared state: RPC -> P2P ---
+
+/// The validators a validator client has said it runs on this node, each with
+/// the epoch it was last named in.
+///
+/// Fulu's validator custody (`validator.md`, "Validator custody") sizes a
+/// node's custody by the validators attached to it, and a beacon node learns
+/// which those are only from its validator clients' calls. The Beacon API
+/// records every index named by `beacon_committee_subscriptions` and
+/// `prepare_beacon_proposer`, which a validator client repeats every epoch;
+/// the p2p layer reads the set once an epoch. A validator not named again for
+/// [`Self::EXPIRY_EPOCHS`] epochs stops counting, so a detached validator
+/// client stops raising this node's custody (the count already raised is kept;
+/// see the p2p layer's `validator_custody`).
+///
+/// In memory only, like the fee recipients: a restarted node relearns the set
+/// from the next calls. A poisoned lock is recovered, as in
+/// [`PeerTableController`]: each critical section is one map operation.
+#[derive(Clone, Debug, Default)]
+pub struct AttachedValidators {
+    last_named: Arc<Mutex<HashMap<ValidatorIndex, Epoch>>>,
+}
+
+impl AttachedValidators {
+    /// How many epochs past the one a validator was last named in it still
+    /// counts as attached. Two, so a validator client that repeats its calls
+    /// once an epoch, whenever in the epoch it does so, is never dropped
+    /// between them.
+    pub const EXPIRY_EPOCHS: Epoch = 2;
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ValidatorIndex, Epoch>> {
+        self.last_named
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Record that a validator client named `indices` at `epoch`. A later
+    /// mention moves an entry forward; an earlier one never moves it back.
+    pub fn record(&self, indices: impl IntoIterator<Item = ValidatorIndex>, epoch: Epoch) {
+        let mut last_named = self.lock();
+        for index in indices {
+            let entry = last_named.entry(index).or_insert(epoch);
+            *entry = (*entry).max(epoch);
+        }
+    }
+
+    /// The validators still attached at `epoch`, ascending: those last named
+    /// at most [`Self::EXPIRY_EPOCHS`] epochs before it. Forgets the rest.
+    pub fn at(&self, epoch: Epoch) -> Vec<ValidatorIndex> {
+        let mut last_named = self.lock();
+        last_named.retain(|_, named| named.saturating_add(Self::EXPIRY_EPOCHS) >= epoch);
+        let mut indices: Vec<ValidatorIndex> = last_named.keys().copied().collect();
+        indices.sort_unstable();
+        indices
     }
 }
 
@@ -778,4 +844,43 @@ pub trait GossipEventSink: Send + Sync {
 
     /// Publish `event` to every current subscriber.
     fn emit(&self, event: GossipEvent);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A validator stays attached for `EXPIRY_EPOCHS` epochs after it was last
+    /// named, and is forgotten the epoch after.
+    #[test]
+    fn an_attached_validator_expires_after_two_silent_epochs() {
+        let attached = AttachedValidators::default();
+        attached.record([7, 3], 10);
+        assert_eq!(attached.at(10), vec![3, 7]);
+        assert_eq!(attached.at(12), vec![3, 7]);
+        assert_eq!(attached.at(13), Vec::<ValidatorIndex>::new());
+        // Forgotten, not merely hidden: an earlier epoch does not bring it back.
+        assert_eq!(attached.at(10), Vec::<ValidatorIndex>::new());
+    }
+
+    /// Naming a validator again keeps it attached; naming it with an older
+    /// epoch (a late request) does not shorten what a newer one granted.
+    #[test]
+    fn a_repeated_mention_extends_the_attachment() {
+        let attached = AttachedValidators::default();
+        attached.record([5], 10);
+        attached.record([5, 6], 12);
+        attached.record([5], 11);
+        assert_eq!(attached.at(14), vec![5, 6]);
+        assert_eq!(attached.at(15), Vec::<ValidatorIndex>::new());
+    }
+
+    /// Clones share one set: the Beacon API records into the handle the p2p
+    /// layer reads.
+    #[test]
+    fn clones_share_the_attached_set() {
+        let attached = AttachedValidators::default();
+        attached.clone().record([1], 0);
+        assert_eq!(attached.at(0), vec![1]);
+    }
 }

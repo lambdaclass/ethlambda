@@ -86,7 +86,19 @@ impl BidPool {
 }
 
 /// Preferences by `(proposal_slot, dependent_root)`: the first valid one wins.
-type PreferencesCache = BTreeMap<(Slot, Root), gloas::SignedProposerPreferences>;
+type PreferencesCache = BTreeMap<(Slot, Root), PooledPreferences>;
+
+/// Preferences in the market, and whether this node still owes them a gossip
+/// publish of its own.
+#[derive(Debug)]
+struct PooledPreferences {
+    signed: gloas::SignedProposerPreferences,
+    /// Set while this node owes them a publish: its last publish reached no
+    /// peer. Cleared once a publish goes out. Never set for preferences gossip
+    /// delivered, which peers already relay. Kept with the entry so it is
+    /// pruned with it.
+    publish_owed: bool,
+}
 
 #[derive(Debug)]
 pub struct BuilderMarket {
@@ -207,7 +219,7 @@ impl BuilderMarket {
     ) -> Option<gloas::SignedProposerPreferences> {
         lock(&self.preferences)
             .get(&(proposal_slot, dependent_root))
-            .cloned()
+            .map(|pooled| pooled.signed.clone())
     }
 
     /// The first valid preferences per key win. `false` if one is held. Prunes
@@ -223,11 +235,56 @@ impl BuilderMarket {
             return false;
         }
         *cache = cache.split_off(&(current_slot, Root::ZERO));
-        cache.insert(key, signed);
+        let pooled = PooledPreferences {
+            signed,
+            publish_owed: false,
+        };
+        cache.insert(key, pooled);
         while cache.len() > MAX_PREFERENCES {
             cache.pop_first();
         }
         cache.contains_key(&key)
+    }
+
+    /// Records whether `signed` is still owed a gossip publish by this node:
+    /// `owed` when no peer was handed it, not once a publish went out. Applies only to the very message pooled under its
+    /// key; one pruned, or other preferences pooled first, are left alone.
+    pub fn record_preferences_publish(
+        &self,
+        signed: &gloas::SignedProposerPreferences,
+        owed: bool,
+    ) {
+        let key = (signed.message.proposal_slot, signed.message.dependent_root);
+        if let Some(pooled) = lock(&self.preferences)
+            .get_mut(&key)
+            .filter(|pooled| pooled.signed == *signed)
+        {
+            pooled.publish_owed = owed;
+        }
+    }
+
+    /// Whether `signed` itself is pooled and still owed a publish by this
+    /// node (see [`Self::record_preferences_publish`]).
+    pub fn preferences_publish_owed(&self, signed: &gloas::SignedProposerPreferences) -> bool {
+        let key = (signed.message.proposal_slot, signed.message.dependent_root);
+        lock(&self.preferences)
+            .get(&key)
+            .is_some_and(|pooled| pooled.publish_owed && pooled.signed == *signed)
+    }
+
+    /// The pooled preferences still owed a publish (see
+    /// [`Self::record_preferences_publish`]) for a proposal slot after `slot`,
+    /// in slot order. Those for `slot` and earlier are left out: the slot has
+    /// started, so its proposer has chosen its bid and none can use them.
+    /// Peers still take them for the first `MAXIMUM_GOSSIP_CLOCK_DISPARITY`
+    /// of the slot, but that allows for clock skew; it does not make them
+    /// useful.
+    pub fn preferences_owed_a_publish(&self, slot: Slot) -> Vec<gloas::SignedProposerPreferences> {
+        lock(&self.preferences)
+            .iter()
+            .filter(|((proposal_slot, _), pooled)| *proposal_slot > slot && pooled.publish_owed)
+            .map(|(_, pooled)| pooled.signed.clone())
+            .collect()
     }
 
     pub fn prune_preferences_before(&self, slot: Slot) {
@@ -566,6 +623,64 @@ mod tests {
         assert!(market.preferences(101, Root::repeat_byte(1)).is_some());
         // A message below everything held is itself the one dropped.
         assert!(!market.record_preferences(prefs(50, 1, 3), 0));
+    }
+
+    #[test]
+    fn an_owed_publish_is_remembered_until_one_goes_out() {
+        let market = BuilderMarket::default();
+        let held = prefs(40, 1, 3);
+        assert!(market.record_preferences(held.clone(), 38));
+        assert!(
+            !market.preferences_publish_owed(&held),
+            "recorded as published"
+        );
+
+        market.record_preferences_publish(&held, true);
+        assert!(market.preferences_publish_owed(&held));
+        // Only the held message itself: other preferences for its key are not.
+        let mut other = held.clone();
+        other.message.fee_recipient = ExecutionAddress::repeat_byte(9);
+        assert!(!market.preferences_publish_owed(&other));
+        market.record_preferences_publish(&other, false);
+        assert!(market.preferences_publish_owed(&held));
+
+        market.record_preferences_publish(&held, false);
+        assert!(!market.preferences_publish_owed(&held));
+
+        // A publish outcome for preferences not held records nothing.
+        let unheld = prefs(41, 1, 3);
+        market.record_preferences_publish(&unheld, true);
+        assert!(!market.preferences_publish_owed(&unheld));
+        assert!(market.preferences(41, Root::repeat_byte(1)).is_none());
+    }
+
+    /// Owed are the preferences whose publish failed and whose slot is still
+    /// ahead: a slot that has started is stale, and one that went out is not
+    /// owed anything.
+    #[test]
+    fn preferences_owed_a_publish_are_the_owed_ones_still_ahead() {
+        let market = BuilderMarket::default();
+        let started = prefs(40, 1, 3);
+        let current = prefs(41, 1, 3);
+        let ahead = prefs(42, 1, 3);
+        let other_root = prefs(42, 2, 3);
+        let delivered = prefs(43, 1, 3);
+        for signed in [&started, &current, &ahead, &other_root, &delivered] {
+            assert!(market.record_preferences(signed.clone(), 40));
+        }
+        for signed in [&started, &current, &ahead, &other_root] {
+            market.record_preferences_publish(signed, true);
+        }
+
+        assert_eq!(
+            market.preferences_owed_a_publish(41),
+            vec![ahead.clone(), other_root.clone()]
+        );
+        assert_eq!(
+            market.preferences_owed_a_publish(39),
+            vec![started, current, ahead, other_root]
+        );
+        assert!(market.preferences_owed_a_publish(43).is_empty());
     }
 
     #[test]

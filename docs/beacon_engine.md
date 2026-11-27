@@ -105,7 +105,10 @@ builds the request on the actor (copying only the payload, never the block),
 sends it from a spawned task so the HTTP exchange keeps progressing, and runs
 `fork_choice::speculate_transition` on the actor meanwhile: the block's state
 transition against its parent's post-state, with the engine assumed valid. The
-import then costs `max(engine wait, transition)` instead of their sum.
+import then costs `max(engine wait, transition)` instead of their sum. Every
+block's transition is computed this way, ahead of `on_block`: one with no
+request to send (no execution client, pre-merge, gloas) runs it on its own,
+and its `PayloadValidity::NotRequired` verdict always lets it stand in.
 
 That needs the spawned task to run on another thread while the actor computes,
 and in the node it does: the chain actor runs on `Backend::Thread`, whose thread
@@ -121,22 +124,26 @@ transition reads nothing else off the store except content-keyed caches. What
 keeps it harmless:
 
 - A block `on_block` would refuse before its own transition gets no
-  speculation: one already imported, one from the future, one at or before the
-  finalized epoch's first slot, or one whose parent is off the finalized chain.
-  `speculate_transition` runs the same guard function `on_block` does
-  (`check_timely_and_on_the_finalized_chain`) before transitioning anything. A
-  block fetched over req/resp carries no gossip-checked signature, and the
-  transition checks the signature only after advancing the parent's state to
-  the block's slot, so without this such a block could make the actor run that
-  advance where `on_block` would have refused it for free.
+  speculation: one already imported, a gloas block whose parent's full payload
+  is not verified, one from the future, one at or before the finalized epoch's
+  first slot, or one whose parent is off the finalized chain.
+  `speculate_transition` runs the same guard functions `on_block` does
+  (`check_parent_payload`, `check_timely_and_on_the_finalized_chain`) before
+  transitioning anything. A block fetched over req/resp carries no
+  gossip-checked signature, and the transition checks the signature only after
+  advancing the parent's state to the block's slot, so without this such a
+  block could make the actor run that advance where `on_block` would have
+  refused it for free.
 - The result is a local value (`SpeculativeTransition`). The block, its
   post-state and its fork choice records reach neither the store nor the network
   until `on_block_speculative` accepts it, and that runs every check `on_block`
-  makes, unchanged and in the same order. The one write computing it can make is
-  an epoch-crossing block's boundary balances, a cache entry keyed by the
-  checkpoint and built from the parent's state alone, so it is the entry
-  `on_block`'s own transition would write and is right whatever becomes of the
-  block.
+  makes, unchanged and in the same order. Computing it can write two cache
+  entries, both keyed by a checkpoint: an epoch-crossing block's boundary
+  balances, built from the parent's state alone, and an epoch's first block's
+  own checkpoint balances, built from its post-state. Both are entries
+  `on_block` would write, and right whatever becomes of the block; for one that
+  never imports (an `INVALID` verdict) the second is an entry nothing reads, in
+  a bounded cache.
 - The argument above rests on the actor handling one message at a time, which
   no type enforces. Builds with debug assertions (the test suite's
   `release-fast` among them) therefore run the transition again whenever a
@@ -163,12 +170,14 @@ keeps it harmless:
   on its own lookup.
 
 The overlap shows in the import timing tree: the transition that ran during the
-round trip is reported under `stf` (used or discarded), and `engine` reports only
-what the question cost beyond it: building the request (a copy of the
-payload) and the wait that was left once the transition finished, the request's
-construction alone when the answer was already in. Without an execution client,
-and for forks that have no request to send (pre-merge, gloas), nothing overlaps,
-`engine` is zero, and the path is the old one. How long the execution client itself took to answer is
+round trip is reported under `cl` (used or discarded), `on_block` after the
+verdict under `store`, and `el_wait` reports only what the question cost beyond
+the transition: building the request (a copy of the payload) and the wait that
+was left once the transition finished, the request's construction alone when
+the answer was already in. Without an execution client, and for forks that have
+no request to send (pre-merge, gloas), the transition still runs ahead of
+`on_block`, on its own, and is reported under `cl`; nothing overlaps, and
+`el_wait` is zero. How long the execution client itself took to answer is
 `lean_engine_new_payload_seconds{outcome}`, timed around every `engine_newPayload*`
 request this module sends (`timed_new_payload`), a gloas envelope's included.
 
@@ -524,11 +533,17 @@ authentication, so an endpoint without a secret is refused at startup, before
 anything binds or connects. Clap cannot express "both or neither" across two
 optional flags, so the pairing is checked once, in `From<BeaconOptions>`.
 
-Blob fetching has no flag of its own: it is on whenever `--execution-endpoint` is set.
+Blob fetching has no flag of its own: it is on whenever the node has an
+execution client.
 
-With **neither** flag, the follower contacts no execution client and every block
-gets `PayloadValidity::NotRequired`, which is exactly what it did before any of
-this existed.
+With **neither** flag, a build with the `include-ethrex` feature starts the
+ethrex it embeds and uses it as its execution client, configured by the
+`--ethrex.*` flags; every call above then goes to ethrex's own handlers in
+process instead of over HTTP, with the same timeouts and the same retries
+after a timeout (see [Embedded ethrex](./ethrex.md)). In any other build the
+follower contacts no execution client and every block gets
+`PayloadValidity::NotRequired`, which is exactly what it did before any of this
+existed.
 
 Authentication is HMAC-SHA256 over a JOSE header and a claim set whose only
 member is `iat`. Execution clients accept about a minute of skew either way; a

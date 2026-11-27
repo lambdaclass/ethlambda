@@ -36,12 +36,14 @@ pub mod doppelganger;
 pub mod duties;
 pub mod error;
 pub mod exit;
+pub mod graffiti_file;
 pub mod head_monitor;
 pub mod http_api;
 pub(crate) mod in_flight;
 pub mod keys;
 pub mod metrics;
 pub mod payload_attestation;
+pub mod performance;
 pub mod preferences;
 pub mod proposal;
 pub mod proposer_settings;
@@ -51,6 +53,7 @@ mod scale_tests;
 pub mod secure_fs;
 pub mod shared_config;
 pub mod signing;
+pub mod slashed;
 pub mod slashing_protection;
 pub mod slot_clock;
 pub mod subscriptions;
@@ -63,9 +66,11 @@ pub use error::{Error, Result};
 /// Run this process on the preset the beacon node reports, before anything
 /// reads one.
 ///
-/// A validator client has no network config of its own: the node's
-/// `/eth/v1/config/spec` is where it learns the chain, `PRESET_BASE`
-/// included. Every container this client decodes, builds or signs is bounded
+/// A validator client runs on the node's `/eth/v1/config/spec`, `PRESET_BASE`
+/// included, even with `--network`: the network it names is only compared
+/// against (see [`chain_check::ExpectedNetwork`]). Resolving that network
+/// selects its preset first, and the reference node is then one on it, so
+/// this selects the same preset again. Every container this client decodes, builds or signs is bounded
 /// by that preset (a sync committee's bits, an attestation's committee bits,
 /// the slots in an epoch), so it is selected here, right after the spec is
 /// fetched and before any duty runs.
@@ -94,6 +99,7 @@ pub(crate) fn require_unread_preset() -> Result<()> {
         .map_err(|err| Error::Preset(err.to_string()))
 }
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -133,11 +139,15 @@ pub struct ValidatorConfig {
     pub validators_dir: PathBuf,
     pub secrets_dir: PathBuf,
     pub metrics: std::net::SocketAddr,
-    /// The graffiti every validator proposes with unless the keymanager API
-    /// gives it its own. Consensus never reads it. An ethlambda beacon node
-    /// appends both clients' versions to it; other nodes follow their own
-    /// policy.
-    pub graffiti: Bytes32,
+    /// The graffiti every validator proposes with unless the graffiti file or
+    /// the keymanager API gives it its own. Consensus never reads it. An
+    /// ethlambda beacon node appends both clients' versions to it; other nodes
+    /// follow their own policy. `None` sends no graffiti, so the beacon node
+    /// applies its own default.
+    pub graffiti: Option<Bytes32>,
+    /// `--graffiti-file`, read before every proposal ahead of every other
+    /// graffiti source. See [`graffiti_file`].
+    pub graffiti_file: Option<graffiti_file::GraffitiFile>,
     /// Where execution-layer block rewards should be paid, for every validator
     /// the keymanager API gives no address of its own.
     ///
@@ -158,8 +168,10 @@ pub struct ValidatorConfig {
     /// The gas limit every validator targets unless the keymanager API gives
     /// it its own: its builder registrations' before gloas, and its proposer
     /// preferences' from gloas, which is what the node's own payload is built
-    /// toward.
-    pub gas_limit: u64,
+    /// toward. `None` when `--gas-limit` was not given: the network's
+    /// `GAS_LIMIT_SCHEDULE` then names it per epoch, and
+    /// [`proposer_settings::DEFAULT_GAS_LIMIT`] where it names none.
+    pub gas_limit: Option<u64>,
     /// Builder proposals, or `None` when `--builder-proposals` is off.
     pub builder: Option<BuilderProposals>,
     /// The smallest p2p bid, in gwei, a gloas block may be built on
@@ -183,6 +195,9 @@ pub struct ValidatorConfig {
     /// has seen it stay silent for a full epoch, and stop if it does not. See
     /// [`doppelganger`].
     pub doppelganger_protection: bool,
+    /// The network `--network` names, or `None` to run on whichever chain the
+    /// first beacon node to answer is on. See [`chain_check::ExpectedNetwork`].
+    pub network: Option<chain_check::ExpectedNetwork>,
     /// `--broadcast`: the signed messages sent to every beacon node rather
     /// than the first that accepts them. See [`beacon_node::fallback`].
     pub broadcast: beacon_node::fallback::Broadcast,
@@ -192,6 +207,11 @@ pub struct ValidatorConfig {
     /// together with [`Self::doppelganger_protection`]; see
     /// [`refuse_conflicting_modes`].
     pub distributed: bool,
+
+    /// Stop the client when the chain reports a loaded key slashed, rather
+    /// than only dropping that key's proposer, attester and attestation
+    /// aggregation duties. See [`slashed`].
+    pub shut_down_when_slashed: bool,
     /// Read the beacon nodes' event streams, so attestations and sync
     /// committee messages go out when the slot's block arrives and payload
     /// votes when its payload does, rather than only at their deadlines. See
@@ -278,7 +298,8 @@ where
     }
     let settings = Arc::new(
         ProposerSettings::new(config.graffiti, config.suggested_fee_recipient)
-            .with_default_gas_limit(config.gas_limit),
+            .with_default_gas_limit(config.gas_limit)
+            .with_graffiti_file(config.graffiti_file),
     );
 
     // The directory's lock first, before any key is read: held from here,
@@ -361,14 +382,15 @@ where
 
     // The chain the client runs on is the first node's that answers, waiting
     // for one while none does; every other node is checked against it, and a
-    // node on another chain is not used. The schedule is the reference's: a
-    // fork another node schedules is taken by the background check once every
+    // node on another chain is not used. With `--network`, only a node on
+    // that network can be the first. The schedule is the reference's: a fork
+    // another node schedules is taken by the background check once every
     // node answering schedules it alike. See `chain_check`.
     let ChainId {
         genesis,
         config: spec,
     } = beacon_node
-        .establish(|reference| {
+        .establish_on(config.network.as_ref(), |reference| {
             // Right after the reference is chosen and before anything reads a
             // preset value, which the epoch below does.
             require_unread_preset()?;
@@ -376,14 +398,18 @@ where
             Ok(chain_check::current_epoch_of(reference))
         })
         .await?;
+    settings.set_gas_limit_schedule(spec.gas_limit_schedule.clone());
+    let network = config.network.as_ref().map(|network| network.name.as_str());
     info!(
+        network = network.unwrap_or("any, taken from the beacon nodes"),
         preset = spec.preset_base.as_str(),
         genesis_time = genesis.genesis_time,
         slot_duration_ms = spec.slot_duration_ms,
         attestation_due_bps = spec.attestation_due_bps,
         aggregate_due_bps = spec.aggregate_due_bps,
         validators = store.read().await.len(),
-        gas_limit = config.gas_limit,
+        gas_limit = ?config.gas_limit,
+        gas_limit_schedule = %chain_check::gas_limit_schedule_text(&spec.gas_limit_schedule),
         "Validator client starting"
     );
 
@@ -450,6 +476,9 @@ where
     if config.distributed {
         context = context.with_distributed();
     }
+    context = context.with_slashed(slashed::SlashedValidators::new(
+        config.shut_down_when_slashed,
+    ));
     let context = Arc::new(context);
     let distributed = config.distributed.then(|| {
         Arc::new(distributed::Distributed::new(
@@ -458,16 +487,23 @@ where
         ))
     });
 
+    // Each validator's duty outcomes, counted by the services that serve them.
+    let performance = Arc::new(performance::Performance::new(
+        performance::LABELLED_VALIDATORS,
+    ));
     // Every node's stream, read until `run` returns and `_monitor` with it.
     let (_monitor, triggers) =
         head_monitor::start(&config.beacon_nodes, &context, config.event_stream)?;
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =
-        AttestationService::new(beacon_node.clone(), context.clone(), protection.clone());
+        AttestationService::new(beacon_node.clone(), context.clone(), protection.clone())
+            .with_performance(performance.clone());
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
-    let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
-    let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());
+    let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone())
+        .with_performance(performance.clone());
+    let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone())
+        .with_performance(performance.clone());
 
     // Unconditional, as Lighthouse does: from gloas the preferences carry the
     // fee recipient of every proposal, builders or not. See the module doc.
@@ -491,7 +527,8 @@ where
     .with_gloas_boost_factor(config.gloas_boost_factor)
     .with_self_build_only(config.self_build_only)
     .with_preferences(preferences.clone())
-    .with_tasks(tasks.clone());
+    .with_tasks(tasks.clone())
+    .with_performance(performance);
     // The proposer preparations' per-slot re-send. The epoch's own send is
     // `refresh_epoch`'s.
     let preparations = Arc::new(Preparations::new(beacon_node.clone(), settings.clone()));
@@ -561,6 +598,8 @@ where
         genesis,
         clock.clone(),
         context.clone(),
+        settings.clone(),
+        config.network.clone(),
         shutdown.clone(),
     ));
     let mut keymanager = None;
@@ -771,6 +810,9 @@ where
                     &mut resolved,
                     &mut node_syncing,
                 );
+                // A refresh that found a key slashed and then failed partway
+                // keeps the entries of the last full one, which predate it.
+                resolved = mark_slashed(&resolved, context.slashed());
                 match settled {
                     Ok(settled) => owed = settled,
                     Err(err) => return Err(err),
@@ -801,7 +843,7 @@ where
             let readmission = (readmitted && last_epoch.is_some() && owed.is_none()).then(|| {
                 let registrable = resolved
                     .iter()
-                    .filter(|entry| is_registrable(&entry.status))
+                    .filter(|entry| is_registrable(entry))
                     .map(|entry| entry.pubkey)
                     .collect::<Vec<_>>();
                 (registrable, sync_subscriptions_owed(&duties, epoch))
@@ -839,6 +881,13 @@ where
                         "Not proposing: doppelganger protection has not cleared this validator yet"
                     );
                 }
+            } else if let Some(duty) = duties.slashed_proposer_at_slot(slot, epoch) {
+                warn!(
+                    %slot,
+                    validator = duty.validator_index,
+                    "Not proposing: the validator is slashed, and the chain refuses a block \
+                     from a slashed proposer"
+                );
             }
 
             // Right after the proposal and ahead of the slot's other duties: the
@@ -940,9 +989,13 @@ where
             // slots it will not serve, and the refresh could use up the stop's
             // wait for nothing (see `run_until_stopped`), while the slot's own
             // duties beside it run to their end.
+            //
+            // Settled as soon as it ends, not once the slot's duties have: a
+            // refresh that stops the client stops them too (see
+            // `beside_slot_duties`).
             let refresh = async {
                 if !defer_refresh {
-                    return None;
+                    return Ok(None);
                 }
                 let budget = clock.remaining_in(slot, SystemTime::now());
                 let refreshed = bounded_refresh(
@@ -955,11 +1008,21 @@ where
                     &context,
                     budget,
                 );
-                tokio::select! {
+                let outcome = tokio::select! {
                     biased;
-                    () = shutdown.cancelled() => None,
-                    outcome = refreshed => Some(outcome),
-                }
+                    () = shutdown.cancelled() => return Ok(None),
+                    outcome = refreshed => outcome,
+                };
+                let settled = settle_refresh(
+                    epoch,
+                    outcome,
+                    &mut last_epoch,
+                    &mut resolved,
+                    &mut node_syncing,
+                );
+                // As for a refresh run ahead of the block.
+                resolved = mark_slashed(&resolved, context.slashed());
+                settled
             };
             let slot_work = async {
                 // The rest of the way to the first of the slot's remaining
@@ -986,34 +1049,21 @@ where
                 )
                 .await;
             };
-            let (deferred, ()) = tokio::join!(refresh, slot_work);
-            if let Some(outcome) = deferred {
-                let settled = settle_refresh(
+            let deferred = beside_slot_duties(refresh, slot_work).await?;
+            if let Some(owed) = deferred {
+                report_refreshed(&health, &duties, epoch, resolved.len());
+                // From the next slot: this one's duties are served.
+                send_owed(
+                    owed,
+                    slot + 1,
                     epoch,
-                    outcome,
-                    &mut last_epoch,
-                    &mut resolved,
-                    &mut node_syncing,
+                    &beacon_node,
+                    &duties,
+                    &store,
+                    &context,
+                    &registration,
+                    distributed.as_ref(),
                 );
-                match settled {
-                    Ok(Some(owed)) => {
-                        report_refreshed(&health, &duties, epoch, resolved.len());
-                        // From the next slot: this one's duties are served.
-                        send_owed(
-                            owed,
-                            slot + 1,
-                            epoch,
-                            &beacon_node,
-                            &duties,
-                            &store,
-                            &context,
-                            &registration,
-                            distributed.as_ref(),
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(err) => return Err(err),
-                }
             }
 
             // Off the slot loop, like the epoch's full send: a keymanager change
@@ -1780,6 +1830,36 @@ async fn bounded_refresh<B: BeaconNodeApi>(
         .unwrap_or(Err(Error::DutyRefreshDeadline { epoch, slot }))
 }
 
+/// Run the epoch's refresh, deferred past the slot's block, beside the slot's
+/// duties (`slot_work`), and hand back what it settled to. `refresh` has been
+/// through [`settle_refresh`] already, so an error from it is one that stops
+/// the client.
+///
+/// Such an error stops the slot's duties at once, where they stand, rather
+/// than once they end. With `--shut-down-when-slashed` a refresh that finds a
+/// key slashed returns one, and waiting would leave every other key
+/// attesting, aggregating and serving its committees for the rest of the
+/// slot after the stop was decided; the refresh asks for the slashed flags
+/// before anything else, so it usually ends ahead of the slot's attestations.
+/// A doppelganger sighting stops the duty loop the same way (see
+/// `doppelganger_watch` in [`run`]), and dropping the duties mid-flight is
+/// safe for the same reason: slashing protection records before signing (see
+/// [`attest_and_aggregate`]).
+///
+/// Anything else, a refresh that failed and is retried included, waits for
+/// both, so the slot's duties run to their end.
+async fn beside_slot_duties<T>(
+    refresh: impl Future<Output = Result<T>>,
+    slot_work: impl Future<Output = ()>,
+) -> Result<T> {
+    let slot_work = async {
+        slot_work.await;
+        Ok::<(), Error>(())
+    };
+    let (settled, ()) = tokio::try_join!(refresh, slot_work)?;
+    Ok(settled)
+}
+
 /// Record a refresh's outcome in the duty loop's state, and hand back what it
 /// leaves owing for [`send_owed`].
 ///
@@ -1823,13 +1903,11 @@ fn settle_refresh(
             warn!(%epoch, %err, "Failed to refresh duties; keeping the previous schedule");
             Ok(None)
         }
-        // Unreachable today: every error `refresh_epoch` can produce comes
-        // from a `BeaconNodeApi` call or its deadline, and every variant those
-        // raise is classified retryable (see `Error::is_retryable`). Kept
-        // rather than deleted, since it is the only thing that would stop the
-        // process if a future non-retryable failure (a local config or key
-        // problem, say) ever reached this point; do not remove it as
-        // unreachable dead code.
+        // A slashed key under `--shut-down-when-slashed`, whose reason
+        // `slashed` has already logged. Every other error `refresh_epoch` can
+        // produce comes from a `BeaconNodeApi` call or its deadline, and every
+        // variant those raise is classified retryable (see
+        // `Error::is_retryable`).
         Err(err) => {
             error!(%epoch, %err, "Cannot refresh duties; stopping");
             Err(err)
@@ -2024,13 +2102,35 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     // would otherwise keep asking for validators whose keys were all deleted.
     if pubkeys.is_empty() {
         duties.set_indices(Vec::new());
+        // No key loaded is no key slashed: forgets any that keymanager
+        // deletes took out, in the duties service too, so a key imported
+        // again before the next refresh is not withheld there alone.
+        context.slashed().observe(&[])?;
+        duties.set_slashed(context.slashed().indices());
         return Ok(Refreshed::default());
     }
 
     // Re-resolved every epoch, not once at startup: a validator can be
     // deposited but not yet activated, in which case it has no index to ask
     // duties for until it is.
-    let entries = beacon_node.validator_indices(pubkeys).await?;
+    //
+    // Only the keys asked for: a node that answers for more must not have this
+    // client fetch duties for, prepare, register, report slashed or stop over
+    // a validator it does not hold.
+    let asked: HashSet<&BlsPubkey> = pubkeys.iter().collect();
+    let answered = beacon_node.validator_indices(pubkeys).await?;
+    let answered_count = answered.len();
+    let entries: Vec<ValidatorEntry> = answered
+        .into_iter()
+        .filter(|entry| asked.contains(&entry.pubkey))
+        .collect();
+    if entries.len() != answered_count {
+        warn!(
+            answered = answered_count,
+            kept = entries.len(),
+            "The beacon node answered for validators this client did not ask about; ignoring them"
+        );
+    }
     let indices: Vec<ValidatorIndex> = entries.iter().map(|entry| entry.index).collect();
     if indices.len() != pubkeys.len() {
         info!(
@@ -2046,6 +2146,11 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     // a single log line from whenever it first happened.
     metrics::set_validators_resolved(indices.len() as u64);
     duties.set_indices(indices);
+    // Before anything is fetched or sent for the epoch, so a key found slashed
+    // has no duty, preparation or registration from here on, and
+    // `--shut-down-when-slashed` stops the client ahead of all of them.
+    context.slashed().observe(&entries)?;
+    duties.set_slashed(context.slashed().indices());
 
     // Sent here, with the epoch's duties, and then again every slot by the
     // duty loop (see `Preparations`). Ahead of a block only on the refresh the
@@ -2071,7 +2176,7 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     refresh_ptc(duties, epoch, context).await;
     refresh_sync(beacon_node, duties, epoch, context).await;
     metrics::set_duties_held(duties.all().len() as u64);
-    let registrable = entries.iter().filter(|entry| is_registrable(&entry.status));
+    let registrable = entries.iter().filter(|entry| is_registrable(entry));
     Ok(Refreshed {
         // Taken here, after the last await, rather than from
         // `refresh_around`'s answer: a refresh abandoned after that answer
@@ -2101,13 +2206,15 @@ async fn prepare_proposers<B: BeaconNodeApi>(
 /// default, as `settings` names it now.
 ///
 /// A validator with neither is left out: there is nothing to tell the node,
-/// which then picks an address itself, as the startup warning says.
+/// which then picks an address itself, as the startup warning says. So is a
+/// slashed one, whose block the chain would refuse (see [`slashed`]).
 fn preparations<'a>(
     entries: impl IntoIterator<Item = &'a ValidatorEntry>,
     settings: &ProposerSettings,
 ) -> Vec<ProposerPreparationDto> {
     entries
         .into_iter()
+        .filter(|entry| !entry.slashed)
         .filter_map(|entry| {
             let fee_recipient = settings.fee_recipient(&entry.pubkey)?;
             Some(ProposerPreparationDto {
@@ -2255,9 +2362,9 @@ impl<B: BeaconNodeApi + 'static> Preparations<B> {
     }
 }
 
-/// Whether a validator whose Beacon API `status` is this one is sent a builder
-/// registration: one that is pending or active, not one that exited or was
-/// withdrawn.
+/// Whether a validator is sent a builder registration: one that is pending or
+/// active, not one that exited or was withdrawn, and not one the chain reports
+/// slashed.
 ///
 /// The flashbots relay refuses a whole registration request over one key it
 /// does not know, and it knows only pending and active validators, so one
@@ -2265,8 +2372,30 @@ impl<B: BeaconNodeApi + 'static> Preparations<B> {
 /// [`beacon_node::REGISTRATION_BATCH`]. Teku's validator client leaves exited
 /// keys out the same way, and Lighthouse's beacon node drops them before
 /// forwarding; a node that forwards as it gets would otherwise pass them on.
-fn is_registrable(status: &str) -> bool {
-    status.starts_with("pending") || status.starts_with("active")
+///
+/// The relay would take a slashed one, which is still active until it exits,
+/// but its block would be refused, so there is nothing to register it for
+/// (see [`slashed`]).
+fn is_registrable(entry: &ValidatorEntry) -> bool {
+    let status = entry.status.as_str();
+    !entry.slashed && (status.starts_with("pending") || status.starts_with("active"))
+}
+
+/// `resolved` with every key `slashed` holds marked slashed, or `resolved`
+/// itself when it already says so for each of them.
+fn mark_slashed(
+    resolved: &Arc<Vec<ValidatorEntry>>,
+    slashed: &slashed::SlashedValidators,
+) -> Arc<Vec<ValidatorEntry>> {
+    let found = |entry: &ValidatorEntry| !entry.slashed && slashed.contains(&entry.pubkey);
+    if !resolved.iter().any(found) {
+        return resolved.clone();
+    }
+    let marked = resolved.iter().map(|entry| ValidatorEntry {
+        slashed: entry.slashed || found(entry),
+        ..entry.clone()
+    });
+    Arc::new(marked.collect())
 }
 
 /// Fetch the payload timeliness committee schedule for this epoch and the next,
@@ -2463,11 +2592,13 @@ mod tests {
                 index: 11,
                 pubkey: pubkey(1),
                 status: "active_ongoing".to_string(),
+                slashed: false,
             },
             ValidatorEntry {
                 index: 22,
                 pubkey: pubkey(2),
                 status: "active_ongoing".to_string(),
+                slashed: false,
             },
         ];
         node
@@ -2818,8 +2949,9 @@ mod tests {
 
     /// Only pending and active validators get a builder registration: the
     /// flashbots relay refuses a whole batch over one key it does not know, and
-    /// it knows no exited or withdrawn one. Proposer preparations still go to
-    /// every resolved validator.
+    /// it knows no exited or withdrawn one. Nor does a slashed one, whose block
+    /// would be refused. Proposer preparations still go to every resolved
+    /// validator but the slashed one.
     #[tokio::test]
     async fn only_pending_and_active_validators_are_registered() {
         let mut node = node();
@@ -2828,23 +2960,28 @@ mod tests {
             index: 33,
             pubkey: pubkey(3),
             status: "pending_queued".to_string(),
+            slashed: false,
         });
         node.validators.push(ValidatorEntry {
             index: 44,
             pubkey: pubkey(4),
             status: "withdrawal_done".to_string(),
+            slashed: false,
         });
-        // Exiting and slashed are still active: the relay loads validators
-        // with `status=active,pending`, which takes in both.
+        // Exiting is still active: the relay loads validators with
+        // `status=active,pending`, which takes it in. So is slashed, but
+        // that one is left out all the same.
         node.validators.push(ValidatorEntry {
             index: 55,
             pubkey: pubkey(5),
             status: "active_exiting".to_string(),
+            slashed: false,
         });
         node.validators.push(ValidatorEntry {
             index: 66,
             pubkey: pubkey(6),
             status: "active_slashed".to_string(),
+            slashed: true,
         });
         let node = Arc::new(node);
         let mut duties = DutiesService::new(node.clone(), Vec::new());
@@ -2863,11 +3000,8 @@ mod tests {
                 .await
                 .expect("refreshes");
 
-        assert_eq!(
-            registrable,
-            vec![pubkey(1), pubkey(3), pubkey(5), pubkey(6)]
-        );
-        assert_eq!(node.preparations().len(), 6);
+        assert_eq!(registrable, vec![pubkey(1), pubkey(3), pubkey(5)]);
+        assert_eq!(node.preparations().len(), 5);
     }
 
     /// With nothing resolved there is nobody to register, and an empty array
@@ -3205,6 +3339,83 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert!(owed.moved, "the first schedule is a move");
         assert_eq!(owed.registrable.len(), 2);
+    }
+
+    /// `outcome` settled as the duty loop settles a refresh deferred past the
+    /// slot's block.
+    async fn settled(outcome: Result<Refreshed>) -> Result<Option<Refreshed>> {
+        let (mut last_epoch, mut resolved, mut node_syncing) = (Some(2), Arc::default(), false);
+        settle_refresh(
+            3,
+            outcome,
+            &mut last_epoch,
+            &mut resolved,
+            &mut node_syncing,
+        )
+    }
+
+    /// A deferred refresh that stops the client, as one that finds a key
+    /// slashed does under `--shut-down-when-slashed`, stops the slot's duties
+    /// beside it there and then: waiting for them would leave every other key
+    /// attesting and aggregating for the rest of the slot after the stop was
+    /// decided. The duties here never end, so only that stop returns.
+    #[tokio::test]
+    async fn a_refresh_that_stops_the_client_stops_the_slots_duties_with_it() {
+        let refresh = settled(Err(Error::ValidatorSlashed {
+            validators: vec![22],
+        }));
+        let stopped = beside_slot_duties(refresh, std::future::pending());
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), stopped)
+            .await
+            .expect("the slot's duties are not waited for");
+        assert!(
+            matches!(&stopped, Err(Error::ValidatorSlashed { validators }) if *validators == [22]),
+            "got {stopped:?}"
+        );
+    }
+
+    /// Any other deferred refresh leaves the slot's duties beside it to run
+    /// to their end: one that got through, one that failed and is retried
+    /// next slot, and one a shutdown cut off, which settles nothing.
+    #[tokio::test]
+    async fn a_refresh_that_does_not_stop_the_client_waits_for_the_slots_duties() {
+        /// Whether `refresh` returned only once the slot's duties ended, and
+        /// what it settled to.
+        async fn beside(
+            refresh: impl Future<Output = Result<Option<Refreshed>>>,
+        ) -> (Result<Option<Refreshed>>, bool) {
+            let served = std::sync::atomic::AtomicBool::new(false);
+            let slot_work = async {
+                // Not done at its first poll, unlike every refresh here.
+                tokio::task::yield_now().await;
+                served.store(true, std::sync::atomic::Ordering::Relaxed);
+            };
+            let outcome = beside_slot_duties(refresh, slot_work).await;
+            (outcome, served.load(std::sync::atomic::Ordering::Relaxed))
+        }
+
+        let node = Arc::new(node());
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+        let outcome =
+            refresh_epoch(&node, &mut duties, &keys, 3, &settings(None), &context()).await;
+        let (got_through, served) = beside(settled(outcome)).await;
+        assert!(matches!(got_through, Ok(Some(_))), "got {got_through:?}");
+        assert!(served, "the duties ran to their end");
+
+        let retried = [
+            Error::BeaconNodeSyncing,
+            Error::DutyRefreshDeadline { epoch: 3, slot: 96 },
+        ];
+        for err in retried {
+            let (failed, served) = beside(settled(Err(err))).await;
+            assert!(matches!(failed, Ok(None)), "got {failed:?}");
+            assert!(served, "the duties ran to their end");
+        }
+
+        let (cut_off, served) = beside(async { Ok(None) }).await;
+        assert!(matches!(cut_off, Ok(None)), "got {cut_off:?}");
+        assert!(served, "the duties ran to their end");
     }
 
     /// A refresh abandoned after it moved the attester schedule still owes

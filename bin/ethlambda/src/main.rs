@@ -42,7 +42,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-use cli::{Network, Options};
+use cli::{Execution, Network, Options};
 use command::Command;
 use shutdown::ShutdownSignals;
 
@@ -91,11 +91,11 @@ fn main() -> eyre::Result<()> {
         // command line.
         Command::Node(options) => {
             init_node_logging()?;
-            run_node(options.into())
+            run(options.into())
         }
         Command::Beacon(options) => {
             init_node_logging()?;
-            run_node(options.into())
+            run(options.into())
         }
         // The benchmark is synchronous, CPU-bound work, so it runs on this
         // thread and the tokio runtime is never started — rather than parking
@@ -256,6 +256,9 @@ struct RunningNode {
     http: tokio::task::JoinHandle<()>,
     /// Cancelled by [`wait_for_shutdown`] to stop `http`.
     shutdown: CancellationToken,
+    /// The in-process execution client, when the beacon node started one.
+    #[cfg(feature = "include-ethrex")]
+    embedded_ethrex: Option<ethlambda_ethrex::EmbeddedEthrex>,
 }
 
 /// What one chain claims to serve, in the entries its ENR publishes and its
@@ -300,6 +303,9 @@ enum ChainActor {
         /// The checkpoint-sync URLs to ask for a gloas anchor's execution
         /// payload envelope; empty when there is nothing to ask.
         anchor_envelope_urls: Vec<String>,
+        /// This start's custody set, recorded in the data directory just
+        /// before the chain actor spawns (see `StartupCustody::record`).
+        custody_record: ethlambda_storage::CustodyRecord,
     },
 }
 
@@ -334,6 +340,37 @@ struct ChainSetup {
     chain: ChainActor,
 }
 
+/// Runs [`run_node`], and stops the embedded ethrex if a startup step fails
+/// after it started, so its database is flushed and its peers recorded all the
+/// same.
+//
+// Shadow single-steps execution in a discrete-event simulation, so the default
+// multi-threaded runtime's worker threads add only scheduling noise, never
+// parallelism. Use a single-threaded runtime under Shadow. This is an
+// optimization, not a correctness requirement.
+#[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
+#[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
+async fn run(options: Options) -> eyre::Result<()> {
+    // Filled by the beacon arm when it starts ethrex in-process, and taken
+    // into `RunningNode` once no startup step is left to fail.
+    #[cfg(feature = "include-ethrex")]
+    let mut embedded_ethrex = None;
+    let ran = run_node(
+        options,
+        #[cfg(feature = "include-ethrex")]
+        &mut embedded_ethrex,
+    )
+    .await;
+    #[cfg(feature = "include-ethrex")]
+    if let Some(embedded) = embedded_ethrex {
+        let _ = embedded
+            .shutdown()
+            .await
+            .inspect_err(|err| error!(%err, "Failed to flush the embedded ethrex database"));
+    }
+    ran
+}
+
 /// Boot the node, on whichever chain [`Options::network`] names.
 ///
 /// One startup path, in the order it has to happen: validate the port, register
@@ -355,14 +392,15 @@ struct ChainSetup {
 /// site serves both, but its endpoints still read metadata keys and state
 /// variants a beacon store does not carry, so they do not yet answer for a
 /// beacon directory; fixing that is its own change.
-//
-// Shadow single-steps execution in a discrete-event simulation, so the default
-// multi-threaded runtime's worker threads add only scheduling noise, never
-// parallelism. Use a single-threaded runtime under Shadow. This is an
-// optimization, not a correctness requirement.
-#[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
-#[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
-async fn run_node(options: Options) -> eyre::Result<()> {
+///
+/// The beacon arm puts an embedded ethrex it starts in `embedded_ethrex`,
+/// which [`run`] holds, so a step that fails after it can still be stopped.
+async fn run_node(
+    options: Options,
+    #[cfg(feature = "include-ethrex")] embedded_ethrex: &mut Option<
+        ethlambda_ethrex::EmbeddedEthrex,
+    >,
+) -> eyre::Result<()> {
     // Before any side effect, so a port collision aborts ahead of the metrics
     // registry, the fd limit and the data directory.
     options.validate_ports()?;
@@ -374,8 +412,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         Network::Lean(lean) => Some(lean.node_id.clone()),
         Network::Mainnet { .. } => None,
     };
-    let telemetry_url = common.telemetry_clickhouse_url;
-    let telemetry_client_name = common.telemetry_client_name;
+    // Cloned rather than moved out: the embedded ethrex's port check borrows
+    // `common` whole further down.
+    let telemetry_url = common.telemetry_clickhouse_url.clone();
+    let telemetry_client_name = common.telemetry_client_name.clone();
 
     #[cfg(feature = "shadow-integration")]
     if let Network::Lean(lean) = &network {
@@ -561,6 +601,11 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
     let clean_checkpoint_urls = checkpoint_sync::clean_urls(&common.checkpoint_sync_url);
 
+    // The validators a validator client names to the Beacon API, read by the
+    // p2p layer's validator custody once an epoch. Beacon only; a lean node
+    // never fills it.
+    let attached_validators = ethlambda_network_api::AttachedValidators::default();
+
     // The one place the two chains diverge. Everything above is shared setup;
     // everything below is shared startup and, in `wait_for_shutdown`, shared
     // teardown.
@@ -724,7 +769,37 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             // the same computation, so the two cannot disagree about this
             // node's identity.
             let node_id = beacon::beacon_node_id(&node_p2p_key)?;
-            let params = beacon::wire_params(&source, node_id, mainnet.custody_group_count)?;
+
+            // Resolved and checked ahead of the anchor fetch, so a bad
+            // `--ethrex.*` value or a port clash fails startup before a
+            // checkpoint download rather than after it.
+            #[cfg(feature = "include-ethrex")]
+            let mut embedded_config = match &execution {
+                Execution::Embedded(args) => {
+                    let config = args
+                        .resolve(&data_dir, &mainnet.network)
+                        .map_err(|err| eyre::eyre!("configuring the embedded ethrex: {err}"))?;
+                    common.validate_embedded_ports(true, p2p_socket.ip(), &config)?;
+                    Some(config)
+                }
+                Execution::External(_) => None,
+            };
+
+            // The anchored beacon store. `P2PServer` holds it for the lean
+            // handlers, and the two beacon block handlers read it too: it is
+            // what `beacon_blocks_by_{range,root}/2` are answered from.
+            //
+            // Opened before the wire parameters are derived because the
+            // custody count comes partly from it: the highest count the
+            // attached validators have required, recorded by an earlier run.
+            let store =
+                fetch_initial_beacon_state(&clean_checkpoint_urls, backend.clone(), &source)
+                    .await
+                    .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+            let custody = beacon::startup_custody(&store, mainnet.custody_group_count);
+
+            let params =
+                beacon::wire_params(&source, node_id, custody, attached_validators.clone())?;
 
             // Cloned ahead of the move into `WireConfig::Beacon` below: the
             // chain actor needs its own copy to gate fulu import on, the same
@@ -738,42 +813,49 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             let attestation_subnets: HashSet<u64> =
                 params.wire.attestation_subnets.iter().copied().collect();
 
-            // The anchored beacon store. `P2PServer` holds it for the lean
-            // handlers, and the two beacon block handlers read it too: it is
-            // what `beacon_blocks_by_{range,root}/2` are answered from.
-            let store =
-                fetch_initial_beacon_state(&clean_checkpoint_urls, backend.clone(), &source)
-                    .await
-                    .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
-
             let engine = match &execution {
-                None => {
+                #[cfg(not(feature = "include-ethrex"))]
+                Execution::None => {
                     info!(
                         "No execution client configured; beacon blocks import without \
                          payload validation"
                     );
                     None
                 }
-                Some(options) => {
+                Execution::External(options) => {
                     let secret = JwtSecret::from_file(&options.jwt_secret)
                         .map_err(|err| eyre::eyre!("reading --execution-jwt-secret: {err}"))?;
                     let client = EngineClient::new(options.endpoint.clone(), secret)
                         .map_err(|err| eyre::eyre!("building the engine client: {err}"))?;
                     info!(endpoint = %options.endpoint, "Execution client configured");
-
-                    // A handshake failure is not a reason to refuse to run: the
-                    // execution client may simply be starting up, and every
-                    // call that matters has its own retry ladder.
-                    let gloas_scheduled = store.config().gloas_fork_epoch
-                        != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
-                    let _ = client
-                        .handshake(&version::engine_client_version(), gloas_scheduled)
+                    Some(client)
+                }
+                #[cfg(feature = "include-ethrex")]
+                Execution::Embedded(_) => {
+                    let config = embedded_config
+                        .take()
+                        .expect("resolved above for an embedded execution client");
+                    let started = ethlambda_ethrex::start(config)
                         .await
-                        .inspect_err(|err| warn!(%err, "Engine API handshake failed"));
-
+                        .map_err(|err| eyre::eyre!("starting the embedded ethrex: {err}"))?;
+                    let client =
+                        EngineClient::in_process(started.rpc_context(), started.shutdown_token());
+                    info!("Embedded ethrex configured as the execution client");
+                    *embedded_ethrex = Some(started);
                     Some(client)
                 }
             };
+            if let Some(client) = &engine {
+                // A handshake failure is not a reason to refuse to run: the
+                // execution client may simply be starting up, and every call
+                // that matters has its own retry ladder.
+                let gloas_scheduled = store.config().gloas_fork_epoch
+                    != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
+                let _ = client
+                    .handshake(&version::engine_client_version(), gloas_scheduled)
+                    .await
+                    .inspect_err(|err| warn!(%err, "Engine API handshake failed"));
+            }
 
             ChainSetup {
                 wire: WireConfig::Beacon(Box::new(params.wire)),
@@ -787,7 +869,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     attestation_committee_count:
                         ethlambda_p2p::beacon::constants::ATTESTATION_SUBNET_COUNT,
                     fork_id: params.fork_id,
-                    custody_group_count: Some(mainnet.custody_group_count),
+                    // The count the custody set was computed for, which
+                    // `MetaData` v3 also starts at. The record keeps it until
+                    // a restart: a runtime raise reaches `MetaData` only.
+                    custody_group_count: Some(custody.group_count),
                 },
                 store,
                 node_names: HashMap::new(),
@@ -801,6 +886,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                         .safe_slots_to_import_optimistically,
                     always_prepare_payload: mainnet.always_prepare_payload,
                     anchor_envelope_urls: clean_checkpoint_urls.clone(),
+                    custody_record: custody.record(),
                 },
             }
         }
@@ -967,6 +1053,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     builder_market: rpc_builder_market,
                     sync_committee_pool: sync_committee_pool.clone(),
                     fee_recipients: rpc_fee_recipients,
+                    attached_validators,
                     prepared_payloads: rpc_prepared_payloads,
                     custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
@@ -1006,8 +1093,15 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             safe_slots_to_import_optimistically,
             always_prepare_payload,
             anchor_envelope_urls,
+            custody_record,
         } => {
             check_custody_set(&custody_columns)?;
+            // The last fallible step is behind us and the chain actor, the
+            // only importer of blocks and columns, starts next: from here on
+            // this start holds its custody set, so the next start compares
+            // against it. A start that failed earlier recorded nothing, so
+            // it cannot move the next one's `earliest_available_slot`.
+            setup.store.set_custody_record(custody_record);
             anchor_envelope_fetch = missing_anchor_envelope_root(&setup.store)
                 .filter(|_| !anchor_envelope_urls.is_empty())
                 .map(|root| (anchor_envelope_urls, root));
@@ -1069,9 +1163,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         blockchain,
         http,
         shutdown,
+        #[cfg(feature = "include-ethrex")]
+        embedded_ethrex: embedded_ethrex.take(),
     })
-    .await;
-    Ok(())
+    .await
 }
 
 /// `(meta_client_name, meta_network_name)` for the telemetry rows.
@@ -1166,6 +1261,11 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
     Ok(())
 }
 
+/// How long shutdown waits for the last telemetry rows to reach ClickHouse:
+/// one request's timeout plus a margin, so a reachable server gets them and an
+/// unreachable one does not hold the exit up for long.
+const TELEMETRY_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
 /// Wait for ctrl-c or SIGTERM, then stop and join whatever is running.
 ///
 /// A 2nd, 3rd and 4th signal, ctrl-c or SIGTERM in any mix, escalate to
@@ -1179,22 +1279,30 @@ fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
 /// Shared by both chains. Mainnet used to park on `pending()` here, so a
 /// follower killed mid-write left recovery to do; it now tears down the same
 /// way the lean node does.
-/// How long shutdown waits for the last telemetry rows to reach ClickHouse:
-/// one request's timeout plus a margin, so a reachable server gets them and an
-/// unreachable one does not hold the exit up for long.
-const TELEMETRY_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
-
-async fn wait_for_shutdown(node: RunningNode) {
+///
+/// An embedded execution client that stops on its own starts the same
+/// teardown, and the node then exits with an error: it cannot validate a
+/// payload without one. Signals sent during that teardown escalate the same
+/// way, since listening has already taken their default action away.
+async fn wait_for_shutdown(node: RunningNode) -> eyre::Result<()> {
     let mut signals = ShutdownSignals::listen();
     info!("Node initialized");
 
     // 1st ctrl+c or SIGTERM: start graceful shutdown
-    let signal = signals.recv().await;
+    let execution_client_stopped = tokio::select! {
+        signal = signals.recv() => {
+            info!(
+                signal,
+                "Shutdown signal received, stopping actors and servers..."
+            );
+            false
+        }
+        () = execution_client_stopped(&node) => true,
+    };
 
-    info!(
-        signal,
-        "Shutdown signal received, stopping actors and servers..."
-    );
+    if execution_client_stopped {
+        error!("The embedded execution client stopped; shutting down");
+    }
 
     signals.force_exit_on_repeats();
 
@@ -1208,10 +1316,45 @@ async fn wait_for_shutdown(node: RunningNode) {
     blockchain_ref.join().await;
     p2p_ref.join().await;
     let _ = node.http.await;
-    // After the actors, which are the only emitters, have stopped.
-    ethlambda_telemetry::shutdown(TELEMETRY_FLUSH_TIMEOUT).await;
+
+    // After the actors, which are the only telemetry emitters, and after the
+    // HTTP server's drain, so a proposal still in it gets its payload: an
+    // Engine API call that begins later is refused. The two at once, so a
+    // slow ClickHouse cannot push the execution database's flush past a
+    // container's stop timeout.
+    let telemetry = ethlambda_telemetry::shutdown(TELEMETRY_FLUSH_TIMEOUT);
+    #[cfg(feature = "include-ethrex")]
+    let ((), flushed) = tokio::join!(telemetry, async {
+        match node.embedded_ethrex {
+            Some(embedded) => embedded.shutdown().await,
+            None => Ok(()),
+        }
+    });
+    #[cfg(not(feature = "include-ethrex"))]
+    telemetry.await;
 
     info!("Shutdown complete");
+    // A failed flush first: when the client had also stopped itself, that
+    // was logged as it happened, and the flush error is the one left unsaid.
+    #[cfg(feature = "include-ethrex")]
+    flushed.wrap_err("flushing the embedded ethrex database")?;
+    eyre::ensure!(
+        !execution_client_stopped,
+        "the embedded execution client stopped"
+    );
+    Ok(())
+}
+
+/// Resolves when the embedded execution client cancels itself, which its
+/// execution JSON-RPC server does on failing, as ethrex's own does. Never
+/// resolves for a node without one.
+async fn execution_client_stopped(node: &RunningNode) {
+    #[cfg(feature = "include-ethrex")]
+    if let Some(embedded) = &node.embedded_ethrex {
+        return embedded.cancelled().await;
+    }
+    let _ = node;
+    std::future::pending().await
 }
 
 /// `node`'s bootnodes: the ENRs in its `--bootnodes` file, if one was given.
@@ -2136,7 +2279,11 @@ fn first_config_difference(
         deposit_contract_address: _,
 
         // PeerDAS custody: describes what this node samples/custodies, an
-        // operator/wire choice, not a state-transition rule.
+        // operator/wire choice, not a state-transition rule. Validator
+        // custody reads `balance_per_additional_custody_group` and
+        // `validator_custody_requirement` off the running config, so a changed
+        // value applies to the next requirement it computes; the count already
+        // recorded in the directory stands either way, since it never falls.
         balance_per_additional_custody_group: _,
         custody_requirement: _,
         number_of_custody_groups: _,
@@ -2154,6 +2301,13 @@ fn first_config_difference(
         max_request_blob_sidecars_electra: _,
         max_request_data_column_sidecars: _,
         min_epochs_for_block_requests: _,
+
+        // Advisory, a validator client's default gas limit: the specification
+        // says it adds no validity rule, so the file's always wins, through
+        // the caller's `replace_config`. In a directory that predates its
+        // row, `persisted` already holds the file's
+        // (`Store::fill_missing_config_keys`).
+        gas_limit_schedule: _,
     } = persisted;
 
     compare!(preset_base);
@@ -2346,12 +2500,22 @@ async fn fetch_initial_beacon_state(
                 .max(state.slot());
             let processed_through = compute_epoch_at_slot(processed_slot);
 
-            let persisted = store.config();
+            // A config key this directory predates has no stored value to
+            // compare, so it is added from the config file rather than
+            // refused; `replace_config` below writes it.
+            let (persisted, added) = store.fill_missing_config_keys(&config);
             if let Some(difference) =
                 first_config_difference(&persisted, &config, processed_through)
             {
                 error!(%difference, "Persisted config disagrees with the network config");
                 return Err(checkpoint_sync::CheckpointSyncError::ConfigChanged { difference });
+            }
+            // Only once the resume is accepted: a refused one adds nothing.
+            for key in &added {
+                info!(
+                    key,
+                    "Config key this data directory predates; adding the config file's"
+                );
             }
             // Not a chain value, so not refused (see `first_config_difference`).
             if persisted.config_name != config.config_name {
@@ -2380,11 +2544,9 @@ async fn fetch_initial_beacon_state(
             // Whatever differs now is a value this directory does not
             // contradict, so the config file wins: the node runs on the
             // persisted config, and keeping the stored one would leave it on
-            // the old fork schedule. `replace_config` needs the only handle
-            // to the cached config, hence the `drop`.
-            let config_changed = *persisted != config;
-            drop(persisted);
-            if config_changed {
+            // the old fork schedule. A key added above has no row yet, which
+            // `replace_config` writes too.
+            if persisted != config || !added.is_empty() {
                 store.replace_config(config.clone());
             }
 
@@ -3546,6 +3708,127 @@ validators:
             reopened.config().fulu_fork_epoch,
             fulu_fork_epoch,
             "the new schedule must be persisted, not only served"
+        );
+    }
+
+    /// `GAS_LIMIT_SCHEDULE` is stored in a `Metadata` row of its own:
+    /// - a fresh directory writes it, so a reopened one carries the schedule
+    ///   with no config file involved;
+    /// - a directory that predates the row (written by an older build;
+    ///   simulated here by deleting the row) still resumes, with the key added
+    ///   from the config file and written, and the `config` row unchanged;
+    /// - a changed schedule in the file is followed and stored.
+    #[tokio::test]
+    async fn the_gas_limit_schedule_is_stored_and_added_to_a_directory_that_predates_it() {
+        use ethlambda_storage::Table;
+        use ethlambda_types::beacon::config::GasLimitScheduleEntry;
+
+        // The schedule's row, as `ethlambda_storage`'s `CONFIG_ROWS` names it.
+        const SCHEDULE_ROW: &[u8] = b"config_gas_limit_schedule";
+        let row = |backend: &Arc<dyn StorageBackend>, key: &[u8]| {
+            backend
+                .begin_read()
+                .unwrap()
+                .get(Table::Metadata, key)
+                .unwrap()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/networks/devnet/config.yaml"),
+            dir.path().join("config.yaml"),
+        )
+        .unwrap();
+        let state = beacon::mainnet_genesis_state().unwrap();
+        std::fs::write(dir.path().join("genesis.ssz"), state.to_ssz()).unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+
+        // The devnet's file carries an empty schedule; give the loaded config
+        // one, as a file that schedules a gas limit would.
+        let first = GasLimitScheduleEntry {
+            epoch: 100,
+            gas_limit: 200_000_000,
+        };
+        let load = |entries: Vec<GasLimitScheduleEntry>| {
+            let mut loaded = network::dir::NetworkDir::load(dir.path()).unwrap();
+            loaded.config.gas_limit_schedule = entries.into();
+            network::NetworkSource::Loaded(Box::new(loaded))
+        };
+
+        let Ok(fresh) = fetch_initial_beacon_state(&[], backend.clone(), &load(vec![first])).await
+        else {
+            panic!("first run anchors");
+        };
+        assert_eq!(fresh.config().gas_limit_schedule.entries(), [first]);
+        drop(fresh);
+
+        let stored = Store::from_db_state(backend.clone())
+            .expect("reopen")
+            .expect("populated directory");
+        assert_eq!(
+            stored.config().gas_limit_schedule.entries(),
+            [first],
+            "the schedule is read back from its row"
+        );
+        drop(stored);
+
+        // A directory written before the row existed.
+        assert!(
+            row(&backend, SCHEDULE_ROW).is_some(),
+            "the fresh run wrote it"
+        );
+        let config_row = row(&backend, b"config").expect("config row");
+        let mut batch = backend.begin_write().unwrap();
+        batch
+            .delete_batch(Table::Metadata, vec![SCHEDULE_ROW.to_vec()])
+            .unwrap();
+        batch.commit().unwrap();
+        let predating = Store::from_db_state(backend.clone())
+            .expect("a directory without the row loads")
+            .expect("populated directory");
+        assert!(predating.config().gas_limit_schedule.is_empty());
+        drop(predating);
+
+        let Ok(resumed) =
+            fetch_initial_beacon_state(&[], backend.clone(), &load(vec![first])).await
+        else {
+            panic!("a directory that predates the key resumes");
+        };
+        assert_eq!(resumed.config().gas_limit_schedule.entries(), [first]);
+        drop(resumed);
+        assert!(
+            row(&backend, SCHEDULE_ROW).is_some(),
+            "the resume writes the key it added"
+        );
+        assert_eq!(
+            row(&backend, b"config").expect("config row"),
+            config_row,
+            "the config row is left as it was"
+        );
+
+        // The file schedules another entry.
+        let second = GasLimitScheduleEntry {
+            epoch: 200,
+            gas_limit: 300_000_000,
+        };
+        let Ok(followed) =
+            fetch_initial_beacon_state(&[], backend.clone(), &load(vec![first, second])).await
+        else {
+            panic!("a changed schedule resumes");
+        };
+        assert_eq!(
+            followed.config().gas_limit_schedule.entries(),
+            [first, second]
+        );
+        drop(followed);
+        let reopened = Store::from_db_state(backend)
+            .expect("reopen")
+            .expect("populated directory");
+        assert_eq!(
+            reopened.config().gas_limit_schedule.entries(),
+            [first, second],
+            "the changed schedule is stored"
         );
     }
 
