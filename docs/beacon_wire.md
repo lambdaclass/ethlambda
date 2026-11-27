@@ -246,6 +246,28 @@ verifies every envelope itself, without being propagated. And a
 signature, with the actor re-checking only the store-state conditions (known
 block, current slot, committee seat).
 
+A gloas `data_column_sidecar` whose block has not been seen, or has no
+post-state yet, is queued like any other, but its gossip verdict is held rather
+than reported as `Ignore` at once (`p2p/src/beacon/deferred_columns.rs`). The
+specification says a sidecar that fails this deferred validation MUST cost its
+forwarding peers, and one that passes MUST be re-broadcast. Gossipsub does both
+for a verdict reported late: `Accept` relays the message it holds, `Reject`
+penalizes the peer it came from and every peer that sent a copy. Publishing
+again would not work, since the duplicate cache refuses a publish of bytes
+already received, and an `Ignore` reported at once drops the message from
+gossipsub's cache. So the sidecar goes through the chain checks as before
+(parked by the chain actor and rechecked once its block imports), and the held
+verdict is reported when they decide: `Accept` when the sidecar was handed to
+the chain actor, subject to the seen cache like any accept; `Reject` or
+`Ignore` as the checks dropped it (an already stored column is `Ignore`d, since
+storing says nothing of this copy). One verdict is held per block and column,
+at most 512 at once. Gossipsub holds a message only for its message cache's
+window (six 700 ms heartbeats), so a verdict still held then is reported with
+its `Queue`: a block that arrives later than that still gets the column
+stored, but the node neither relays it nor blames its senders (see
+[spec_deviations.md](./spec_deviations.md)). Fulu sidecars are unchanged: the
+fulu specification asks for neither.
+
 `voluntary_exit`, `proposer_slashing`, `attester_slashing` and
 `bls_to_execution_change` are validated in p2p like aggregates, by
 `gossip::operations`: the specification's `validate_*_gossip` functions

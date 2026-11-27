@@ -1202,6 +1202,18 @@ pub(crate) const MESH_N: usize = 8;
 /// one two epochs later does exactly that.
 const PRUNE_BACKOFF: Duration = Duration::from_secs(60);
 
+/// Gossipsub's heartbeat, the beacon spec's 700ms.
+const GOSSIPSUB_HEARTBEAT_MS: u64 = 700;
+
+/// How many heartbeats a message stays in gossipsub's message cache.
+const GOSSIPSUB_HISTORY_LENGTH: usize = 6;
+
+/// How long gossipsub holds a received message waiting for its verdict:
+/// `history_length` heartbeats. A verdict reported later finds the message
+/// gone, so an `Accept` forwards nothing and a `Reject` penalizes nobody.
+pub(crate) const MESSAGE_CACHE_WINDOW: Duration =
+    Duration::from_millis(GOSSIPSUB_HEARTBEAT_MS * GOSSIPSUB_HISTORY_LENGTH as u64);
+
 /// The gossipsub parameters both wires share.
 ///
 /// `mesh_n` 8, low 6, high 12, the 700ms heartbeat, and the 6/3 history already
@@ -1227,9 +1239,9 @@ pub(crate) fn gossipsub_config(
         .mesh_n_high(12)
         // d_lazy
         .gossip_lazy(6)
-        .heartbeat_interval(Duration::from_millis(700))
+        .heartbeat_interval(Duration::from_millis(GOSSIPSUB_HEARTBEAT_MS))
         .fanout_ttl(Duration::from_secs(60))
-        .history_length(6)
+        .history_length(GOSSIPSUB_HISTORY_LENGTH)
         .history_gossip(3)
         .prune_backoff(PRUNE_BACKOFF)
         .unsubscribe_backoff(PRUNE_BACKOFF)
@@ -1618,6 +1630,7 @@ impl P2P {
                 SEEN_COLUMNS_CAPACITY,
             ),
             seen_block_columns: SeenBlockColumns::new(SEEN_COLUMNS_CAPACITY),
+            deferred_columns: Default::default(),
             seen_envelopes: SeenEnvelopes::new(SEEN_ENVELOPES_CAPACITY),
             seen_payload_attestations: SeenPayloadAttestations::new(
                 SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
@@ -1823,6 +1836,9 @@ pub struct P2PServer {
     /// Gloas's counterpart of [`Self::seen_columns`]: the first valid sidecar
     /// per `(block root, index)`, since a gloas sidecar names no proposer.
     pub(crate) seen_block_columns: SeenBlockColumns,
+    /// Gossip verdicts of gloas sidecars waiting on their deferred validation.
+    /// See [`beacon::deferred_columns`].
+    pub(crate) deferred_columns: beacon::deferred_columns::DeferredColumns,
     /// The first valid `execution_payload` per `(block root, builder index)`
     /// accepted from gossip.
     pub(crate) seen_envelopes: SeenEnvelopes,
@@ -2013,6 +2029,14 @@ pub(crate) trait P2PProtocol: Send + Sync {
     /// its lookup on what passed.
     #[allow(dead_code)] // sent by the column checks' completion callback
     fn column_answer_checked(&self, report: ColumnReport) -> Result<(), ActorError>;
+    /// A gloas gossip sidecar whose verdict is held has been through the
+    /// chain checks: report what they decided. See [`beacon::deferred_columns`].
+    #[allow(dead_code)] // sent by the column checks' completion callback
+    fn deferred_columns_checked(
+        &self,
+        block_root: H256,
+        verdicts: Vec<(u64, beacon::column_checks::ColumnVerdict)>,
+    ) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_envelope_fetch(&self, block_root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
@@ -2112,6 +2136,15 @@ impl P2PServer {
     }
 
     #[send_handler]
+    async fn handle_deferred_columns_checked(
+        &mut self,
+        msg: p2p_protocol::DeferredColumnsChecked,
+        _ctx: &Context<Self>,
+    ) {
+        beacon::deferred_columns::settle(self, msg.block_root, msg.verdicts);
+    }
+
+    #[send_handler]
     async fn handle_retry_peer_redial(
         &mut self,
         msg: p2p_protocol::RetryPeerRedial,
@@ -2205,6 +2238,9 @@ impl P2PServer {
             send_after(slot, ctx.clone(), p2p_protocol::RefreshPeerScoring);
         }
         beacon::scoring::refresh(self);
+        // Riding the same once-a-slot tick: held column verdicts are
+        // otherwise swept only when another is held or settled.
+        beacon::deferred_columns::report_expired(self, Instant::now());
     }
 
     /// Re-ask the connected peers whose `Status` is an interval old, so the
@@ -2347,15 +2383,11 @@ impl Handler<FetchBlock> for P2PServer {
 }
 
 impl Handler<CheckDataColumnSidecars> for P2PServer {
-    async fn handle(&mut self, msg: CheckDataColumnSidecars, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: CheckDataColumnSidecars, ctx: &Context<Self>) {
         match msg.origin {
             // Parked sidecars handed back once their block imported: their
             // arrival was recorded when they were parked.
-            SidecarOrigin::Parked => beacon::column_checks::check_and_forward(
-                self,
-                msg.sidecars,
-                beacon::column_checks::ColumnArrival::Recheck,
-            ),
+            SidecarOrigin::Parked => beacon::deferred_columns::recheck(self, ctx, msg.sidecars),
             SidecarOrigin::ExecutionLayer => {
                 beacon::engine_columns::publish_and_forward(self, msg.sidecars)
             }
@@ -4102,6 +4134,7 @@ pub(crate) mod test_support {
             seen_block_columns: ethlambda_state_transition::beacon::gossip::SeenBlockColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
+            deferred_columns: Default::default(),
             seen_envelopes: ethlambda_state_transition::beacon::gossip::envelope::SeenEnvelopes::new(
                 crate::SEEN_ENVELOPES_CAPACITY,
             ),

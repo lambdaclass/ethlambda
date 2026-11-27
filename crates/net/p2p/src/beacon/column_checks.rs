@@ -7,7 +7,9 @@
 //! through here:
 //!
 //! - a gossiped sidecar reported `Queue` or `Ignore(Overloaded)`, whose
-//!   stateful checks stopped early or never ran;
+//!   stateful checks stopped early or never ran (a queued gloas one's gossip
+//!   verdict waits for what these checks decide; see
+//!   [`crate::beacon::deferred_columns`]);
 //! - every `DataColumnsByRoot` and `DataColumnsByRange` answer;
 //! - sidecars the chain actor was told to hold, handed back once the block
 //!   they wait on imported (`BlockChainToP2P::check_data_column_sidecars`): a
@@ -195,31 +197,53 @@ pub(crate) fn column_rows(
     }
 }
 
-/// What the checks made of one fetched sidecar, as the lookup that asked for
-/// it needs to know: whether its column is now here, and whether the peer that
-/// sent it is to blame if not.
+/// What the checks made of one sidecar, for a caller waiting on it: a
+/// `DataColumnsByRoot` lookup, which needs to know whether its column is now
+/// here and whether the sender is to blame if not ([`Self::is_here`],
+/// [`Self::is_rejected`]), or a gloas gossip sidecar whose verdict is held
+/// until its deferred validation decides (`beacon::deferred_columns`), which
+/// needs the outcome itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ColumnVerdict {
-    /// Passed and was handed to the chain actor, or was already stored: the
-    /// column is here.
+    /// Passed and was handed to the chain actor.
     Delivered,
-    /// Not judged, through no fault of the sender: parked until its block can
-    /// judge it, dropped for a reason that is not the sender's (an `Ignore`),
-    /// or never checked or never handed over, because this node had no chain
+    /// Not judged yet: parked until its block can judge it. A parked sidecar
+    /// comes back through the checks once that block imports.
+    Parked,
+    /// Dropped for this outcome: an `Ignore`, for a reason that is not the
+    /// sender's (an already stored column among them), or a `Reject`.
+    Dropped(Outcome),
+    /// Never judged, or passed but never handed over: this node had no chain
     /// actor to check it for or reach, its check panicked, or its task ended
     /// first.
-    Undecided,
-    /// Refused as invalid: the sender sent something it should not have.
-    Rejected,
+    Unjudged,
+}
+
+impl ColumnVerdict {
+    /// Whether the column is now here: handed to the chain actor, or already
+    /// stored.
+    pub(crate) fn is_here(&self) -> bool {
+        matches!(
+            self,
+            Self::Delivered | Self::Dropped(Outcome::Ignore(IgnoreReason::AlreadyStored))
+        )
+    }
+
+    /// Whether the checks refused the sidecar as invalid: the sender sent
+    /// something it should not have.
+    pub(crate) fn is_rejected(&self) -> bool {
+        matches!(self, Self::Dropped(Outcome::Reject(_)))
+    }
 }
 
 impl From<&ChainVerdict> for ColumnVerdict {
+    /// A kept sidecar is [`Self::Unjudged`] here: it counts as delivered only
+    /// once the chain actor has taken it ([`forward`]).
     fn from(verdict: &ChainVerdict) -> Self {
         match verdict {
-            ChainVerdict::Keep
-            | ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::AlreadyStored)) => Self::Delivered,
-            ChainVerdict::Drop(Outcome::Reject(_)) => Self::Rejected,
-            ChainVerdict::AwaitParent | ChainVerdict::Drop(_) => Self::Undecided,
+            ChainVerdict::Keep => Self::Unjudged,
+            ChainVerdict::AwaitParent => Self::Parked,
+            ChainVerdict::Drop(outcome) => Self::Dropped(*outcome),
         }
     }
 }
@@ -230,7 +254,7 @@ pub(crate) type Done = Box<dyn FnOnce(Vec<(u64, ColumnVerdict)>) + Send>;
 
 /// The verdicts of one call, handed to its [`Done`] when dropped: those
 /// recorded, and every other column of the call as
-/// [`ColumnVerdict::Undecided`].
+/// [`ColumnVerdict::Unjudged`].
 ///
 /// Reported on drop rather than by a call at the end of the checks, so every
 /// way out reports, a panic or a task ended early included: a lookup that
@@ -274,7 +298,7 @@ impl Drop for Verdicts {
         };
         let mut verdicts = std::mem::take(&mut self.recorded);
         let unjudged = self.unjudged.drain(..);
-        verdicts.extend(unjudged.map(|index| (index, ColumnVerdict::Undecided)));
+        verdicts.extend(unjudged.map(|index| (index, ColumnVerdict::Unjudged)));
         done(verdicts);
     }
 }
@@ -640,7 +664,7 @@ pub(crate) fn check_and_forward(
 /// carry bad cells or proofs, and a gloas one carries no signature at all.
 /// `done` runs on every path ([`Verdicts`] reports when dropped), with a
 /// sidecar that was never judged, or that passed but could not be handed to
-/// the chain actor, reported as [`ColumnVerdict::Undecided`].
+/// the chain actor, reported as [`ColumnVerdict::Unjudged`].
 pub(crate) fn check_and_forward_then(
     server: &P2PServer,
     sidecars: Vec<DataColumnSidecar>,
@@ -1157,14 +1181,17 @@ pub(crate) mod tests {
         ];
         check_and_forward_then(&server, sidecars, ColumnArrival::Recheck, Some(done));
 
+        let verdicts = verdicts_of(&mut reported).await.expect("reported");
+        let indices: Vec<u64> = verdicts.iter().map(|(index, _)| *index).collect();
+        assert_eq!(indices, vec![0, 1, 2]);
         assert_eq!(
-            verdicts_of(&mut reported).await,
-            Some(vec![
-                (0, ColumnVerdict::Delivered),
-                (1, ColumnVerdict::Rejected),
-                (2, ColumnVerdict::Undecided),
-            ])
+            verdicts[0].1,
+            ColumnVerdict::Dropped(Outcome::Ignore(IgnoreReason::AlreadyStored))
         );
+        assert!(verdicts[0].1.is_here());
+        assert!(verdicts[1].1.is_rejected());
+        assert_eq!(verdicts[2].1, ColumnVerdict::Parked);
+        assert!(!verdicts[2].1.is_here() && !verdicts[2].1.is_rejected());
     }
 
     /// With no chain actor to check for, the callback still runs, so a lookup
@@ -1179,7 +1206,7 @@ pub(crate) mod tests {
 
         assert_eq!(
             verdicts_of(&mut reported).await,
-            Some(vec![(3, ColumnVerdict::Undecided)])
+            Some(vec![(3, ColumnVerdict::Unjudged)])
         );
     }
 
@@ -1201,7 +1228,7 @@ pub(crate) mod tests {
 
         assert_eq!(
             verdicts_of(&mut reported).await,
-            Some(vec![(4, ColumnVerdict::Undecided)])
+            Some(vec![(4, ColumnVerdict::Parked)])
         );
     }
 
@@ -1209,7 +1236,7 @@ pub(crate) mod tests {
     /// blocking checks, or a runtime shutting down) still settles the lookup,
     /// with what it did not judge as undecided.
     #[test]
-    fn verdicts_dropped_early_report_the_rest_as_undecided() {
+    fn verdicts_dropped_early_report_the_rest_as_unjudged() {
         let (done, mut reported) = reporting();
         let batch = [
             DataColumnSidecar::Fulu(valid_shaped_sidecar(5, 3)),
@@ -1223,7 +1250,7 @@ pub(crate) mod tests {
             reported.try_recv().ok(),
             Some(vec![
                 (3, ColumnVerdict::Delivered),
-                (4, ColumnVerdict::Undecided)
+                (4, ColumnVerdict::Unjudged)
             ])
         );
     }
@@ -1252,7 +1279,7 @@ pub(crate) mod tests {
             let expected = if chain_alive {
                 ColumnVerdict::Delivered
             } else {
-                ColumnVerdict::Undecided
+                ColumnVerdict::Unjudged
             };
             assert_eq!(
                 verdicts_of(&mut reported).await,

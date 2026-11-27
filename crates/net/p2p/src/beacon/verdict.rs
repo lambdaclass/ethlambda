@@ -11,7 +11,10 @@
 //! [`P2PServer::sync_validation_permits`]. Either way
 //! the blocking task sends a [`GossipVerdict`] back to the actor. Every beacon
 //! gossip message ends in exactly one [`report`]: gossipsub holds each one
-//! until then.
+//! until then. A gloas data column sidecar judged `Queue` is reported later
+//! than the rest, once its deferred validation decides, or when gossipsub's
+//! message cache would have dropped it anyway; see
+//! [`crate::beacon::deferred_columns`].
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
@@ -42,11 +45,12 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler};
 use tracing::{debug, error, warn};
 
-use crate::beacon::column_checks;
+use crate::beacon::{column_checks, deferred_columns};
 use crate::gossipsub::operation_kind;
 use crate::{P2PServer, metrics};
 
 /// Which gossip message a verdict is for.
+#[derive(Debug)]
 pub(crate) struct GossipId {
     pub(crate) message_id: MessageId,
     pub(crate) propagation_source: PeerId,
@@ -654,13 +658,26 @@ pub(crate) fn settle_message(
 }
 
 impl Handler<GossipVerdict> for P2PServer {
-    async fn handle(&mut self, msg: GossipVerdict, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: GossipVerdict, ctx: &Context<Self>) {
         let GossipVerdict {
             id,
             outcome,
             object,
         } = msg;
         let outcome = settle_message(self, &id.message_id, outcome, &object);
+        // A queued gloas column's verdict waits for its deferred validation,
+        // so gossipsub can still relay it or blame its senders.
+        let (id, object) = match (outcome, object) {
+            (Outcome::Queue(_), Validated::Column(sidecar))
+                if matches!(*sidecar, DataColumnSidecar::Gloas(_)) =>
+            {
+                match deferred_columns::defer(self, ctx, id, outcome, sidecar) {
+                    None => return,
+                    Some((id, sidecar)) => (id, Validated::Column(sidecar)),
+                }
+            }
+            (_, object) => (id, object),
+        };
         let received_at = id.received_at;
         // Taken before `forward` consumes the object.
         let unverified_payload = (outcome == Outcome::Ignore(IgnoreReason::PayloadEnvelopeUnseen))
