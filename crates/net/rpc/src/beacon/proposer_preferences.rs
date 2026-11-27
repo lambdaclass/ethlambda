@@ -67,12 +67,14 @@ struct PreferencesQuery {
 ///
 /// Every signed preference the market holds for an upcoming proposal slot,
 /// narrowed by `?slot` and `?dependent_root`, in `(proposal_slot,
-/// dependent_root)` order. The market keeps only slots not yet past, so that
-/// is what "upcoming" means here. Always versioned `gloas`, the one fork
-/// whose preferences exist. The SSZ form is `ProgressiveList[SignedProposerPreferences]`,
-/// whose bytes are the fixed-size entries in order.
+/// dependent_root)` order. "Upcoming" is the wall clock's slot or later: the
+/// market prunes past slots only when it records new preferences, so it can
+/// still hold some. Always versioned `gloas`, the one fork whose preferences
+/// exist. The SSZ form is `ProgressiveList[SignedProposerPreferences]`, whose
+/// bytes are the fixed-size entries in order.
 async fn get_proposer_preferences(
     Query(query): Query<PreferencesQuery>,
+    State(store): State<Store>,
     Extension(market): Extension<SharedBuilderMarket>,
     headers: HeaderMap,
 ) -> Response {
@@ -88,7 +90,9 @@ async fn get_proposer_preferences(
             return ApiError::BadRequest("Invalid dependent_root parameter").into_response();
         }
     };
-    let held = market.preferences_matching(slot, dependent_root);
+    let mut held = market.preferences_matching(slot, dependent_root);
+    let wall_slot = crate::beacon::node::wall_slot(&store);
+    held.retain(|signed| signed.message.proposal_slot >= wall_slot);
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let response = match Encoding::from_accept(accept) {
         Encoding::Ssz => ssz_response(held.iter().flat_map(|signed| signed.to_ssz()).collect()),

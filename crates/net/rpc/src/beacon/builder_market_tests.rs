@@ -1154,6 +1154,11 @@ async fn held_preferences_are_listed_and_filtered() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::OK);
+    // One for a slot the clock has passed, which the market keeps until it
+    // next records preferences: not upcoming, so never listed.
+    let mut stale = signed.clone();
+    stale.message.proposal_slot = HEAD_SLOT - 1;
+    assert!(world.market.record_preferences(stale, 0));
 
     let get = |query: String, accept: &'static str| {
         Request::get(format!("/eth/v1/beacon/proposer_preferences{query}"))

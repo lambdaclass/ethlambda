@@ -694,7 +694,11 @@ the parent block, the operation pool's slashings, exits and credential changes
 (through `pack_operations`, run with gloas's own slashing rules) and the sync
 committee's aggregate over the parent (an operation that does not verify
 against the advanced state is dropped, since one bad operation fails the
-block). A block built on a builder's bid packs the same body. The state root comes
+block). The slashings, exits and credential changes are checked against that
+state with the parent payload's execution requests applied, which a gloas
+block runs before its operations: a parent's withdrawal or consolidation
+request can already have exited a validator whose exit is pooled. A block
+built on a builder's bid packs the same body. The state root comes
 from running the block through `process_block`. The bid is a zero-value
 self-build bid read off the built payload. What was built is cached by `(slot,
 block root)`, for the current and previous slot only.

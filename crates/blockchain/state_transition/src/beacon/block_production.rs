@@ -393,7 +393,11 @@ impl Operations {
 ///
 /// The same function packs a gloas block, run on a gloas `state` with gloas's
 /// own slashing rules. Candidates and the result stay in electra's shape, which
-/// [`super::gloas_block_production`] converts into the gloas body.
+/// [`super::gloas_block_production`] converts into the gloas body. A gloas
+/// block applies its parent payload's execution requests before its
+/// operations, and those can exit a validator or queue a partial withdrawal
+/// for it, which invalidates its exit; so a gloas caller passes `state` with
+/// the parent payload already applied, or the packed exits may fail the block.
 pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Config) -> Operations {
     let mut scratch = state.clone();
     // Gloas modifies `process_proposer_slashing` (it also clears the slashed
@@ -496,7 +500,7 @@ pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Con
 /// because every `process_*` used here runs all its checks (BLS verifies
 /// included) before its first write: `process_proposer_slashing` checks before
 /// `slash_validator` (gloas's runs the same checks first, then clears the
-/// builder payment after slashing); electra's and gloas's
+/// builder payment and slashes); electra's and gloas's
 /// `process_attester_slashing` check before their loop, and its final
 /// `slashed_any` check fails only if nothing was written;
 /// electra's `process_voluntary_exit` checks before `initiate_validator_exit`;

@@ -77,11 +77,14 @@ use ethlambda_state_transition::beacon::{
     stf::{
         ExecutionEngine,
         block::{BlockProcessingOptions, RandaoVerification},
-        gloas::{verify_execution_payload_envelope, verify_execution_payload_envelope_signature},
+        gloas::{
+            apply_parent_execution_payload, verify_execution_payload_envelope,
+            verify_execution_payload_envelope_signature,
+        },
     },
     sync_committee_pool::SharedSyncCommitteePool,
 };
-use ethlambda_storage::{PubkeyIndexCache, Store};
+use ethlambda_storage::{ActiveBalanceCache, PubkeyIndexCache, Store};
 use ethlambda_types::{
     beacon::{
         config::Config,
@@ -912,7 +915,9 @@ impl Packed {
 /// what `process_block` would accept, in the order it applies them. The sync
 /// aggregate is verified exactly as `process_sync_aggregate` will check it; a
 /// candidate that fails becomes the empty aggregate rather than a block the
-/// chain would refuse.
+/// chain would refuse. The slashings, exits and credential changes are packed
+/// against that state with the parent payload applied (see
+/// [`parent_payload_applied`]).
 fn pack(config: &Config, prepared: &Prepared, candidates: Candidates) -> Packed {
     let Prepared {
         state,
@@ -920,9 +925,14 @@ fn pack(config: &Config, prepared: &Prepared, candidates: Candidates) -> Packed 
         head_slot,
         ..
     } = prepared;
+    let applied = parent_payload_applied(config, prepared);
     Packed {
         attestations: pack_gloas_attestations(state, candidates.attestations),
-        operations: pack_operations(state, candidates.operations, config),
+        operations: pack_operations(
+            applied.as_ref().unwrap_or(state),
+            candidates.operations,
+            config,
+        ),
         payload_attestations: pack_payload_attestations(
             state,
             *head_root,
@@ -936,6 +946,34 @@ fn pack(config: &Config, prepared: &Prepared, candidates: Candidates) -> Packed 
                 verified_sync_aggregate(state, candidate)
             }),
     }
+}
+
+/// `prepared.state` with the parent payload's execution requests applied, the
+/// state a gloas block's operations actually meet: `process_block` runs
+/// `process_parent_execution_payload` before `process_operations`. A parent
+/// withdrawal request may already have started a validator's exit or queued a
+/// partial withdrawal for it, and a consolidation request exits its source,
+/// so a pooled exit for that validator passes on `prepared.state` alone and
+/// then fails the block, whose retry drops everything else with it.
+///
+/// `None` when there is nothing to apply (`parent_requests` is empty unless
+/// the block builds on a full gloas parent) or the requests do not apply,
+/// which fails the block whatever is packed.
+fn parent_payload_applied(config: &Config, prepared: &Prepared) -> Option<BeaconState> {
+    if prepared.parent_requests == ExecutionRequests::default() {
+        return None;
+    }
+    let mut applied = prepared.state.clone();
+    apply_parent_execution_payload(
+        &mut applied,
+        &prepared.parent_requests,
+        config,
+        &ActiveBalanceCache::default(),
+        &prepared.pubkey_indices,
+    )
+    .inspect_err(|err| warn!(%err, "Applying the parent payload's requests failed"))
+    .ok()?;
+    Some(applied)
 }
 
 /// The pure half: the pooled operations and the built payload into a block and
@@ -1904,6 +1942,117 @@ mod tests {
             produced.block.body.proposer_slashings.to_vec(),
             vec![slashing]
         );
+    }
+
+    /// Gloas applies the parent payload's execution requests before the
+    /// block's operations, so a pooled exit for a validator the parent's
+    /// full-exit request has already exited would fail the block. Packing
+    /// leaves it out, and packs it when the parent carries no such request.
+    #[test]
+    fn an_exit_the_parent_payload_already_started_is_not_packed() {
+        use ethlambda_state_transition::beacon::helpers::test_state::sign_for;
+        use ethlambda_types::beacon::containers::{
+            electra::WithdrawalRequest,
+            shared::{SignedVoluntaryExit, VoluntaryExit},
+        };
+        use ethlambda_types::beacon::signing::compute_domain;
+
+        // Every validator of the fixture is active since epoch 0; with no
+        // `SHARD_COMMITTEE_PERIOD` any of them may exit at the state's epoch.
+        let mut config = config();
+        config.shard_committee_period = 0;
+        let mut state = state_to_build_on();
+        let exiting = 3u64;
+        let address = ExecutionAddress::repeat_byte(0x42);
+        {
+            let validator = state.validator_mut(exiting).unwrap();
+            let mut credentials = [0u8; 32];
+            credentials[0] = constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX;
+            credentials[12..].copy_from_slice(&address.0);
+            validator.withdrawal_credentials = H256(credentials);
+        }
+        state.apply_pending_mutations();
+
+        let message = VoluntaryExit {
+            epoch: 0,
+            validator_index: exiting,
+        };
+        let domain = compute_domain(
+            constants::DOMAIN_VOLUNTARY_EXIT,
+            config.capella_fork_version,
+            state.genesis_validators_root(),
+        );
+        let exit = SignedVoluntaryExit {
+            message,
+            signature: sign_for(
+                exiting as usize,
+                compute_signing_root(message.hash_tree_root(), domain),
+            ),
+        };
+        let full_exit = WithdrawalRequest {
+            source_address: address,
+            validator_pubkey: state.validator(exiting).unwrap().pubkey,
+            amount: constants::FULL_EXIT_REQUEST_AMOUNT,
+        };
+        let requests = ExecutionRequests {
+            withdrawals: vec![full_exit].into(),
+            ..Default::default()
+        };
+
+        // The request does exit the validator once applied.
+        let mut applied = state.clone();
+        apply_parent_execution_payload(
+            &mut applied,
+            &requests,
+            &config,
+            &ActiveBalanceCache::default(),
+            &PubkeyIndexCache::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            applied.validator(exiting).unwrap().exit_epoch,
+            constants::FAR_FUTURE_EPOCH
+        );
+
+        let packed_exits = |parent_requests: ExecutionRequests| {
+            // Packing reads no payload input.
+            let inputs = gloas_payload_inputs(
+                &state,
+                true,
+                &ExecutionRequests::default(),
+                &config,
+                &PubkeyIndexCache::default(),
+            )
+            .unwrap();
+            let prepared = Prepared {
+                state: state.clone(),
+                inputs,
+                proposer: get_beacon_proposer_index(&state).unwrap(),
+                head_root: H256::repeat_byte(5),
+                head_slot: state.slot() - 1,
+                parent_requests,
+                preferences: None,
+                options: BlockProcessingOptions::default(),
+                pubkey_indices: Default::default(),
+            };
+            let candidates = Candidates {
+                attestations: Vec::new(),
+                operations: Operations {
+                    voluntary_exits: vec![exit.clone()],
+                    ..Operations::default()
+                },
+                payload_attestations: Vec::new(),
+                sync_aggregate: None,
+            };
+            pack(&config, &prepared, candidates)
+                .operations
+                .voluntary_exits
+        };
+        assert_eq!(
+            packed_exits(ExecutionRequests::default()),
+            vec![exit.clone()]
+        );
+        assert!(packed_exits(requests).is_empty());
     }
 
     #[test]
