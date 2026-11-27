@@ -286,6 +286,10 @@ pub struct BeaconApiHandles {
     /// block production and by the chain actor, which publishes
     /// `payload_attributes` for the proposers named here.
     pub fee_recipients: ethlambda_blockchain::FeeRecipients,
+    /// Filled with every validator index `beacon_committee_subscriptions` and
+    /// `prepare_beacon_proposer` name, read once an epoch by the p2p layer's
+    /// validator custody.
+    pub attached_validators: ethlambda_network_api::AttachedValidators,
     /// The payload builds the chain actor started ahead of their slots, which
     /// block production collects instead of starting its own.
     pub prepared_payloads: ethlambda_blockchain::PreparedPayloads,
@@ -345,6 +349,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.sync_committee_pool))
         .layer(Extension(handles.custody_columns))
         .layer(Extension(handles.fee_recipients))
+        .layer(Extension(handles.attached_validators))
         .layer(Extension(handles.prepared_payloads))
         .layer(Extension(handles.engine))
         .layer(Extension(handles.events))

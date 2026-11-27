@@ -4664,16 +4664,17 @@ pub fn is_data_available_gloas_columns(
 /// rather than being stuck with whatever its post-state's
 /// `current_justified_checkpoint` was at the moment it was imported.
 ///
-/// `extended_totals` is the block's unslashed target balances when the caller
-/// derived them from its parent's cached totals (see
-/// [`totals_from_parent`]); `None` makes this scan the registry once and
-/// cache the result.
+/// `target_totals` is the block's unslashed target balances when the caller
+/// has them: derived from its parent's cached totals (see
+/// [`totals_from_parent`]), or scanned while the execution client was asked
+/// (see [`speculate_transition`]). `None` makes this scan the registry once.
+/// Either way the totals are cached under `block_root`.
 pub fn compute_pulled_up_tip(
     store: &mut Store,
     block_root: Root,
     block_slot: Slot,
     config: &Config,
-    extended_totals: Option<TargetBalances>,
+    target_totals: Option<TargetBalances>,
 ) -> Result<()> {
     let state = store
         .get_state(&block_root)
@@ -4681,7 +4682,7 @@ pub fn compute_pulled_up_tip(
         .ok_or(Error::SpecAssert("block_root in store.block_states"))?;
 
     let (current_justified, finalized) =
-        pulled_up_checkpoints(store, &state, block_root, config, extended_totals)?;
+        pulled_up_checkpoints(store, &state, block_root, config, target_totals)?;
 
     store.set_unrealized_justification(block_root, block_slot, current_justified);
     update_unrealized_checkpoints(store, current_justified, finalized);
@@ -4704,7 +4705,7 @@ pub fn compute_pulled_up_tip(
 /// From altair on this clones nothing: the step reads and writes a handful of
 /// fields, so it runs on a [`JustificationState`] extracted from `state` and
 /// reads the total active balance from the store's cache. The registry is
-/// scanned only when `extended_totals` could not supply the two target
+/// scanned only when `target_totals` could not supply the two target
 /// balances. Phase0 keeps the specification's own shape, since it replays
 /// stored pending attestations instead of reading flags.
 ///
@@ -4716,7 +4717,7 @@ fn pulled_up_checkpoints(
     state: &BeaconState,
     block_root: Root,
     config: &Config,
-    extended_totals: Option<TargetBalances>,
+    target_totals: Option<TargetBalances>,
 ) -> Result<(Checkpoint, Checkpoint)> {
     if state.fork_name() == ForkName::Phase0 {
         return full_pulled_up_checkpoints(state, config);
@@ -4724,9 +4725,10 @@ fn pulled_up_checkpoints(
 
     let mut justification = JustificationState::from_state(state);
     if tracks_epoch(justification.current_epoch) {
-        let totals = match extended_totals {
+        let totals = match target_totals {
             Some(totals) => {
-                // Only an extended total is checked: a scanned one would be
+                // Only a total the caller brought is checked (extended, or
+                // scanned during the speculation): one scanned here would be
                 // compared with a second copy of the same scan.
                 #[cfg(debug_assertions)]
                 assert_eq!(
@@ -5243,17 +5245,20 @@ pub fn on_block(
     )
 }
 
-/// The state transition of one block, computed before the execution client's
-/// verdict on its payload is known.
+/// The state transition of one block, computed ahead of [`on_block`]: while the
+/// execution client is asked about its payload, when there is one to ask
+/// about, and on its own otherwise, which keeps the import's store writes a
+/// step of their own (the chain actor's `cl` and `store` sections).
 ///
 /// Opaque on purpose: the only thing a holder can do with one is hand it to
 /// [`on_block_speculative`], which decides whether it may stand in for the
 /// transition `on_block` would otherwise run. Until then it is a local value:
 /// the block, its post-state and its fork choice records have not reached the
-/// store, and dropping it costs only the work. Computing it may still write one
-/// content-keyed cache entry, the boundary balances of an epoch-crossing block's
-/// checkpoint (see [`speculate_transition`]), which is the entry `on_block`'s
-/// own transition would write and is correct whether or not the block imports.
+/// store, and dropping it costs only the work. Computing it may still write
+/// content-keyed cache entries, the checkpoint balances an epoch-crossing or
+/// epoch-first block brings (see [`speculate_transition`]), which are the
+/// entries `on_block` would write and are correct whether or not the block
+/// imports.
 ///
 /// # Why it is the transition `on_block` would run
 ///
@@ -5297,6 +5302,13 @@ pub struct SpeculativeTransition {
     /// speculation's transition never runs again, so its delta has to come
     /// with it.
     target_delta: TargetBalanceDelta,
+    /// The post-state's unslashed target balances, which
+    /// [`compute_pulled_up_tip`] weighs justification with: the parent's
+    /// cached totals plus `target_delta` when they extend, or else one
+    /// registry scan, made here so it overlaps the execution client's answer
+    /// (see [`speculated_target_totals`]). `None` where the import reads no
+    /// totals, or the scan failed, which leaves it to `on_block`.
+    target_totals: Option<TargetBalances>,
 }
 
 impl SpeculativeTransition {
@@ -5354,6 +5366,34 @@ impl SpeculativeTransition {
     }
 }
 
+/// [New in Gloas:EIP7732] The check [`on_block`] makes right after finding the
+/// parent's post-state: a gloas block that builds on its parent's full payload
+/// needs that payload verified by `on_execution_payload_envelope`. Returns the
+/// parent's payload status for a gloas block and `None` before gloas.
+///
+/// One function for both callers, so [`speculate_transition`] refuses exactly
+/// the blocks `on_block` would refuse here.
+fn check_parent_payload(
+    store: &Store,
+    signed_block: &SignedBeaconBlock,
+    parent_root: Root,
+    rules: ForkRules,
+) -> Result<Option<PayloadStatus>> {
+    match rules {
+        ForkRules::Gloas => {
+            let parent_status = get_parent_payload_status(store, signed_block)?;
+            if parent_status == PayloadStatus::Full {
+                verify(
+                    is_payload_verified(store, parent_root),
+                    "is_payload_verified(store, block.parent_root)",
+                )?;
+            }
+            Ok(Some(parent_status))
+        }
+        ForkRules::PreGloas => Ok(None),
+    }
+}
+
 /// The checks [`on_block`] makes between finding the parent's post-state and
 /// the data-availability check: the block is not from the future, it is later
 /// than the finalized epoch's first slot, and its parent descends from the
@@ -5400,12 +5440,23 @@ fn check_timely_and_on_the_finalized_chain(
 /// Runs `signed_block`'s state transition against its parent's post-state with
 /// the execution engine assumed valid, without importing anything.
 ///
-/// The store is only read, with one exception: an epoch-crossing block's
+/// It also makes the two registry passes `on_block` would otherwise make after
+/// the transition, since both read the post-state alone and so need no
+/// verdict: at an epoch's first slot, the balances of the checkpoint the block
+/// is ([`cache_first_slot_balances`]), and, when the parent's cached totals do
+/// not extend to the block, its unslashed target balances
+/// ([`speculated_target_totals`]). Both cost a pass over the registry, which on
+/// mainnet is tens of milliseconds, and made here they overlap the execution
+/// client's answer instead of following it. Done for a block that never
+/// imports (an `INVALID` verdict, a block held), the work is wasted, and the
+/// first leaves one entry nothing will read in a bounded cache.
+///
+/// The store is only read, with two exceptions, both keyed by a checkpoint
+/// and so right whatever becomes of the block: an epoch-crossing block's
 /// transition caches its boundary checkpoint's balances
 /// ([`cache_boundary_balances`]) and counts a precomputed-state lookup, exactly
-/// as `on_block`'s own transition would. The entry is keyed by the checkpoint
-/// and built from the parent's state alone, so it is right whatever becomes of
-/// the block.
+/// as `on_block`'s own transition would, and an epoch's first block caches its
+/// own checkpoint's balances, as `on_block` would after the transition.
 ///
 /// `None` when the parent has no post-state, the same condition under which
 /// `on_block` fails with `block.parent_root in store.block_states`; the caller
@@ -5415,20 +5466,22 @@ fn check_timely_and_on_the_finalized_chain(
 /// on its own lookup and reports it there.
 ///
 /// Also `None` for a block `on_block` would refuse before its own transition:
-/// one that already has a post-state, one from the future, one at or before
-/// the finalized epoch's first slot, or one whose parent does not descend from
-/// the finalized checkpoint (see [`check_timely_and_on_the_finalized_chain`],
-/// which both run). A block arriving over req/resp carries no gossip-checked
+/// one that already has a post-state, a gloas block whose parent's full
+/// payload is not verified (see [`check_parent_payload`]), one from the
+/// future, one at or before the finalized epoch's first slot, or one whose
+/// parent does not descend from the finalized checkpoint (see
+/// [`check_timely_and_on_the_finalized_chain`]); both functions are the ones
+/// `on_block` runs. A block arriving over req/resp carries no gossip-checked
 /// signature, and the transition checks it only after advancing the parent's
 /// state to the block's slot, so without this a block `on_block` rejects for
-/// free could make the actor run that advance first. Two of `on_block`'s
-/// guards are left to the caller, since neither can fire for a block the actor
+/// free could make the actor run that advance first. One of `on_block`'s
+/// guards is left to the caller, since it cannot fire for a block the actor
 /// speculates on: data availability, which `process_block` checks before it
-/// asks the execution client, and gloas's parent-payload check, since a gloas
-/// block carries no payload to ask about. An error the store reports for the
-/// known-root, parent-state or `LiveChain` read is `None` too, for the reason
-/// above. The finalized checkpoint and the store's clock are read the way the
-/// import path already reads them before it gets here
+/// gets here. An error the store reports for the known-root, parent-state or
+/// `LiveChain` read is `None` too, for the reason above; the gloas check's
+/// parent-block read panics on one, as the same read in `on_block` does,
+/// which runs next. The finalized checkpoint and the store's clock are
+/// read the way the import path already reads them before it gets here
 /// (`process_or_pend_block`, `process_block`), so this adds no panic that path
 /// lacks.
 ///
@@ -5447,6 +5500,8 @@ pub fn speculate_transition(
         return None;
     }
     let parent_state = store.get_state(&parent_root).ok().flatten()?;
+    let rules = ForkRules::of(signed_block.fork_name());
+    check_parent_payload(store, signed_block, parent_root, rules).ok()?;
     let index = store.get_live_chain().ok()?;
     check_timely_and_on_the_finalized_chain(store, signed_block, parent_root, config, &index)
         .ok()?;
@@ -5476,13 +5531,47 @@ pub fn speculate_transition(
             ..Default::default()
         },
     );
+    let target_totals = transition.as_ref().ok().and_then(|post_state| {
+        cache_first_slot_balances(store, post_state, block_root);
+        speculated_target_totals(store, signed_block, &target_delta, post_state)
+    });
     Some(SpeculativeTransition {
         block_root,
         parent_root,
         engine,
         transition,
         target_delta,
+        target_totals,
     })
+}
+
+/// The unslashed target balances of `post_state`, `block`'s post-state, as
+/// [`compute_pulled_up_tip`] would find them: the parent's cached totals plus
+/// `delta` when they extend to the block ([`totals_from_parent`]), and
+/// otherwise one scan of the registry. The scan is what an epoch's first block
+/// costs, since its parent's totals belong to the epoch before.
+///
+/// `None` where [`pulled_up_checkpoints`] reads no totals (phase0, and the
+/// first two epochs, see [`tracks_epoch`]), and when the scan fails: that is
+/// optional work done ahead of the import, so the import repeats the scan and
+/// reports the failure itself.
+fn speculated_target_totals(
+    store: &Store,
+    block: &SignedBeaconBlock,
+    delta: &TargetBalanceDelta,
+    post_state: &BeaconState,
+) -> Option<TargetBalances> {
+    let parent_root = block.parent_root();
+    let extended = totals_from_parent(&store.target_balance_cache(), &parent_root, block, delta);
+    if extended.is_some() {
+        return extended;
+    }
+    let reads_totals =
+        post_state.fork_name() != ForkName::Phase0 && tracks_epoch(get_current_epoch(post_state));
+    if !reads_totals {
+        return None;
+    }
+    compute_target_balances(post_state).ok()
 }
 
 /// [`on_block`] with an optional transition computed ahead of time.
@@ -5558,19 +5647,7 @@ pub fn on_block_speculative(
     // (recorded once the block is stored, below) rather than decoded again on
     // every head computation.
     let rules = ForkRules::of(signed_block.fork_name());
-    let parent_status = match rules {
-        ForkRules::Gloas => {
-            let parent_status = get_parent_payload_status(store, &signed_block)?;
-            if parent_status == PayloadStatus::Full {
-                verify(
-                    is_payload_verified(store, parent_root),
-                    "is_payload_verified(store, block.parent_root)",
-                )?;
-            }
-            Some(parent_status)
-        }
-        ForkRules::PreGloas => None,
-    };
+    let parent_status = check_parent_payload(store, &signed_block, parent_root, rules)?;
     let payload_link = rules.payload_link(parent_status);
 
     // `mut`, and kept alive for the rest of this function: the finalized-chain
@@ -5680,20 +5757,25 @@ pub fn on_block_speculative(
             },
         )
     };
-    // A used speculation brings the delta its own transition collected.
-    let (transition, target_delta) = match usable {
+    // A used speculation brings the delta its own transition collected, and
+    // the totals it worked out from it (scanned, at an epoch's first block).
+    let (transition, target_delta, speculated_totals) = match usable {
         Some(speculation) => {
             #[cfg(debug_assertions)]
             {
                 let fresh_delta = TargetBalanceDelta::default();
                 speculation.assert_agrees_with(&fresh_transition(&fresh_delta), &fresh_delta);
             }
-            (speculation.transition, speculation.target_delta)
+            (
+                speculation.transition,
+                speculation.target_delta,
+                speculation.target_totals,
+            )
         }
         None => {
             let target_delta = TargetBalanceDelta::default();
             let transition = fresh_transition(&target_delta);
-            (transition, target_delta)
+            (transition, target_delta, None)
         }
     };
 
@@ -5739,19 +5821,22 @@ pub fn on_block_speculative(
 
     let mut state = transition?;
 
-    // The block's target balances when its parent's are cached for this epoch
-    // and the block slashes no one. Read before `signed_block` moves into the
-    // store.
-    let extended_totals = totals_from_parent(
-        &store.target_balance_cache(),
-        &parent_root,
-        &signed_block,
-        &target_delta,
-    );
+    // The block's target balances: the speculation's, or, when its parent's
+    // are cached for this epoch and the block slashes no one, those extended.
+    // Read before `signed_block` moves into the store.
+    let target_totals = speculated_totals.or_else(|| {
+        totals_from_parent(
+            &store.target_balance_cache(),
+            &parent_root,
+            &signed_block,
+            &target_delta,
+        )
+    });
 
     // A block at its epoch's first slot is its own epoch-boundary block: its
     // post-state is the checkpoint state. Cached at import so the tick that
-    // justifies it finds the balances built; see `justified_balances`.
+    // justifies it finds the balances built; see `justified_balances`. A used
+    // speculation built them already, which makes this a lookup.
     cache_first_slot_balances(store, &state, block_root);
 
     // Cache the state root in the latest block header. Sound because the
@@ -5892,7 +5977,7 @@ pub fn on_block_speculative(
     update_checkpoints(store, current_justified, finalized);
 
     // Eagerly compute unrealized justification and finality.
-    compute_pulled_up_tip(store, block_root, block_slot, config, extended_totals)?;
+    compute_pulled_up_tip(store, block_root, block_slot, config, target_totals)?;
 
     Ok(())
 }
@@ -7905,10 +7990,16 @@ mod tests {
     /// signatures over [`test_state::secret_key_for`]'s key, so the real,
     /// signature-checking [`on_block`] accepts it.
     fn store_with_valid_child() -> (Config, Store, SignedBeaconBlock) {
+        store_with_valid_child_after(1)
+    }
+
+    /// [`store_with_valid_child`] with the child `slots` after the anchor,
+    /// so a test can put it at an epoch's first slot.
+    fn store_with_valid_child_after(slots: Slot) -> (Config, Store, SignedBeaconBlock) {
         let config = Config::active();
         let (anchor_state, anchor_block) = anchor_pair_with(1);
         let anchor_root = anchor_block.message_hash_tree_root();
-        let target_slot = anchor_state.slot() + 1;
+        let target_slot = anchor_state.slot() + slots;
 
         // The proposer and signing domain for `target_slot` only depend on
         // advancing the slot clock, not on the block itself, so these are
@@ -8135,6 +8226,120 @@ mod tests {
                  block index must be identical"
             );
         }
+    }
+
+    /// An epoch's first block is its own checkpoint, whose balances its import
+    /// builds. The speculation builds them, while the execution client is
+    /// asked, and the import that uses it finds them cached rather than
+    /// building them again, leaving the store as an import without one does.
+    #[test]
+    fn a_speculation_builds_an_epoch_first_blocks_checkpoint_balances() {
+        let config = Config::active();
+        let first_slot_child = || store_with_valid_child_after(preset::slots_per_epoch());
+        let (_, mut store, block) = first_slot_child();
+        let root = block.message_hash_tree_root();
+        let epoch = compute_epoch_at_slot(block.slot());
+        assert_eq!(
+            block.slot(),
+            compute_start_slot_at_epoch(epoch),
+            "the premise: the block is its epoch's first"
+        );
+        let checkpoint = Checkpoint { epoch, root };
+        assert!(store.justified_balances(&checkpoint).is_none());
+
+        let speculation = honest_speculation(&store, &block, &config).expect("speculated");
+        let built = store
+            .justified_balances(&checkpoint)
+            .expect("the speculation built the checkpoint's balances");
+        on_block_speculative(
+            &mut store,
+            block,
+            &config,
+            &DataAvailability::NotRequired,
+            &PayloadValidity::Validated,
+            &CommitteeCache::default(),
+            Some(speculation),
+        )
+        .expect("the speculated import succeeds");
+        let cached = store
+            .justified_balances(&checkpoint)
+            .expect("still cached after the import");
+        assert!(
+            Arc::ptr_eq(&built, &cached),
+            "the import reused the speculation's balances"
+        );
+
+        let (_, mut plain, block) = first_slot_child();
+        on_block(
+            &mut plain,
+            block,
+            &config,
+            &DataAvailability::NotRequired,
+            &PayloadValidity::Validated,
+            &CommitteeCache::default(),
+        )
+        .expect("the plain import succeeds");
+        assert!(plain.justified_balances(&checkpoint).is_some());
+        assert_eq!(
+            observed(&mut store, root, &config),
+            observed(&mut plain, root, &config)
+        );
+        assert_eq!(
+            store.unrealized_justification(&root),
+            plain.unrealized_justification(&root)
+        );
+    }
+
+    /// The totals a speculation carries are the parent's extended when they
+    /// can be, a scan when they cannot, and none where the import reads none.
+    #[test]
+    fn speculated_target_totals_extend_the_parent_or_scan() {
+        let (_, store, _) = store_with_valid_child();
+        let tracked_slot = compute_start_slot_at_epoch(2);
+        let mut state = test_state::with_validators_at(ForkName::Altair, 4);
+        *state.slot_mut() = tracked_slot;
+        let delta = TargetBalanceDelta::default();
+        delta.record_new_target(true, 5, false);
+
+        // No entry for the parent, as at an epoch's first block: the scan.
+        let parent = Root::repeat_byte(0x11);
+        let child = block(tracked_slot, parent);
+        let scanned = compute_target_balances(&state).expect("the scan succeeds");
+        assert_eq!(
+            speculated_target_totals(&store, &child, &delta, &state),
+            Some(scanned)
+        );
+
+        // The parent's totals for the block's own epoch: extended by the delta.
+        let parent_totals = TargetBalances {
+            epoch: 2,
+            previous: 7,
+            current: 11,
+        };
+        store.target_balance_cache().insert(parent, parent_totals);
+        assert_eq!(
+            speculated_target_totals(&store, &child, &delta, &state),
+            Some(TargetBalances {
+                current: 16,
+                ..parent_totals
+            })
+        );
+
+        // Where justification weighs no totals: the first two epochs, and
+        // phase0, which replays attestations instead.
+        let orphan = block(tracked_slot, Root::repeat_byte(0x22));
+        let early = test_state::with_validators_at(ForkName::Altair, 4);
+        assert!(!tracks_epoch(get_current_epoch(&early)), "the premise");
+        assert_eq!(
+            speculated_target_totals(&store, &orphan, &delta, &early),
+            None
+        );
+        let mut phase0 = test_state::with_validators(4);
+        *phase0.slot_mut() = tracked_slot;
+        assert_eq!(
+            speculated_target_totals(&store, &orphan, &delta, &phase0),
+            None
+        );
     }
 
     /// A speculation whose outcome is a marker nothing else produces, so the

@@ -367,7 +367,13 @@ pub(crate) struct BeaconOptions {
 #[derive(Debug, clap::Args)]
 pub(crate) struct MainnetOptions {
     /// How many custody groups this node custodies, advertised as the ENR's
-    /// `cgc` and used to size its own custody set.
+    /// `cgc` and `MetaData`'s `custody_group_count`, and used to size its own
+    /// custody set.
+    ///
+    /// A floor rather than the whole answer: with validators attached, fulu's
+    /// validator custody can require more. The node records the highest count
+    /// its validators have required in the data directory and starts at the
+    /// larger of that and this flag (see `beacon::startup_custody`).
     ///
     /// Raising it makes this node useful to more peers and costs it storage and
     /// bandwidth in proportion: a node at `NUMBER_OF_CUSTODY_GROUPS` is a
@@ -382,8 +388,10 @@ pub(crate) struct MainnetOptions {
     ///
     /// Changing it changes which columns this node custodies, so sidecars
     /// already on disk belong to the old set. Nothing is corrupted by that,
-    /// but the node serves a set it has not finished filling until it has
-    /// backfilled the difference.
+    /// and nothing backfills the difference: a start that holds more groups
+    /// than the data directory did reports the slot after the highest block it
+    /// had stored as `Status`'s `earliest_available_slot`, and refuses column
+    /// ranges that start below it.
     #[arg(
         long = "custody-group-count",
         default_value_t = ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
