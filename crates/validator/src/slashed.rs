@@ -138,8 +138,8 @@ impl SlashedValidators {
                 status = %entry.status,
                 "Validator slashed: it gets no more proposer, attester or attestation aggregation \
                  duties, builder registrations, fee recipient preparations or proposer \
-                 preferences (its sync committee duties go on). A \
-                 slashing means the setup is broken (the key running in a second place, slashing \
+                 preferences (its sync committee and payload timeliness committee duties go \
+                 on). A slashing means the setup is broken (the key running in a second place, slashing \
                  protection bypassed, a leaked key), and every key that shares it is at risk: \
                  find the cause"
             );
@@ -477,6 +477,38 @@ mod tests {
             .await
             .expect("only validator 11 was asked about");
         assert_eq!(context.slashed().count(), 0);
+    }
+
+    /// The rest of the refresh ignores a validator not asked about too, even
+    /// an unslashed one: no duties are fetched, no fee recipient prepared and
+    /// no registration attempted for a key this client does not hold.
+    #[tokio::test]
+    async fn a_validator_not_asked_about_gets_nothing_from_the_refresh() {
+        let mut node = node();
+        node.validators[1].slashed = false;
+        node.validators[1].status = "active_ongoing".to_string();
+        let node = Arc::new(node);
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+
+        let keys = [pubkey(1)];
+        let Refreshed {
+            registrable,
+            resolved,
+            ..
+        } = refresh_epoch(&node, &mut duties, &keys, 3, &settings(), &context(false))
+            .await
+            .expect("refreshes");
+
+        assert_eq!(duties.indices(), [11]);
+        let resolved: Vec<ValidatorIndex> = resolved.iter().map(|entry| entry.index).collect();
+        assert_eq!(resolved, [11]);
+        assert_eq!(registrable, [pubkey(1)]);
+        let prepared: Vec<ValidatorIndex> = node
+            .preparations()
+            .iter()
+            .map(|preparation| preparation.validator_index)
+            .collect();
+        assert_eq!(prepared, [11]);
     }
 
     /// A refresh that finds a key slashed and then fails leaves the duty loop

@@ -815,6 +815,13 @@ where
                         "Not proposing: doppelganger protection has not cleared this validator yet"
                     );
                 }
+            } else if let Some(duty) = duties.slashed_proposer_at_slot(slot, epoch) {
+                warn!(
+                    %slot,
+                    validator = duty.validator_index,
+                    "Not proposing: the validator is slashed, and the chain refuses a block \
+                     from a slashed proposer"
+                );
             }
 
             // Right after the proposal and ahead of the slot's other duties: the
@@ -1976,7 +1983,24 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     // Re-resolved every epoch, not once at startup: a validator can be
     // deposited but not yet activated, in which case it has no index to ask
     // duties for until it is.
-    let entries = beacon_node.validator_indices(pubkeys).await?;
+    //
+    // Only the keys asked for: a node that answers for more must not have this
+    // client fetch duties for, prepare, register, report slashed or stop over
+    // a validator it does not hold.
+    let asked: HashSet<&BlsPubkey> = pubkeys.iter().collect();
+    let answered = beacon_node.validator_indices(pubkeys).await?;
+    let answered_count = answered.len();
+    let entries: Vec<ValidatorEntry> = answered
+        .into_iter()
+        .filter(|entry| asked.contains(&entry.pubkey))
+        .collect();
+    if entries.len() != answered_count {
+        warn!(
+            answered = answered_count,
+            kept = entries.len(),
+            "The beacon node answered for validators this client did not ask about; ignoring them"
+        );
+    }
     let indices: Vec<ValidatorIndex> = entries.iter().map(|entry| entry.index).collect();
     if indices.len() != pubkeys.len() {
         info!(
@@ -1994,16 +2018,8 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     duties.set_indices(indices);
     // Before anything is fetched or sent for the epoch, so a key found slashed
     // has no duty, preparation or registration from here on, and
-    // `--shut-down-when-slashed` stops the client ahead of all of them. Only
-    // the keys asked for: a node that answers for more must not have this
-    // client report, or stop over, a validator it does not hold.
-    let asked: HashSet<&BlsPubkey> = pubkeys.iter().collect();
-    let held: Vec<ValidatorEntry> = entries
-        .iter()
-        .filter(|entry| asked.contains(&entry.pubkey))
-        .cloned()
-        .collect();
-    context.slashed().observe(&held)?;
+    // `--shut-down-when-slashed` stops the client ahead of all of them.
+    context.slashed().observe(&entries)?;
     duties.set_slashed(context.slashed().indices());
 
     // Sent here, with the epoch's duties, and then again every slot by the

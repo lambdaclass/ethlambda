@@ -904,9 +904,12 @@ committee once the slashing is seen. The process exits
 with code **3**, distinct from the `1` of any other failure, clap's `2` for a
 bad command line and the `101` of a panic. Every start finds the same key
 again, so tell the supervisor not to restart on it: systemd's
-`RestartPreventExitStatus=3` next to `Restart=on-failure`. Kubernetes has no
-per-code equivalent, and restarts the pod into the same stop until the key is
-removed. The flag is off by default, as Teku's
+`RestartPreventExitStatus=3` next to `Restart=on-failure`. Kubernetes can
+match on exit codes from 1.34 on, through a container's `restartPolicyRules`
+(alpha behind the `ContainerRestartRules` feature gate in 1.34, beta and on by
+default from 1.35): a rule that restarts the container on every exit code but
+3. An older cluster has no per-code equivalent, and restarts the pod into the
+same stop until the key is removed. The flag is off by default, as Teku's
 `--shut-down-when-validator-slashed-enabled` is.
 
 With the flag on, the keymanager API is up only for the moment before the

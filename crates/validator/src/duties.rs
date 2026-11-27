@@ -188,7 +188,22 @@ impl<B: BeaconNodeApi> DutiesService<B> {
     /// a slashing is first seen (this epoch's, fetched as last epoch's
     /// lookahead) would otherwise keep the key attesting for the rest of the
     /// epoch. Each epoch refresh replaces the set.
+    ///
+    /// A held validator that leaves the set (a node that wrongly reported it
+    /// slashed, answered otherwise by the next) gets its attester duties back,
+    /// and with them the subnet subscriptions and aggregator selection proofs
+    /// [`Self::all`] left out while it was in. Those are owed again although
+    /// no schedule moved, so this records a move for
+    /// [`Self::take_attesters_moved`]. Call it after [`Self::set_indices`], so
+    /// a key deleted from the client does not count.
     pub fn set_slashed(&mut self, slashed: HashSet<ValidatorIndex>) {
+        let readmitted = self
+            .slashed
+            .iter()
+            .any(|index| !slashed.contains(index) && self.indices.contains(index));
+        if readmitted {
+            self.attesters_moved = true;
+        }
         self.slashed = slashed;
     }
 
@@ -595,6 +610,18 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             .duties
             .iter()
             .find(|duty| duty.slot == slot && self.serves(duty.validator_index))
+    }
+
+    /// The proposer duty for `slot` that [`Self::proposer_at_slot`] holds
+    /// back because its validator is slashed, so the duty loop can say why
+    /// the slot gets no block. The schedule is usually fetched an epoch ahead,
+    /// before the slashing is seen, so the warning at fetch time misses it.
+    pub fn slashed_proposer_at_slot(&self, slot: Slot, epoch: Epoch) -> Option<&ProposerDutyDto> {
+        self.proposers
+            .get(&epoch)?
+            .duties
+            .iter()
+            .find(|duty| duty.slot == slot && !self.serves(duty.validator_index))
     }
 
     /// Refresh the current epoch and the one after it, and forget anything
@@ -1604,5 +1631,67 @@ mod tests {
         service.set_slashed(HashSet::new());
         assert_eq!(indices(&service.at_slot(96, 3), attester), [11, 22]);
         assert!(service.proposer_at_slot(98, 3).is_some());
+    }
+
+    /// The proposal held back from a slashed validator is still found, so the
+    /// duty loop can say why its slot gets no block; an unslashed proposer's
+    /// is not.
+    #[tokio::test]
+    async fn a_slashed_validators_held_proposal_is_reported() {
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_duties(3, root(1), Vec::new())
+                .with_duties(4, root(2), Vec::new())
+                .with_proposers(3, root(1), vec![proposer(11, 97), proposer(22, 98)]),
+        );
+        let mut service = DutiesService::new(node, vec![11, 22]);
+        service
+            .refresh_around(3, &Config::mainnet())
+            .await
+            .expect("refreshes");
+        assert!(service.slashed_proposer_at_slot(98, 3).is_none());
+
+        service.set_slashed(HashSet::from([22]));
+        assert_eq!(
+            service
+                .slashed_proposer_at_slot(98, 3)
+                .map(|duty| duty.validator_index),
+            Some(22)
+        );
+        assert!(service.slashed_proposer_at_slot(97, 3).is_none());
+    }
+
+    /// A held validator that leaves the slashed set owes the node its subnet
+    /// subscriptions again, which [`DutiesService::all`] left it out of,
+    /// although no schedule moved. One that joins the set, or leaves it
+    /// because its key was deleted, owes nothing.
+    #[tokio::test]
+    async fn a_validator_leaving_the_slashed_set_owes_its_subscriptions() {
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_duties(3, root(1), vec![duty(11, 96, 2), duty(22, 96, 3)])
+                .with_duties(4, root(2), Vec::new()),
+        );
+        let mut service = DutiesService::new(node, vec![11, 22, 33]);
+        service
+            .refresh_around(3, &Config::mainnet())
+            .await
+            .expect("refreshes");
+        service.take_attesters_moved();
+
+        service.set_slashed(HashSet::from([22, 33]));
+        assert!(!service.take_attesters_moved(), "joining owes nothing");
+
+        service.set_indices(vec![11, 22]);
+        service.set_slashed(HashSet::from([22]));
+        assert!(
+            !service.take_attesters_moved(),
+            "a deleted key leaving owes nothing"
+        );
+
+        service.set_slashed(HashSet::new());
+        assert!(service.take_attesters_moved());
+        let attester = |duty: &AttesterDutyDto| duty.validator_index;
+        assert_eq!(indices(&service.all(), attester), [11, 22]);
     }
 }
