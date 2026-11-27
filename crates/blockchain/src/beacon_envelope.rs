@@ -1317,6 +1317,25 @@ pub(crate) mod tests {
         not(feature = "beacon-spec-tests"),
         ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
     )]
+    async fn an_imported_block_tells_the_p2p_layer_its_state_is_ready() {
+        let case = Case::new("get_head", TIEBREAK);
+        let mut server = case.server(12);
+        let p2p = Arc::new(crate::tests::RecordingP2P::default());
+        server.p2p = Some(p2p.clone());
+
+        server
+            .on_block(case.block(PARENT), ImportTimings::default())
+            .await;
+
+        assert!(server.store.has_state(&root(PARENT)).unwrap());
+        assert_eq!(*p2p.states_ready.lock().unwrap(), vec![root(PARENT)]);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_envelope_ahead_of_its_block_is_held_then_applied_when_the_block_imports() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
