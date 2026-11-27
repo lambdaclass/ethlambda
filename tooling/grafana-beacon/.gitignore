@@ -1,0 +1,4 @@
+__pycache__/
+# Generated. The Beacon Follower's JSON is also gen-dashboards.py's input, so it is kept.
+dashboards/*.json
+!dashboards/beacon-follower.json
