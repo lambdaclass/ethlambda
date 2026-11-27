@@ -319,8 +319,12 @@ for the build without ethrex). Not covered yet:
 **`latest` did not move after promotion.** Usually the tag rename and the
 pre-release untick were saved as two edits. Go to **Actions → Release promotion →
 Run workflow** and set `rc_tag` to the tested candidate (e.g. `v0.2.0-rc.1`) and
-`version` to the final version (e.g. `v0.2.0`). Its `Verify promotion` job
-confirms the result.
+`version` to the final version (e.g. `v0.2.0`). Its `Verify promotion` jobs
+confirm the result.
+
+**Only one of `latest` and `latest-minimal` moved.** The promotion ran, but one
+of its two legs failed. Fix the cause and re-run the promotion run's failed
+jobs. A candidate missing either image fails both legs before either tag moves.
 
 **The release run failed after the tag was pushed.** Fix the cause and re-run the
 failed jobs. If the pre-release already exists, `Create GitHub pre-release`

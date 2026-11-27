@@ -16,8 +16,8 @@ name: Release promotion
 #                         unticks "pre-release" promotes automatically. An edit
 #                         that does only one of the two is ignored.
 #   workflow_dispatch  -> manual recovery: name the candidate and the version.
-#   release: released  -> tripwire: fails unless `latest` really moved to the
-#                         released version.
+#   release: released  -> tripwire: fails unless `latest` and `latest-minimal`
+#                         really moved to the released version.
 #
 # See RELEASE.md for the procedure.
 
@@ -102,8 +102,11 @@ jobs:
     # Both images a candidate publishes (release.yaml's candidate `variants`):
     # the default one, ethrex embedded, and its `-minimal` twin, without it.
     # Each is promoted under its own suffix: `X.Y.Z`/`latest` and
-    # `X.Y.Z-minimal`/`latest-minimal`.
+    # `X.Y.Z-minimal`/`latest-minimal`. A leg that fails does not cancel the
+    # other, which could stop it between moving its tags and attesting them;
+    # re-running the failed leg finishes the promotion.
     strategy:
+      fail-fast: false
       matrix:
         suffix: ["", "-minimal"]
     runs-on: ubuntu-latest
@@ -128,12 +131,17 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3.12.0
 
-      - name: Check the candidate image exists
+      # Each leg checks both candidate images, not only its own, so a candidate
+      # missing one fails both legs before either moves a tag: `latest` cannot
+      # move to a release whose `latest-minimal` is not there to follow it.
+      - name: Check the candidate images exist
         run: |
-          if ! docker buildx imagetools inspect "$IMAGE:$RC_TAG$SUFFIX" > /dev/null; then
-            echo "::error::$IMAGE:$RC_TAG$SUFFIX not found; was the candidate's release run green?"
-            exit 1
-          fi
+          for suffix in "" "-minimal"; do
+            if ! docker buildx imagetools inspect "$IMAGE:$RC_TAG$suffix" > /dev/null; then
+              echo "::error::$IMAGE:$RC_TAG$suffix not found; was the candidate's release run green?"
+              exit 1
+            fi
+          done
 
       # No RUN instruction, so the arm64 half needs no emulation.
       - name: Re-stamp the candidate as stable
@@ -214,11 +222,12 @@ jobs:
 
   assert-latest-promoted:
     name: Assert release was promoted to latest
-    # Tripwire: a release turned into a full release MUST end up on `latest`. The
-    # 'edited' run (or a manual dispatch) promotes concurrently, so poll until
-    # `latest` catches up. A persistent mismatch means the promotion never fired,
-    # typically because the tag rename and the pre-release untick were saved as
-    # two separate edits.
+    # Tripwire: a release turned into a full release MUST end up on `latest`,
+    # and its `-minimal` image on `latest-minimal`. The 'edited' run (or a
+    # manual dispatch) promotes concurrently, so poll until both catch up. A
+    # persistent mismatch of both means the promotion never fired, typically
+    # because the tag rename and the pre-release untick were saved as two
+    # separate edits; of one, that its promotion leg failed.
     if: github.event.action == 'released'
     runs-on: ubuntu-latest
     permissions:
@@ -234,22 +243,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Wait for latest to match the released version
+      - name: Wait for latest and latest-minimal to match the released version
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           digest() {
             docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}' 2> /dev/null || true
           }
+          # The two images `promote` publishes.
           for attempt in $(seq 1 10); do
-            target=$(digest "$IMAGE:$version")
-            current=$(digest "$IMAGE:latest")
-            echo "attempt $attempt: latest=${current:-<none>}  $version=${target:-<none>}"
-            if [ -n "$target" ] && [ "$current" = "$target" ]; then
-              echo "Confirmed :latest -> :$version"
+            behind=()
+            for suffix in "" "-minimal"; do
+              target=$(digest "$IMAGE:$version$suffix")
+              current=$(digest "$IMAGE:latest$suffix")
+              echo "attempt $attempt: latest$suffix=${current:-<none>}  $version$suffix=${target:-<none>}"
+              if [ -z "$target" ] || [ "$current" != "$target" ]; then
+                behind+=("':latest$suffix' did not move to ':$version$suffix'.")
+              fi
+            done
+            if [ "${#behind[@]}" -eq 0 ]; then
+              echo "Confirmed :latest -> :$version and :latest-minimal -> :$version-minimal"
               exit 0
             fi
             sleep 30
           done
-          echo "::error::':latest' did not move to ':$version'. If the tag rename and the pre-release untick were saved as separate edits, nothing promoted it: run 'Release promotion' by hand with rc_tag (the tested candidate, e.g. v$version-rc.1) and version (v$version)."
+          echo "::error::${behind[*]} If the tag rename and the pre-release untick were saved as separate edits, nothing promoted it: run 'Release promotion' by hand with rc_tag (the tested candidate, e.g. v$version-rc.1) and version (v$version). If only one did not move, re-run the promotion run's failed jobs."
           exit 1
