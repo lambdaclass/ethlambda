@@ -6,6 +6,7 @@
 //! execution_payload_bid, proposer_preferences}`, and what they accept is
 //! recorded in the node's shared `BuilderMarket` by the verdict.
 
+use ethlambda_state_transition::beacon::fork_choice::get_slot_component_duration_ms;
 use ethlambda_state_transition::beacon::gossip::{
     self, Outcome, RejectReason, execution_payload_bid::MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE,
 };
@@ -220,34 +221,46 @@ pub(crate) async fn republish_proposer_preferences(
     gossip_proposer_preferences(server, preferences).await;
 }
 
-/// How many slots before a fork-digest boundary this node gossips the proposer
-/// preferences it held back for slots past it.
+/// How long before a fork-digest boundary this node gossips the proposer
+/// preferences it held back for slots past it, in basis points of a slot: a
+/// slot and a half, which is halfway through the slot two before the boundary.
 ///
-/// Peers join the next digest's topics when their own client decides to:
-/// this node an epoch ahead (`SUBSCRIBE_LEAD_EPOCHS`), as Lighthouse does
-/// since v8.3.0, while Lighthouse before it joins two slots ahead and
-/// Grandine 2.0.6 five. Gossipsub refuses to publish a message again for
-/// `seen_ttl` (two epochs) once any peer has it, so preferences gossiped to
-/// the early joiners could never reach the late ones. One slot ahead, every client has joined,
-/// and the preferences still arrive in time for the boundary's first slot: a
-/// bid for a slot is gossiped during that slot or the one before it.
-pub(crate) const PREFERENCES_RELEASE_LEAD_SLOTS: Slot = 1;
+/// The release has to fall between two moments, and this puts it half a slot
+/// after the first and half a slot less the gossip clock disparity (5.5 s on
+/// mainnet) before the second:
+///
+/// - After the late joiners have joined. Peers join the next digest's topics
+///   when their own client decides to: this node an epoch ahead
+///   (`SUBSCRIBE_LEAD_EPOCHS`), as Lighthouse does since v8.3.0, while
+///   Lighthouse before it joins at the start of the slot two before the
+///   boundary and Grandine 2.0.6 five slots ahead. Gossipsub refuses to
+///   publish a message again for `seen_ttl` (two epochs) once any peer has
+///   it, so preferences gossiped to the early joiners could never reach the
+///   late ones.
+/// - Before the first bid that needs them. A bid for the boundary's first
+///   slot passes `is_current_or_next_slot` from `MAXIMUM_GOSSIP_CLOCK_DISPARITY`
+///   (500 ms) before the slot ahead of the boundary starts. A peer that has
+///   not seen the preferences ignores it (`PreferencesUnseen`) without
+///   queueing it, and its duplicate cache keeps it from taking that bid
+///   again, so the preferences need time to reach every peer first.
+pub(crate) const PREFERENCES_RELEASE_LEAD_BPS: u64 = 15_000;
 
 /// When preferences for slots of the digest that activates at
 /// `activation_epoch` may first be gossiped, in wall-clock milliseconds:
-/// [`PREFERENCES_RELEASE_LEAD_SLOTS`] before its first slot starts.
+/// [`PREFERENCES_RELEASE_LEAD_BPS`] of a slot before its first slot starts.
 fn release_ms(wire: &BeaconWire, activation_epoch: Epoch) -> u64 {
-    let release_slot = activation_epoch
-        .saturating_mul(slots_per_epoch())
-        .saturating_sub(PREFERENCES_RELEASE_LEAD_SLOTS);
-    wire.genesis_time
+    let boundary_slot = activation_epoch.saturating_mul(slots_per_epoch());
+    let boundary_ms = wire
+        .genesis_time
         .saturating_mul(1000)
-        .saturating_add(release_slot.saturating_mul(wire.config.slot_duration_ms))
+        .saturating_add(boundary_slot.saturating_mul(wire.config.slot_duration_ms));
+    let lead_ms = get_slot_component_duration_ms(PREFERENCES_RELEASE_LEAD_BPS, &wire.config);
+    boundary_ms.saturating_sub(lead_ms)
 }
 
 /// Whether this node holds back its gossip of preferences for
-/// `proposal_slot` at `now_ms`: until [`PREFERENCES_RELEASE_LEAD_SLOTS`]
-/// before the boundary of the digest they are published under. For a slot of
+/// `proposal_slot` at `now_ms`: until [`PREFERENCES_RELEASE_LEAD_BPS`] of a
+/// slot before the boundary of the digest they are published under. For a slot of
 /// a digest already current (every slot before the next boundary) that moment
 /// has passed, so nothing is held. Nor is anything held for the genesis
 /// digest, which has no boundary for a release timer to wait on.
@@ -288,8 +301,8 @@ pub(crate) fn until_preferences_release(
 
 /// Gossip every preference the market still owes a publish whose slot has not
 /// started: the ones held back for the next digest, and the ones whose publish
-/// reached no peer. Runs [`PREFERENCES_RELEASE_LEAD_SLOTS`] before a boundary,
-/// when what was held back is released, and at the boundary itself, when
+/// reached no peer. Runs [`PREFERENCES_RELEASE_LEAD_BPS`] of a slot before a
+/// boundary, when what was held back is released, and at the boundary itself, when
 /// every peer that follows the fork has joined the new digest's topics.
 ///
 /// A publish that found no peer subscribed left no trace in gossipsub's
@@ -321,8 +334,8 @@ pub(crate) async fn publish_owed_proposer_preferences(server: &mut P2PServer) {
 }
 
 /// Publish on `publish_digest(proposal_slot)`, unless the preferences are for
-/// a digest whose boundary is still more than [`PREFERENCES_RELEASE_LEAD_SLOTS`]
-/// away ([`is_held_back`]): those are only marked owed, for
+/// a digest whose boundary is still more than [`PREFERENCES_RELEASE_LEAD_BPS`]
+/// of a slot away ([`is_held_back`]): those are only marked owed, for
 /// [`publish_owed_proposer_preferences`] to send at the release. Records in
 /// the market whether a peer was handed them, so preferences that reached none
 /// are published again (on a validator client's re-send, and at the release or
@@ -343,7 +356,7 @@ async fn gossip_proposer_preferences(
         debug!(
             proposal_slot,
             validator_index,
-            "Holding proposer preferences back until a slot before their fork digest's boundary"
+            "Holding proposer preferences back until a slot and a half before their fork digest's boundary"
         );
         return;
     }
@@ -389,6 +402,7 @@ async fn gossip_proposer_preferences(
 mod tests {
     use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome, RejectReason};
     use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY;
     use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::preset::slots_per_epoch;
     use ethlambda_types::beacon::primitives::{Epoch, ExecutionBlockHash};
@@ -783,16 +797,18 @@ mod tests {
         wire.genesis_time * 1000 + slot * wire.config.slot_duration_ms
     }
 
-    /// Preferences for any slot of the next digest are held back until a slot
-    /// before its boundary; those for a slot before the boundary never are, and
-    /// nothing is once the digest is current.
+    /// Preferences for any slot of the next digest are held back until
+    /// halfway through the slot two before its boundary; those for a slot
+    /// before the boundary never are, and nothing is once the digest is
+    /// current.
     #[tokio::test]
-    async fn the_next_digests_preferences_are_held_back_until_a_slot_before_it() {
+    async fn the_next_digests_preferences_are_held_back_until_their_release() {
         let server = unconnected_beacon_server(rollover_config(), 0).await;
         let wire = server.wire.beacon().expect("a beacon wire");
         let boundary = GLOAS * slots_per_epoch();
-        let release = slot_start_ms(wire, boundary - PREFERENCES_RELEASE_LEAD_SLOTS);
-        assert_eq!(PREFERENCES_RELEASE_LEAD_SLOTS, 1);
+        let release = release_ms(wire, GLOAS);
+        let half_slot = wire.config.slot_duration_ms / 2;
+        assert_eq!(release, slot_start_ms(wire, boundary - 2) + half_slot);
 
         let window_opens = slot_start_ms(wire, boundary - slots_per_epoch());
         for slot in [boundary, boundary + 5, boundary + slots_per_epoch() - 1] {
@@ -811,11 +827,46 @@ mod tests {
         assert!(!is_held_back(wire, 5, 0));
     }
 
+    /// No peer takes a bid for the boundary's first slot before the release,
+    /// whether its clock agrees with this node's or runs the whole gossip
+    /// disparity ahead of it: the bid rules first take one at the disparity
+    /// before the boundary's previous slot starts, half a slot less the
+    /// disparity after the release, which is the preferences' time to reach
+    /// every peer first.
+    #[tokio::test]
+    async fn the_release_comes_before_any_bid_for_the_boundarys_first_slot() {
+        let server = unconnected_beacon_server(rollover_config(), 0).await;
+        let wire = server.wire.beacon().expect("a beacon wire");
+        let boundary = GLOAS * slots_per_epoch();
+        let release = release_ms(wire, GLOAS);
+        let bid = bid_at(boundary);
+        let check = |now_ms| {
+            gossip::execution_payload_bid::cheap_checks(
+                &server.builder_market,
+                &server.store,
+                &bid,
+                now_ms,
+            )
+        };
+        let not_yet = Err(Outcome::Ignore(IgnoreReason::NotCurrentOrNextSlot));
+
+        assert_eq!(check(release), not_yet);
+        assert_eq!(check(release + MAXIMUM_GOSSIP_CLOCK_DISPARITY), not_yet);
+        let first_bid = slot_start_ms(wire, boundary - 1) - MAXIMUM_GOSSIP_CLOCK_DISPARITY;
+        assert_eq!(check(first_bid - 1), not_yet);
+        assert_eq!(check(first_bid), Ok(()));
+        let half_slot = wire.config.slot_duration_ms / 2;
+        assert_eq!(
+            first_bid - release,
+            half_slot - MAXIMUM_GOSSIP_CLOCK_DISPARITY
+        );
+    }
+
     /// Before the release, preferences for the next digest's slots are pooled
     /// and reported to the chain actor at once, but not gossiped, not even on a
     /// re-send; they are owed a publish, and the release is scheduled a slot
-    /// before the boundary. A preference for a slot before the boundary goes
-    /// out as before.
+    /// and a half before the boundary. A preference for a slot before the
+    /// boundary goes out as before.
     #[tokio::test]
     async fn a_held_back_preference_is_pooled_and_reported_but_not_published() {
         let boundary = GLOAS * slots_per_epoch();
@@ -864,16 +915,17 @@ mod tests {
         assert_eq!(published, vec![(fulu_topic, pre_fork.to_ssz())]);
         assert!(!server.builder_market.preferences_publish_owed(&pre_fork));
 
-        // The release is the start of the boundary's previous slot, a little
-        // under two slots from one second into the one before that.
+        // The release is halfway through the slot two before the boundary, a
+        // slot and a half less a second from one second into the one before
+        // that.
         let (activation_epoch, delay) =
             next_preferences_release(&server).expect("the gloas window is open");
         assert_eq!(activation_epoch, GLOAS);
         let slot = Duration::from_millis(server.wire.beacon().unwrap().config.slot_duration_ms);
-        assert!(delay <= 2 * slot - Duration::from_secs(1));
-        // Loose below, for a slow runner: more than a slot away is still not
-        // the slot two before the boundary, and the bound above is not the
-        // boundary itself.
+        assert!(delay <= slot + slot / 2 - Duration::from_secs(1));
+        // Loose below, for a slow runner: more than a slot away still rules
+        // out the start of the slot two before the boundary, and the bound
+        // above rules out the start of the slot after it.
         assert!(delay > slot);
         let until = until_preferences_release(&server, GLOAS).expect("still ahead");
         assert!(until <= delay && delay - until < Duration::from_secs(1));
@@ -888,9 +940,9 @@ mod tests {
         assert!(next_preferences_release(&server).is_none());
     }
 
-    /// At the release, a slot before the boundary, the held-back preferences
-    /// go out on the new digest's topic and are owed nothing more; one for the
-    /// slot already running is past helping and stays put.
+    /// Once released (here in the slot before the boundary), the held-back
+    /// preferences go out on the new digest's topic and are owed nothing
+    /// more; one for the slot already running is past helping and stays put.
     #[tokio::test]
     async fn held_back_preferences_go_out_at_the_release_on_the_new_digest() {
         let boundary = GLOAS * slots_per_epoch();

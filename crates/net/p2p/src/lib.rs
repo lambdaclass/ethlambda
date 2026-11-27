@@ -2026,8 +2026,8 @@ pub(crate) trait P2PProtocol: Send + Sync {
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn advance_fork_schedule(&self) -> Result<(), ActorError>;
     /// Gossip the proposer preferences held back for the digest that activates
-    /// at `activation_epoch`, a slot before it; see
-    /// [`beacon::builder_market::PREFERENCES_RELEASE_LEAD_SLOTS`]. Scheduled by
+    /// at `activation_epoch`, a slot and a half before it; see
+    /// [`beacon::builder_market::PREFERENCES_RELEASE_LEAD_BPS`]. Scheduled by
     /// the fork schedule's run once that digest's topics are joined.
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn release_held_proposer_preferences(&self, activation_epoch: u64) -> Result<(), ActorError>;

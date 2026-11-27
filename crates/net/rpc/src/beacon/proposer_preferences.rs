@@ -1,9 +1,9 @@
 //! `POST /eth/v1/validator/proposer_preferences`: signed proposer preferences
 //! from a validator client, validated with the gossip rules, cached in the
 //! shared `BuilderMarket` and gossiped on `proposer_preferences`. Preferences
-//! for the next fork digest's slots are held back by p2p until a slot before
-//! its boundary, and a re-send of cached preferences whose publish reached no
-//! peer is gossiped again.
+//! for the next fork digest's slots are held back by p2p until a slot and a
+//! half before its boundary, and a re-send of cached preferences whose
+//! publish reached no peer is gossiped again.
 //!
 //! Not gated on the sync status: the specification lists no 503, and a node
 //! that lacks the dependent block simply answers `ignore: unknown_block` per
@@ -62,7 +62,7 @@ struct Failure {
 /// message that fails them is one every peer would score this node down for
 /// relaying. Valid ones are cached for block production and for the bids judged
 /// against them, then gossiped (those for the next fork digest's slots only a
-/// slot before its boundary, which the answer does not reflect); the others
+/// slot and a half before its boundary, which the answer does not reflect); the others
 /// are reported by position and the rest still go out. An entry already
 /// cached, identical, is a success that is not republished, unless this node
 /// still owes it a publish and its slot is still ahead: then the re-send is

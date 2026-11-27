@@ -444,25 +444,28 @@ from the Beacon API, and no other way.
 - **`Eth-Consensus-Version` may be absent** on the bid and preferences posts. If
   present it must name a gloas-compatible fork.
 
-## Preferences for the next fork digest are gossiped a slot before its boundary
+## Preferences for the next fork digest are gossiped a slot and a half before its boundary
 
 - **The specification:** the Beacon API broadcasts accepted
   `SignedProposerPreferences` at once, and `p2p-interface.md` leaves when a
   node joins the next digest's topics to the client.
 - **ethlambda:** preferences a validator client submits for a slot past the
   next fork-digest boundary (from gloas on) are validated, pooled, reported
-  to the chain actor and answered at once, but gossiped only one slot before
-  the boundary (`PREFERENCES_RELEASE_LEAD_SLOTS`). Gossip-delivered
+  to the chain actor and answered at once, but gossiped only a slot and a
+  half before the boundary (`PREFERENCES_RELEASE_LEAD_BPS`). Gossip-delivered
   preferences are relayed as usual.
 - **Why:** clients join the next digest at different times (this node an epoch
   ahead, Lighthouse before v8.3.0 two slots ahead), and gossipsub refuses to
   publish a message again for `seen_ttl` (two epochs) once any peer has it. Gossiped at
   once, a preference reaches only the early joiners and never the late ones.
-  A slot ahead every client has joined, and a bid for the boundary's first
-  slot, gossiped during the slot before it, still finds the preference.
+  Halfway through the slot two before the boundary, every client has joined,
+  and a bid for the boundary's first slot, first current or next
+  `MAXIMUM_GOSSIP_CLOCK_DISPARITY` before the slot ahead of it starts, is
+  still half a slot less that disparity away, so the preference reaches
+  peers before it (a peer that saw the bid first would ignore it for good).
 - **Consequence:** an early joiner's builders see the warm-up epoch's
-  preferences only from that slot on, which is when bids for them start to be
-  gossiped anyway.
+  preferences only from that moment on, shortly before bids for them start to
+  be gossiped anyway.
 
 ## No minimum bid increment or rate limit
 

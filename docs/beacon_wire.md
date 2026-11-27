@@ -129,9 +129,14 @@ digest (`is_held_back` in `p2p/src/beacon/builder_market.rs`), from gloas on,
 at every digest boundary (a blob-parameter-only one too). They are accepted,
 pooled in the market and reported to the chain actor as usual, and the Beacon
 API answers as it would for any other, but they are not gossiped until
-`PREFERENCES_RELEASE_LEAD_SLOTS` (one) before the boundary. By then every client
-has joined, and a bid for the boundary's first slot, which is gossiped during
-the slot before it, still finds them. At that moment a timer the fork schedule
+`PREFERENCES_RELEASE_LEAD_BPS` (a slot and a half) before the boundary, halfway
+through the slot two before it. That is half a slot after the latest join
+(Lighthouse before v8.3.0, at the start of that slot), and half a slot less
+`MAXIMUM_GOSSIP_CLOCK_DISPARITY` before a bid for the boundary's first slot is
+first current or next (`MAXIMUM_GOSSIP_CLOCK_DISPARITY` before the slot ahead
+of the boundary starts). A peer that sees such a bid before the preferences
+ignores it and never takes it again, so the preferences go out with time to
+reach every peer first. At that moment a timer the fork schedule
 arms once the next digest's topics are joined
 (`release_held_proposer_preferences`) publishes every held one, on the new
 digest's topic. Preferences gossip delivers are never held back: gossipsub

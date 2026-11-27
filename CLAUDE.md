@@ -379,7 +379,8 @@ actual_slot = finalized_slot + 1 + relative_index
     id is topic plus payload, and its duplicate cache refuses it for `seen_ttl` (two epochs). So the node holds
     back its own preferences for the next digest's slots (`is_held_back`, gloas on, every digest
     boundary): pooled, reported to the chain actor and answered as usual, but gossiped only
-    `PREFERENCES_RELEASE_LEAD_SLOTS` (one) before the boundary, by a timer the fork schedule arms
+    `PREFERENCES_RELEASE_LEAD_BPS` (a slot and a half) before the boundary, ahead of the first bid
+    for its first slot (peers take one from 500 ms before the slot ahead of it), by a timer the fork schedule arms
     once the topics are joined (`release_held_proposer_preferences`). Gossip-delivered ones are
     never held. The market remembers what is still owed a publish (held, or no peer was handed
     it) and publishes it on the validator client's re-send (`republish_proposer_preferences`), at
