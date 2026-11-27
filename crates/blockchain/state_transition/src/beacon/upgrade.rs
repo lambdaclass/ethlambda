@@ -959,17 +959,18 @@ fn requeue(
 /// builder. From the fork onward, a builder is created or topped up only
 /// through a `BuilderDepositRequest` (EIP-8282).
 ///
-/// A deposit for an already-registered validator stays queued untouched. A
-/// deposit whose pubkey neither registry recognizes yet is onboarded as a
-/// builder only if its withdrawal credential is builder-prefixed, no deposit
-/// already re-queued in this same pass could still turn that pubkey into a
-/// validator instead (the specification's `is_pending_validator`),
-/// and its signature checks out. A deposit that fails the credential or
-/// pending-validator check stays queued instead; one that fails the
-/// signature check is dropped outright, matching phase0's own "an invalid
-/// signature just means the deposit is not credited" rule one level up. A
-/// deposit for an already-registered builder tops up its balance directly
-/// instead of registering a second record.
+/// Only a deposit with a builder withdrawal credential can fund a builder;
+/// every other one stays queued untouched, even when a builder holds its
+/// pubkey. A builder-credential deposit for an already-registered builder
+/// tops up its balance directly instead of registering a second record. One
+/// whose pubkey no builder holds yet registers a new builder if its signature
+/// checks out, even when a validator holds the same pubkey (the two
+/// registries are separate). One whose signature does not check out stays
+/// queued only when it could still top up a validator, registered or pending
+/// (the specification's `is_pending_validator`), and is dropped otherwise.
+/// That is consensus-specs #5736's rule; before v1.7.0-beta.5, a validator's
+/// pubkey kept every deposit for it queued, and the pending-validator check
+/// came before the signature.
 ///
 /// The pending deposit queue might be large at the fork, so every
 /// membership question this asks per deposit is kept O(1) amortized rather
@@ -1021,23 +1022,16 @@ fn onboard_builders_from_pending_deposits(
     // mutably (`add_builder_to_registry`, the balance top-up) without a
     // lingering borrow of one of its own fields.
     for deposit in std::mem::take(&mut state.pending_deposits).to_vec() {
-        if validator_pubkeys.contains(&deposit.pubkey) {
+        // Only builder-credential deposits can fund builders at the fork.
+        if !crate::beacon::helpers::gloas::is_builder_withdrawal_credential(
+            deposit.withdrawal_credentials,
+        ) {
             requeue(&mut pending_deposits, &mut pending_index, deposit);
             continue;
         }
 
         match builder_indices.get(&deposit.pubkey).copied() {
             None => {
-                if !crate::beacon::helpers::gloas::is_builder_withdrawal_credential(
-                    deposit.withdrawal_credentials,
-                ) {
-                    requeue(&mut pending_deposits, &mut pending_index, deposit);
-                    continue;
-                }
-                if pending_index.is_pending_validator(&pending_deposits, deposit.pubkey, config) {
-                    requeue(&mut pending_deposits, &mut pending_index, deposit);
-                    continue;
-                }
                 if !crate::beacon::stf::electra::is_valid_deposit_signature(
                     deposit.pubkey,
                     deposit.withdrawal_credentials,
@@ -1045,6 +1039,17 @@ fn onboard_builders_from_pending_deposits(
                     &deposit.signature,
                     config,
                 ) {
+                    // Preserve validator top-ups when no builder can
+                    // receive them.
+                    if validator_pubkeys.contains(&deposit.pubkey)
+                        || pending_index.is_pending_validator(
+                            &pending_deposits,
+                            deposit.pubkey,
+                            config,
+                        )
+                    {
+                        requeue(&mut pending_deposits, &mut pending_index, deposit);
+                    }
                     continue;
                 }
 
@@ -1107,7 +1112,10 @@ fn onboard_builders_from_pending_deposits(
 /// Every field from `builders` onward is new. `execution_payload_availability`
 /// starts every bit set (every slot in the window is "available": there is no
 /// missing payload to report yet) rather than at its `Default`, whose
-/// all-zero value would claim the opposite. `builder_pending_payments` and
+/// all-zero value would claim the opposite, except the fork slot's own bit,
+/// which is cleared (consensus-specs #5808): gloas's `process_slot` clears
+/// the next slot's bit, and the slot before the fork ran under fulu's, so the
+/// upgrade does it in its place. `builder_pending_payments` and
 /// `ptc_window` are `SszVector`s, so each starts at its own fixed length
 /// ([`preset::BUILDER_PENDING_PAYMENTS_LENGTH`]/[`preset::PTC_WINDOW_LENGTH`]
 /// entries) built explicitly rather than through `Default`, which a fixed
@@ -1145,13 +1153,21 @@ pub fn upgrade_to_gloas(pre: &BeaconState, config: &Config) -> Result<BeaconStat
         execution_requests_root: gloas::ExecutionRequests::default().hash_tree_root(),
     };
 
-    // Every slot starts "available"; see this function's own doc.
+    // Every slot starts "available" but the fork slot's own; see this
+    // function's own doc.
     let mut execution_payload_availability = gloas::ExecutionPayloadAvailability::new();
     for index in 0..preset::slots_per_historical_root() {
         execution_payload_availability
             .set(index, true)
             .expect("index is in [0, SLOTS_PER_HISTORICAL_ROOT)");
     }
+    // [New in Gloas:EIP7732] (consensus-specs #5808) Unset the fork slot's
+    // payload availability, which `process_slot` would have done at the
+    // previous slot had it been processed with gloas rules.
+    let fork_slot_index = (pre.slot % preset::slots_per_historical_root() as u64) as usize;
+    execution_payload_availability
+        .set(fork_slot_index, false)
+        .expect("index is in [0, SLOTS_PER_HISTORICAL_ROOT)");
 
     // A placeholder, overwritten by `initialize_ptc_window` below once `post`
     // exists as a full `BeaconState`; see this function's own doc for why

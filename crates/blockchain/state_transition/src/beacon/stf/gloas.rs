@@ -50,7 +50,7 @@ use libssz::SszEncode as _;
 use crate::beacon::bls::{self, SignatureSet};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
-use crate::beacon::containers::shared::{DepositMessage, ProposerSlashing};
+use crate::beacon::containers::shared::DepositMessage;
 use crate::beacon::containers::{BeaconState, capella, gloas};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
@@ -70,7 +70,7 @@ use crate::beacon::helpers::gloas::{
     settle_builder_payment,
 };
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
-use crate::beacon::helpers::mutators::{decrease_balance, increase_balance, slash_validator};
+use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
 use crate::beacon::helpers::predicates::is_slashable_attestation_data;
 use crate::beacon::helpers::target_balances::TargetBalanceDelta;
 use crate::beacon::preset;
@@ -250,12 +250,43 @@ pub fn get_builder_withdrawals(
     Ok((withdrawals, withdrawal_index, processed_count))
 }
 
+/// `get_builder_balance_after_withdrawals` (gloas `beacon-chain.md`): a
+/// builder's balance less what `withdrawals` already pays it, floored at
+/// zero.
+///
+/// Takes the builder's balance rather than the state, since its one caller
+/// already holds the builder, and `withdrawals` as an iterator, since that
+/// caller's are two lists (the earlier sweeps' and its own so far) the
+/// specification concatenates.
+pub fn get_builder_balance_after_withdrawals<'a>(
+    balance: Gwei,
+    builder_index: gloas::BuilderIndex,
+    withdrawals: impl IntoIterator<Item = &'a capella::Withdrawal>,
+) -> Gwei {
+    let validator_index = convert_builder_index_to_validator_index(builder_index);
+    let withdrawn = withdrawals
+        .into_iter()
+        .filter(|withdrawal| withdrawal.validator_index == validator_index)
+        .fold(0, |sum: Gwei, withdrawal| {
+            sum.saturating_add(withdrawal.amount)
+        });
+    balance.saturating_sub(withdrawn)
+}
+
 /// `get_builders_sweep_withdrawals` (gloas `beacon-chain.md`): the builder
 /// registry's own counterpart of
 /// [`get_validators_sweep_withdrawals`](crate::beacon::stf::electra::get_validators_sweep_withdrawals),
 /// swept
 /// from [`gloas::BeaconState::next_withdrawal_builder_index`] the same
 /// bounded, wrapping way.
+///
+/// A builder's sweep withdrawal is its balance less what this payload
+/// already withdraws from it ([`get_builder_balance_after_withdrawals`]): a
+/// payment it owes ([`gloas::BeaconState::builder_pending_withdrawals`],
+/// [`get_builder_withdrawals`]' share of the same payload) would otherwise be
+/// withdrawn on top of the whole balance. consensus-specs #5695 (first in
+/// v1.7.0-beta.3) added that, alongside settling the parent's payment
+/// before its requests; until then the sweep withdrew the whole balance.
 pub fn get_builders_sweep_withdrawals(
     state: &BeaconState,
     mut withdrawal_index: WithdrawalIndex,
@@ -287,12 +318,17 @@ pub fn get_builders_sweep_withdrawals(
                     index: builder_index as usize,
                     len: inner.builders.len(),
                 })?;
-        if builder.withdrawable_epoch <= epoch && builder.balance > 0 {
+        let balance = get_builder_balance_after_withdrawals(
+            builder.balance,
+            builder_index,
+            prior_withdrawals.iter().chain(&withdrawals),
+        );
+        if builder.withdrawable_epoch <= epoch && balance > 0 {
             withdrawals.push(capella::Withdrawal {
                 index: withdrawal_index,
                 validator_index: convert_builder_index_to_validator_index(builder_index),
                 address: builder.execution_address,
-                amount: builder.balance,
+                amount: balance,
             });
             withdrawal_index = withdrawal_index
                 .checked_add(1)
@@ -962,8 +998,8 @@ pub fn process_execution_payload_bid(
 
 /// `apply_parent_execution_payload` (gloas `beacon-chain.md`).
 ///
-/// Processes the parent's execution-layer-triggered requests, settles (or
-/// directly queues) its builder payment, and marks its payload available.
+/// Settles (or directly queues) the parent's builder payment, processes its
+/// execution-layer-triggered requests, and marks its payload available.
 /// Called by [`process_parent_execution_payload`] during block processing,
 /// and (per the specification's own note) by the validator during block
 /// production before computing withdrawals.
@@ -1001,6 +1037,39 @@ pub fn apply_parent_execution_payload(
         "apply_parent_execution_payload: len(requests.builder_exits) <= MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD",
     )?;
 
+    // Settle the builder payment before the requests, so that a builder exit
+    // request is rejected while the payment is pending (consensus-specs
+    // #5695; before v1.7.0-beta.3 the requests came first).
+    let current_epoch = get_current_epoch(state);
+    if parent_epoch == current_epoch {
+        let payment_index = preset::slots_per_epoch()
+            .checked_add(parent_slot % preset::slots_per_epoch())
+            .ok_or(Error::ArithmeticOverflow(
+                "apply_parent_execution_payload: SLOTS_PER_EPOCH + parent_slot % SLOTS_PER_EPOCH",
+            ))?;
+        settle_builder_payment(
+            gloas_state(state, "apply_parent_execution_payload")?,
+            payment_index,
+        )?;
+    } else if parent_epoch == get_previous_epoch(state) {
+        let payment_index = parent_slot % preset::slots_per_epoch();
+        settle_builder_payment(
+            gloas_state(state, "apply_parent_execution_payload")?,
+            payment_index,
+        )?;
+    } else if parent_bid.value > 0 {
+        // Parent is older than the previous epoch, its payment entry has
+        // been evicted from builder_pending_payments. Append the withdrawal
+        // directly.
+        gloas_state(state, "apply_parent_execution_payload")?
+            .builder_pending_withdrawals
+            .push(gloas::BuilderPendingWithdrawal {
+                fee_recipient: parent_bid.fee_recipient,
+                amount: parent_bid.value,
+                builder_index: parent_bid.builder_index,
+            });
+    }
+
     // Process execution requests from the parent's payload. The execution
     // requests are processed at state.slot (child's slot), not the parent's
     // slot.
@@ -1034,37 +1103,6 @@ pub fn apply_parent_execution_payload(
     }
     for builder_exit in requests.builder_exits.iter() {
         process_builder_exit_request(state, builder_exit, config)?;
-    }
-
-    // Settle the builder payment.
-    let current_epoch = get_current_epoch(state);
-    if parent_epoch == current_epoch {
-        let payment_index = preset::slots_per_epoch()
-            .checked_add(parent_slot % preset::slots_per_epoch())
-            .ok_or(Error::ArithmeticOverflow(
-                "apply_parent_execution_payload: SLOTS_PER_EPOCH + parent_slot % SLOTS_PER_EPOCH",
-            ))?;
-        settle_builder_payment(
-            gloas_state(state, "apply_parent_execution_payload")?,
-            payment_index,
-        )?;
-    } else if parent_epoch == get_previous_epoch(state) {
-        let payment_index = parent_slot % preset::slots_per_epoch();
-        settle_builder_payment(
-            gloas_state(state, "apply_parent_execution_payload")?,
-            payment_index,
-        )?;
-    } else if parent_bid.value > 0 {
-        // Parent is older than the previous epoch, its payment entry has
-        // been evicted from builder_pending_payments. Append the withdrawal
-        // directly.
-        gloas_state(state, "apply_parent_execution_payload")?
-            .builder_pending_withdrawals
-            .push(gloas::BuilderPendingWithdrawal {
-                fee_recipient: parent_bid.fee_recipient,
-                amount: parent_bid.value,
-                builder_index: parent_bid.builder_index,
-            });
     }
 
     // Update parent payload availability and latest block hash.
@@ -1254,72 +1292,6 @@ pub fn process_builder_exit_request(
 // ---------------------------------------------------------------------------
 // Operations
 // ---------------------------------------------------------------------------
-
-/// `process_proposer_slashing` (modified, EIP-7732): the shared
-/// `crate::beacon::stf::operations::verify_proposer_slashing` prologue, plus
-/// clearing the [`gloas::BeaconState::builder_pending_payments`] entry tied
-/// to the slashed proposal, if the slashing lands the slashed validator
-/// itself as the payment's own proposer and the payment is still inside the
-/// live two-epoch window. An unrelated same-slot equivocation (a different
-/// validator's evidence about the same proposal) must not grief an honest
-/// proposer's payment, which is exactly what comparing `payment.proposer_index`
-/// against the slashed proposer's own index, rather than clearing
-/// unconditionally, prevents.
-pub fn process_proposer_slashing(
-    state: &mut BeaconState,
-    proposer_slashing: &ProposerSlashing,
-    config: &Config,
-    active_balances: &ActiveBalanceCache,
-    signatures: &mut SignatureBatch,
-) -> Result<()> {
-    let (proposer_index, current_epoch) = crate::beacon::stf::operations::verify_proposer_slashing(
-        state,
-        proposer_slashing,
-        signatures,
-    )?;
-
-    // [New in Gloas:EIP7732] Remove the `BuilderPendingPayment` corresponding
-    // to this proposal if it is still in the 2-epoch window.
-    let slot = proposer_slashing.signed_header_1.message.slot;
-    let proposal_epoch = compute_epoch_at_slot(slot);
-    if proposal_epoch == current_epoch {
-        let payment_index = preset::slots_per_epoch()
-            .checked_add(slot % preset::slots_per_epoch())
-            .ok_or(Error::ArithmeticOverflow(
-                "process_proposer_slashing: SLOTS_PER_EPOCH + slot % SLOTS_PER_EPOCH",
-            ))? as usize;
-        clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
-    } else if proposal_epoch == get_previous_epoch(state) {
-        let payment_index = (slot % preset::slots_per_epoch()) as usize;
-        clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
-    }
-
-    slash_validator(state, proposer_index, None, config, Some(active_balances))?;
-    Ok(())
-}
-
-/// Clears `state.builder_pending_payments[payment_index]` if it is recorded
-/// against `proposer_index`, [`process_proposer_slashing`]'s own helper for
-/// its two (current-epoch, previous-epoch) payment-window branches.
-fn clear_builder_pending_payment_if_owned_by(
-    state: &mut BeaconState,
-    payment_index: usize,
-    proposer_index: ValidatorIndex,
-) -> Result<()> {
-    let inner = gloas_state(state, "process_proposer_slashing")?;
-    let len = inner.builder_pending_payments.len();
-    let payment = inner
-        .builder_pending_payments
-        .get_mut(payment_index)
-        .ok_or(Error::IndexOutOfBounds {
-            index: payment_index,
-            len,
-        })?;
-    if payment.proposer_index == proposer_index {
-        *payment = gloas::BuilderPendingPayment::default();
-    }
-    Ok(())
-}
 
 /// `process_attester_slashing` (unmodified since electra). Transcribed here,
 /// not called through [`crate::beacon::stf::electra::process_attester_slashing`],
@@ -1744,11 +1716,20 @@ pub fn process_operations(
         "process_operations: len(body.payload_attestations) <= MAX_PAYLOAD_ATTESTATIONS",
     )?;
 
-    // [Modified in Gloas:EIP7732]
+    // Unmodified since phase0: gloas's own modification moved into
+    // `slash_validator` (consensus-specs #5719).
     try_for_each_timed(
         StfPhase::ProposerSlashings,
         body.proposer_slashings.iter(),
-        |slashing| process_proposer_slashing(state, slashing, config, active_balances, signatures),
+        |slashing| {
+            crate::beacon::stf::operations::process_proposer_slashing(
+                state,
+                slashing,
+                config,
+                active_balances,
+                signatures,
+            )
+        },
     )?;
     try_for_each_timed(
         StfPhase::AttesterSlashings,

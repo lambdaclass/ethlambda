@@ -666,7 +666,7 @@ the chain actor writes, so no request waits on the actor.
 - **`pool/proposer_slashings`, `pool/attester_slashings`, `pool/voluntary_exits`
   and `pool/bls_to_execution_changes`**: `GET` lists the pool. `POST` runs the
   specification's `validate_*_gossip` rule for the topic against the head's
-  post-state as it is (consensus-specs v1.7.0-beta.1; no `process_*` and no
+  post-state as it is (consensus-specs v1.7.0-beta.5; no `process_*` and no
   state advance, and an attester slashing's range and slashability checks run
   before its BLS checks), pools the operation and gossips it on the topic. The
   rules apply under an electra, fulu or gloas head. An attester slashing's JSON
@@ -1045,6 +1045,13 @@ gloas's `MAX_*_SIZE` preset keys, which bound gossip message sizes the node does
 not run on. Domain types and withdrawal prefixes are `0x`-prefixed hex;
 `VERSIONED_HASH_VERSION_KZG` is a decimal, as lighthouse reports it.
 `GENESIS_TIME` is absent: `/eth/v1/beacon/genesis` reports it.
+`GAS_LIMIT_SCHEDULE` (gloas, EIP-8261) is a list of `{"EPOCH", "GAS_LIMIT"}`
+entries with quoted values, ascending by epoch, as `BLOB_SCHEDULE` is and as
+lighthouse reports it, and `[]` on a network that schedules nothing (lighthouse
+leaves the key out while gloas is unscheduled). Validator clients, this one's
+included, take their default gas limit from it. The data directory stores it,
+in a row of its own; a directory written before that row existed takes the
+network `config.yaml`'s on its next start.
 
 The configuration keys come from the `Config` the data directory was
 initialized with. Some of them (the custody and subnet counts, the

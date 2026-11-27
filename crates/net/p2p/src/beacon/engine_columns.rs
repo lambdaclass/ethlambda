@@ -266,7 +266,7 @@ mod tests {
 
         let mut published = Vec::new();
         while let Ok(command) = commands.try_recv() {
-            if let SwarmCommand::Publish { topic, data } = command {
+            if let SwarmCommand::Publish { topic, data, .. } = command {
                 published.push((topic, data));
             }
         }
@@ -316,7 +316,7 @@ mod tests {
 
         publish_and_forward(&mut server, vec![sidecar(1)]);
 
-        let Ok(SwarmCommand::Publish { topic, data }) = commands.try_recv() else {
+        let Ok(SwarmCommand::Publish { topic, data, .. }) = commands.try_recv() else {
             panic!("column 1 is new and custodied, so it is published");
         };
         // The id gossipsub computes for a received copy of those bytes.

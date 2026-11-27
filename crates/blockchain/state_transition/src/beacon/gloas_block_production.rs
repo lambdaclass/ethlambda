@@ -303,7 +303,8 @@ pub fn aggregate_payload_attestations(
 /// flattened cell proofs, `CELLS_PER_EXT_BLOB` per blob in blob order
 /// (`BlobsBundleV2`). The cells are recomputed from the blobs, since the
 /// bundle carries only proofs. Fails when the proof count does not match, or
-/// a blob is not valid.
+/// a blob is not valid. A payload without blobs has no sidecars at all
+/// (consensus-specs #5767), not `NUMBER_OF_COLUMNS` empty ones.
 pub fn gloas_data_column_sidecars(
     beacon_block_root: Root,
     slot: Slot,
@@ -314,6 +315,9 @@ pub fn gloas_data_column_sidecars(
         cell_proofs.len() == blobs.len() * preset::CELLS_PER_EXT_BLOB,
         "a blob carries CELLS_PER_EXT_BLOB cell proofs",
     )?;
+    if blobs.is_empty() {
+        return Ok(Vec::new());
+    }
     let per_blob_cells = blobs
         .iter()
         .map(|blob| super::kzg::compute_cells(blob))
@@ -1431,6 +1435,12 @@ mod gloas_block_production_tests {
         // A proof count that does not fit the blobs is refused.
         assert!(
             gloas_data_column_sidecars(root, 33, &[vec![0; preset::BYTES_PER_BLOB]], &[]).is_err()
+        );
+        // No blobs, no sidecars (consensus-specs #5767).
+        assert!(
+            gloas_data_column_sidecars(root, 33, &[], &[])
+                .unwrap()
+                .is_empty()
         );
     }
 

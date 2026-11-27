@@ -1165,7 +1165,7 @@ impl BlockChainServer {
                 // last call, so a tick delayed by a long import still resets
                 // proposer boost and pulls up unrealized checkpoints for each
                 // slot it skipped, not just the latest one.
-                fork_choice::on_tick(&mut self.store, timestamp_ms / 1000, &config);
+                fork_choice::on_tick_ms(&mut self.store, timestamp_ms, &config);
                 // Between the clock and the head: an aggregate for the slot
                 // that just ended becomes applicable exactly now, and its
                 // votes have to be in fork choice before the head this tick
@@ -3488,6 +3488,8 @@ impl BlockChainServer {
                 // This root now has a post-state, which is the one thing every
                 // sidecar parked under it was waiting for.
                 self.drain_sidecars_awaiting_parent(block_root);
+                // And every vote for it the p2p layer is holding.
+                self.announce_block_state_ready(block_root);
 
                 // An envelope that arrived ahead of this block can be judged now.
                 self.note_block_imported_for_envelope(block_root);
@@ -3602,6 +3604,21 @@ impl BlockChainServer {
             };
             let _ = p2p.fetch_block(request).inspect_err(
                 |err| error!(%block_root, %err, "Failed to request a held block's missing data columns"),
+            );
+        }
+    }
+
+    /// Tell the p2p layer `block_root` has a post-state now, so the votes for
+    /// it that arrived while it was still importing can be checked.
+    ///
+    /// Beacon only: lean gossip has no verdicts to hold.
+    pub(crate) fn announce_block_state_ready(&self, block_root: H256) {
+        if self.store.chain() != Chain::Beacon {
+            return;
+        }
+        if let Some(ref p2p) = self.p2p {
+            let _ = p2p.block_state_ready(block_root).inspect_err(
+                |err| error!(%block_root, %err, "Failed to tell the p2p layer a block's state is ready"),
             );
         }
     }
@@ -4296,8 +4313,9 @@ impl BlockChainServer {
     /// across a slot boundary: crossing one is the tick's job, since it also
     /// drains deferred aggregates and recomputes the head, which this does
     /// not. An event from a later slot than the store reads is clamped to the
-    /// last instant of the current one. The specification's clock is whole
-    /// seconds, so the deadlines are judged on the second the event fell in.
+    /// last instant of the current one. The specification's clock is in
+    /// milliseconds since consensus-specs v1.7.0-beta.3 (#5667), so the
+    /// deadlines are judged on the millisecond the event arrived at.
     fn advance_beacon_clock_to(&mut self, event_ms: u64) {
         if self.store.chain() != Chain::Beacon {
             return;
@@ -4312,10 +4330,10 @@ impl BlockChainServer {
                     .saturating_mul(config.slot_duration_ms),
             )
             .saturating_sub(1);
-        let time = event_ms.min(slot_end_ms) / 1000;
+        let time_ms = event_ms.min(slot_end_ms);
         let store_time_ms = self.store.time_ms().expect("store time exists");
-        if fork_choice::seconds_to_milliseconds(time) > store_time_ms {
-            fork_choice::on_tick(&mut self.store, time, &config);
+        if time_ms > store_time_ms {
+            fork_choice::on_tick_ms(&mut self.store, time_ms, &config);
         }
     }
 
@@ -5405,14 +5423,17 @@ mod tests {
     }
 
     /// Every `BlockChainToP2P` message the chain actor sends, kept for a test
-    /// to read back. Only `check_data_column_sidecars` and `fetch_block` are
-    /// recorded: nothing under test here sends the others.
+    /// to read back. Only `check_data_column_sidecars`, `fetch_block` and
+    /// `block_state_ready` are recorded: nothing under test here sends the
+    /// others.
     #[derive(Default)]
     pub(crate) struct RecordingP2P {
         pub(crate) checks: std::sync::Mutex<Vec<Vec<DataColumnSidecar>>>,
         /// The origin each entry of `checks` was handed over with, in order.
         pub(crate) check_origins: std::sync::Mutex<Vec<ethlambda_network_api::SidecarOrigin>>,
         pub(crate) fetches: std::sync::Mutex<Vec<FetchRequest>>,
+        /// Every root announced through `block_state_ready`, in order.
+        pub(crate) states_ready: std::sync::Mutex<Vec<H256>>,
     }
 
     impl ethlambda_network_api::BlockChainToP2P for RecordingP2P {
@@ -5451,6 +5472,13 @@ mod tests {
             self.checks.lock().unwrap().push(sidecars);
             Ok(())
         }
+        fn block_state_ready(
+            &self,
+            block_root: H256,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.states_ready.lock().unwrap().push(block_root);
+            Ok(())
+        }
     }
 
     /// `beacon_server(store)` with a [`RecordingP2P`] wired in as its p2p ref.
@@ -5459,6 +5487,28 @@ mod tests {
         let mut server = beacon_server(store);
         server.p2p = Some(p2p.clone());
         (server, p2p)
+    }
+
+    #[test]
+    fn a_ready_beacon_state_is_announced_and_a_lean_one_is_not() {
+        let (server, p2p) = beacon_server_recording(beacon_store(GENESIS_TIME, 0));
+        server.announce_block_state_ready(H256::repeat_byte(7));
+        assert_eq!(
+            *p2p.states_ready.lock().unwrap(),
+            vec![H256::repeat_byte(7)]
+        );
+
+        // Lean gossip has no verdicts held, so there is nothing to release.
+        let store = Store::from_anchor_state(
+            Arc::new(InMemoryBackend::default()),
+            State::from_genesis(0, Vec::new()),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let mut server = lean_server(store);
+        let p2p = Arc::new(RecordingP2P::default());
+        server.p2p = Some(p2p.clone());
+        server.announce_block_state_ready(H256::repeat_byte(7));
+        assert!(p2p.states_ready.lock().unwrap().is_empty());
     }
 
     /// A beacon store whose clock reads slot 10, so a sidecar at slot 10 is

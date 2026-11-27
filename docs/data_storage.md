@@ -284,7 +284,9 @@ different checkpoints.
 | `chain`                        | raw byte     | both   | Which consensus protocol this directory holds (`Chain`)       |
 | `preset`                       | raw byte     | both   | Which SSZ preset the writing build used (`Preset`)            |
 | `time`                         | `u64`        | both   | The store clock, as a **UNIX timestamp in milliseconds**      |
-| `config`                       | `Config`     | both   | The node's runtime configuration                              |
+| `config`                       | `Config`     | both   | The node's runtime configuration, except the keys below that have rows of their own |
+| `config_gas_limit_schedule`    | `List[GasLimitScheduleEntry, 32]` | both | `GAS_LIMIT_SCHEDULE` (gloas, EIP-8261); absent in a directory written before it |
+| `config_min_transaction_gas`   | `u64`        | both   | `MIN_TRANSACTION_GAS` (gloas, consensus-specs v1.7.0-beta.5); absent in a directory written before it |
 | `head`                         | `H256`       | both   | Current fork choice head                                      |
 | `anchor_slot`                  | `u64`        | both   | The slot this directory's chain begins at                     |
 | `states_pruned_below`          | `u64`        | both   | Exclusive upper bound of the `States`/`StateDiffs` slots already range-deleted; absent means 0 |
@@ -300,6 +302,18 @@ different checkpoints.
 Rows marked for one chain are never written on the other, so reaching one
 through the wrong chain's accessor panics naming the key rather than reading a
 zero. That is deliberate: a data directory holds one chain for its whole life.
+
+`config` is a positional SSZ container, so a field added to it would leave
+every row written before it undecodable. A `Config` key added since
+`DB_VERSION` 7 therefore takes zero bytes there and gets a `config_*` row of its
+own (`CONFIG_ROWS` in `store.rs`). An older directory just lacks the row: a
+beacon resume reports the key as missing, adds the config file's value and
+writes the row, instead of failing. An older build never reads the row. Every
+`config*` row is written in one batch, at bootstrap and by `replace_config`.
+A lean resume never rewrites `config`, so a lean directory that predates a row
+goes on lacking it and runs on the field's zero-width default; each such key's
+default must therefore be the value `Config::lean` holds, as
+`GAS_LIMIT_SCHEDULE`'s empty schedule is.
 
 #### One clock, three readings
 
@@ -318,10 +332,11 @@ Everything coarser is derived from it, exactly and in one direction:
 | Slot | `Store::current_slot` | both chains, including the beacon `get_slots_since_genesis` |
 
 Nothing stores a derived reading, so none of them can fall out of step with
-the row or with each other. The beacon specification denominates its own
-`Store.time` in seconds, so `on_tick` and `on_tick_per_slot` convert on the
-way in and the fixture harness divides on the way out; that conversion lives
-at those edges rather than in a second row.
+the row or with each other. The beacon specification keeps `Store.time_ms` in
+milliseconds too (consensus-specs #5667), which `on_tick_ms` and
+`on_tick_per_slot_ms` take as is; the seconds-taking `on_tick` the fixture
+harness ticks with multiplies on the way in, and the harness divides on the way
+out for the fixtures' `time` check, a whole-second reading.
 
 Lean's `on_tick` writes the row only at interval boundaries, since the
 boundary is what it has actually processed: it walks forward one interval at a
@@ -344,9 +359,10 @@ migration path.
 `config` and `chain` are the odd ones out among the mutable rows: written at
 bootstrap (`init_store` for lean, `init_beacon` for beacon) and not mutated as
 the chain progresses. `chain` is never rewritten (it has a getter,
-`Store::chain`, and no setter). `config` is rewritten in one place,
-`Store::replace_config`, by a beacon resume whose config file changed values
-the directory does not contradict (see below), and that method panics unless
+`Store::chain`, and no setter). `config` (with its `config_*` rows) is
+rewritten in one place, `Store::replace_config`, by a beacon resume whose
+config file changed values the directory does not contradict (see below) or
+whose directory predates a `config_*` row, and that method panics unless
 its `Store` holds the only handle to the cached copy. Because neither changes
 once a `Store` is shared, the `Store` keeps a copy of each in memory, and
 reads of them never reach the backend. Every other `Metadata` key is mutated
@@ -400,8 +416,8 @@ because a second row denominated in `slot ‖ root` would be a value that could
 drift from the first.
 
 `init_beacon` writes the two beacon-only keys plus `db_version`, `chain`,
-`preset`, `config`, `time`, `head`, `anchor_slot`, `latest_justified` and
-`latest_finalized` in one atomic batch.
+`preset`, `config` and its `config_*` rows, `time`, `head`, `anchor_slot`,
+`latest_justified` and `latest_finalized` in one atomic batch.
 
 `anchor_slot` is the odd one among these: every other row is either a format
 tag or something a later writer moves, while this one is written once at
@@ -910,7 +926,8 @@ A `Store` is created through one of four constructors in
 
 The first two funnel into `init_store`, which writes the anchor in **one
 atomic batch**: the `Metadata` keys a lean directory needs (the format version
-and the chain and preset tags, time, config, head = safe_target = anchor root,
+and the chain and preset tags, time, config and its `config_*` rows, head =
+safe_target = anchor root,
 justified = finalized = anchor checkpoint), the anchor header, its
 `BlockRoots` entry, the body if non-empty, a full snapshot into `States` keyed by the anchor's slot and root (the
 base of every future diff chain), and the anchor's `LiveChain` entry. `time`
@@ -929,7 +946,8 @@ one row an import does not write is the anchor's `BlockRoots` entry, which
 `index_beacon_anchor` adds right after the block (see [BlockRoots](#blockroots)).
 
 `from_db_state` is the restore path: it reads `db_version`, `preset`, `chain`,
-`config` and `anchor_slot` from `Metadata`, returning `None` for an empty DB. A format
+`config` (with whichever `config_*` rows the directory has) and `anchor_slot`
+from `Metadata`, returning `None` for an empty DB. A format
 mismatch is still fatal, failing with `Error::DbVersionMismatch` or
 `Error::PresetMismatch` rather than reading on, but `from_db_state` no longer
 judges the network or the chain, and it does not mutate anything either: it

@@ -417,14 +417,6 @@ from the Beacon API, and no other way.
   and a bid is compatible with it when it builds on that head and its payload.
   The builder-exit check is skipped for a pre-gloas parent, which carries no
   envelope.
-- **Preference signatures** are accepted under `DOMAIN_PROPOSER_PREFERENCES` at
-  the proposal epoch's fork version, which consensus-specs v1.7.0-beta.4 signs
-  and verifies with and every client signs with, and also under the two that
-  v1.7.0-beta.2's rule (`get_domain` on the lookahead state) could give: that
-  state's own fork, and the fork version of the epoch before the proposal's.
-  They coincide outside the first epoch of a fork. The older two are kept for a
-  client still signing by beta.2, until the fixtures (pinned to beta.2) move
-  past it.
 - **Consequence:** builders onboarded at the fork are inactive until their
   deposit epoch is finalized, so gossip bids are rejected for the first epochs of
   gloas and `produceBlockV4` self-builds.
@@ -446,11 +438,17 @@ from the Beacon API, and no other way.
 - **The specification:** a note says implementations SHOULD guard against
   builders spamming bids with minimal increments, for example with a minimum
   threshold or by forwarding only the best bid at intervals.
-- **ethlambda:** neither is implemented. Spam is bounded by one bid per builder
-  per `(slot, parent_hash, parent_root)`, a strictly higher value than the best
-  seen, a funded active registered builder with a valid signature, a cap on keys
-  per slot and on bids pooled per parent, and a separate permit pool for
-  validating them. A configurable minimum increment is a follow-up.
+- **ethlambda:** neither is implemented. Spam is bounded by the specification's
+  own rules: at most `get_builder_bid_limit` bids per builder per `(slot,
+  parent_hash, parent_root)` (one per whole ETH of the builder's balance net of
+  its pending withdrawals, consensus-specs #5805 and #5843), none before the
+  previous slot's payload attestation deadline, a strictly higher value than
+  the best seen, and a funded active registered builder with a valid
+  signature. On top of those, a cap on keys per slot and on bids pooled per
+  parent, and a separate permit pool for validating them. Bids are validated
+  concurrently, so recording compares the count with the limit again under
+  the market's lock, and the limit holds however many of one builder's bids
+  are in validation at once. A configurable minimum increment is a follow-up.
 
 ## `skip_randao_verification` is ignored
 
@@ -724,31 +722,6 @@ node, and each call walks every latest message and every ancestor step.
   every `head` check of every fork-choice fixture and on randomized trees;
   `compute_head` is the pre-gloas reference.
 
-## The committee fraction leaves slashed validators out, ahead of the pinned release
-
-The proposer boost and both reorg thresholds follow a consensus-specs change
-newer than the release the fixtures are pinned to.
-
-- **The pinned release (`v1.7.0-beta.2`):** `calculate_committee_fraction`
-  divides `get_total_active_balance`, which counts a validator that is slashed
-  but still active, and `get_proposer_score` does the same arithmetic inline.
-- **ethlambda:** both divide the total balance of the active, unslashed
-  validators, as consensus-specs #5679 does (first released in
-  `v1.7.0-beta.4`). Fork choice weighs no vote from a slashed validator, so
-  during a mass slashing a boost sized against their stake outweighs a larger
-  share of the votes that still count, which makes a reorg easier. The
-  `JustifiedBalances` snapshot carries that total (`total_balance`)
-  beside each validator's raw effective balance,
-  which `is_head_weak` still adds back for equivocators in the head slot's
-  committees, slashed or not.
-- **Other clients:** Lighthouse's `JustifiedBalances::from_justified_state`
-  already sums active, unslashed validators only.
-- **Consequence:** none while no active validator in the justified state is
-  slashed. No `v1.7.0-beta.2` fork-choice fixture distinguishes the two: the
-  one that slashes validators in its anchor state ticks past the boosted slot
-  before it checks the head. Remove this entry when the pin reaches
-  `v1.7.0-beta.4`.
-
 ## The execution client judges a gloas payload before the envelope is applied
 
 `verify_execution_payload_envelope` asks the execution engine last, as part of
@@ -878,7 +851,7 @@ node, and a pre-gloas block's is its parent. Both walks stop at finality.
 - A hash of zero is "nothing to say" on either fork, so a payload whose hash is
   zero (the fixtures' placeholder) sends no `forkchoiceUpdated`.
 
-## Sync committee gossip resolves the committee by the message's slot and the domain by the fork schedule
+## Sync committee gossip takes the signing domain from the fork schedule
 
 `sync_committee_{subnet_id}` and `sync_committee_contribution_and_proof`
 validate against the cached head state, choosing the committee from the
@@ -886,15 +859,14 @@ message's slot and the signing domain from the config's fork schedule.
 
 - **Specification:** `p2p-interface.md`'s `get_sync_subcommittee_pubkeys` and
   `validator.md`'s `compute_subnets_for_sync_committee` pick the committee by
-  `state.slot + 1`, and `get_domain(state, ..)` takes the fork version from
-  `state.fork`.
-- **ethlambda:** the committee is chosen by `message.slot + 1`
-  (`current_sync_committee` in the head's own period, `next_sync_committee` in
-  the one after), and the domain comes from `Config`'s schedule
-  (`helpers::sync_committee`). The validator client signs with the same
-  domain. When the head is in the message's period and fork the answer is the
-  specification's. When it lags across a period or fork boundary, the
-  specification would reject honest messages and this does not.
+  the message's `slot + 1` (consensus-specs #5838, v1.7.0-beta.5; `state.slot +
+  1` before it), as ethlambda always has, but `get_domain(state, ..)` takes the
+  fork version from `state.fork`.
+- **ethlambda:** the domain comes from `Config`'s schedule at the message's
+  epoch (`helpers::sync_committee`), and the validator client signs with the
+  same domain. When the head is in the message's fork the answer is the
+  specification's. When it lags across a fork boundary, the specification
+  would reject honest messages and this does not.
 - **Unanswerable cases are IGNORE:** a head state that is not cached is
   `IGNORE` (`state_unavailable`), like every other topic, and a period the head
   state's two committees cannot cover is `IGNORE sync_committee_unavailable`,
@@ -1005,17 +977,12 @@ signature, whichever way the node answered. Three departures:
 
 ## The validator client's proposer preferences
 
-- **Signing domain: no departure, but ahead of the fixtures.** The validator
-  client signs under `DOMAIN_PROPOSER_PREFERENCES` at the proposal epoch's fork
-  version (`SigningContext::sign_proposer_preferences`), as consensus-specs
-  v1.7.0-beta.4's `get_signed_proposer_preferences` does with
-  `compute_fork_version(proposal_epoch)`, and as Lighthouse, Prysm, Teku,
-  Lodestar and Nimbus all sign and verify. The fixtures are still pinned to
-  v1.7.0-beta.2, whose gossip rule verified with `get_domain` on the dependent
-  block's state advanced to the lookahead start, the fork of the epoch before
-  the proposal's. The two differ only for a proposal in the first epoch of a
-  fork, where Lighthouse refuses beta.2's signature as a bad one. This node
-  still accepts beta.2's domain too (see the fulu-to-gloas boundary entry).
+- **Signing domain: no departure.** The validator client signs under
+  `DOMAIN_PROPOSER_PREFERENCES` at the proposal epoch's fork version
+  (`SigningContext::sign_proposer_preferences`), as consensus-specs'
+  `get_signed_proposer_preferences` does with
+  `compute_fork_version(proposal_epoch)` since v1.7.0-beta.4, and as
+  Lighthouse, Prysm, Teku, Lodestar and Nimbus all sign and verify.
 - **Published unconditionally,** not gated on `--builder-proposals`, since from
   gloas the preferences carry every proposal's fee recipient. Validators with no
   fee recipient are skipped (the field is required), and a preference cannot be

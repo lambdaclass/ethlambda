@@ -356,6 +356,7 @@ pub(crate) mod builder_scene {
         let market = BuilderMarket::default();
         let preferences = test_support::sign_preferences(
             &state,
+            &gloas_support::config(),
             gloas::ProposerPreferences {
                 dependent_root,
                 proposal_slot: bid_slot,

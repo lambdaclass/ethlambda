@@ -1,4 +1,4 @@
-.PHONY: help fmt lint inert-paths-check bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests cryptography-specs docs docs-deps docs-serve slashing-protection-interchange-tests
+.PHONY: help fmt lint inert-paths-check bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-ethrex test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests cryptography-specs docs docs-deps docs-serve slashing-protection-interchange-tests
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -11,6 +11,8 @@ lint: inert-paths-check ## 🔍 Run clippy on all workspace crates
 	# The spectests are `test = false` (stale leanSpec fixtures), which
 	# `--all-targets` skips: lint them by name so they keep compiling
 	cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests --test interchange_vectors -- -D warnings
+	# The binary's `include-ethrex` code is cfg'd out of the passes above
+	cargo clippy --locked --workspace --all-targets --features ethlambda/include-ethrex -- -D warnings
 	# Storage alone, with its `rocksdb` feature off: in a workspace build the
 	# binary turns the feature on, so a test that needs it would pass above
 	# and break a plain `cargo test -p ethlambda-storage`. Same as CI's Lint
@@ -77,14 +79,24 @@ TEST=cargo test --locked --profile release-fast
 # else.
 CONSENSUS_CRATES=ethlambda-types ethlambda-fork-choice ethlambda-state-transition ethlambda-blockchain ethlambda-crypto ethlambda-ssz-tree
 
-test: test-consensus test-node ## 🧪 Run all tests
+# The embedded execution client, tested apart from both halves: ethrex's RPC
+# and node crates are a large build neither half otherwise needs, so it runs as
+# a third part, in parallel with them. `test-node` excludes it.
+ETHREX_CRATES=ethlambda-ethrex
+
+test: test-consensus test-node test-ethrex ## 🧪 Run all tests
 
 test-consensus: leanSpec/fixtures ## 🧪 Run the consensus half of the workspace suite
 	$(TEST) $(addprefix -p ,$(CONSENSUS_CRATES))
 
 test-node: leanSpec/fixtures slashing-protection-interchange-tests ## 🧪 Run the node half of the workspace suite
-	$(TEST) --workspace $(addprefix --exclude ,$(CONSENSUS_CRATES))
+	$(TEST) --workspace $(addprefix --exclude ,$(CONSENSUS_CRATES) $(ETHREX_CRATES))
 	$(TEST) -p ethlambda-validator --test interchange_vectors
+
+# The engine and the binary run again with the feature on, for their
+# `include-ethrex` code: the in-process transport and the `--ethrex.*` flags.
+test-ethrex: ## 🧪 Run the embedded-ethrex tests (include-ethrex feature)
+	$(TEST) $(addprefix -p ,$(ETHREX_CRATES)) -p ethlambda-engine -p ethlambda --features ethlambda/include-ethrex
 
 # The spec binary selects its preset at runtime from BEACON_SPEC_PRESET, so both
 # presets run off one build of it.
@@ -213,7 +225,7 @@ leanSpec/fixtures:
 # definition of correctness for that module, so it should move only when we choose
 # to move it. The release publishes no checksums for these assets, so unlike the
 # leanSpec bundle below there is nothing to verify against.
-CONSENSUS_SPEC_TESTS_VERSION ?= v1.7.0-beta.2
+CONSENSUS_SPEC_TESTS_VERSION ?= v1.7.0-beta.5
 CONSENSUS_SPEC_TESTS_BASE_URL ?= https://github.com/ethereum/consensus-specs/releases/download/$(CONSENSUS_SPEC_TESTS_VERSION)
 
 # Which fixture trees to fetch. A run reads its own preset's tree and nothing

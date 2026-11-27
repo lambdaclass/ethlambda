@@ -400,9 +400,11 @@ impl Operations {
 /// the parent payload already applied, or the packed exits may fail the block.
 pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Config) -> Operations {
     let mut scratch = state.clone();
-    // Gloas modifies `process_proposer_slashing` (it also clears the slashed
-    // proposal's builder payment) and reads its own `AttesterSlashing`; the
-    // exit and credential-change rules are electra's at both forks.
+    // Gloas reads its own `AttesterSlashing`; the proposer-slashing, exit and
+    // credential-change rules are electra's at both forks (since
+    // consensus-specs v1.7.0-beta.5, `slash_validator` itself clears a slashed
+    // proposer's builder payments, so gloas no longer modifies
+    // `process_proposer_slashing`).
     let at_gloas = matches!(state, BeaconState::Gloas(_));
     // One table for the whole scratch pass, slashings included (a slashing
     // starts an exit too): the scratch state is at the block's own slot, so
@@ -414,23 +416,13 @@ pub fn pack_operations(state: &BeaconState, candidates: Operations, config: &Con
         preset::MAX_PROPOSER_SLASHINGS,
         config,
         |state, slashing, config, signatures| {
-            if at_gloas {
-                stf::gloas::process_proposer_slashing(
-                    state,
-                    slashing,
-                    config,
-                    &active_balances,
-                    signatures,
-                )
-            } else {
-                stf::operations::process_proposer_slashing(
-                    state,
-                    slashing,
-                    config,
-                    &active_balances,
-                    signatures,
-                )
-            }
+            stf::operations::process_proposer_slashing(
+                state,
+                slashing,
+                config,
+                &active_balances,
+                signatures,
+            )
         },
     );
 

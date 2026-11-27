@@ -10,10 +10,12 @@
 //!
 //! Deliberate departures from the specification:
 //!
-//! - The committee is chosen by the message's slot and the signing domain by
-//!   the config's fork schedule (see [`crate::beacon::helpers::sync_committee`]),
-//!   not by `state.slot + 1` and `state.fork`. A head that lags across a period
-//!   or fork boundary would otherwise reject honest messages.
+//! - The signing domain comes from the config's fork schedule at the message's
+//!   epoch (see [`crate::beacon::helpers::sync_committee`]), not from
+//!   `state.fork`. A head that lags across a fork boundary would otherwise
+//!   reject honest messages. The committee is chosen by the message's slot,
+//!   as the specification does too since consensus-specs #5838
+//!   (v1.7.0-beta.5; `state.slot + 1` before it).
 //! - The head state is read from the state cache, never rebuilt. A miss is
 //!   `IGNORE`, like the other topics' uncached states, and so is a period the
 //!   head state's committees cannot answer for ([`IgnoreReason::SyncCommitteeUnavailable`]).

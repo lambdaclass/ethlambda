@@ -9,7 +9,7 @@
 //! chain actor.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     num::NonZeroUsize,
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -25,7 +25,8 @@ pub type SharedBuilderMarket = Arc<BuilderMarket>;
 
 /// Bids pooled per `(slot, parent hash, parent root)`, top values kept.
 pub const MAX_BIDS_PER_PARENT: usize = 16;
-/// A full slot refuses new keys: `record_bid` answers `false`.
+/// A full slot refuses new `(parent, builder)` keys: `record_bid` answers
+/// `false`.
 pub const MAX_SEEN_BID_KEYS_PER_SLOT: usize = 4096;
 /// Over the cap, the lowest `proposal_slot` is dropped first.
 pub const MAX_PREFERENCES: usize = 1024;
@@ -56,9 +57,11 @@ type ParentKey = (ExecutionBlockHash, Root);
 
 #[derive(Debug, Default)]
 struct SlotBids {
-    /// The spec's `seen.execution_payload_bids`: one bid per builder per
-    /// `(slot, parent_hash, parent_root)`.
-    seen: BTreeSet<(ParentKey, u64)>,
+    /// The spec's `seen.execution_payload_bid_counts`: how many bids each
+    /// builder has had accepted per `(slot, parent_hash, parent_root)`, which
+    /// the gossip rule holds to the builder's bid limit (consensus-specs
+    /// #5805; until v1.7.0-beta.5 a builder had one bid per key).
+    counts: BTreeMap<(ParentKey, u64), u64>,
     parents: BTreeMap<ParentKey, ParentBids>,
 }
 
@@ -73,9 +76,6 @@ impl BidPool {
             return Ok(());
         };
         let parent = (bid.parent_block_hash, bid.parent_block_root);
-        if slot.seen.contains(&(parent, bid.builder_index)) {
-            return Err(IgnoreReason::AlreadySeen);
-        }
         if let Some(best) = slot.parents.get(&parent).and_then(|p| p.best_value)
             && bid.value <= best
         {
@@ -83,10 +83,31 @@ impl BidPool {
         }
         Ok(())
     }
+
+    fn count(&self, bid: &gloas::ExecutionPayloadBid) -> u64 {
+        let parent = (bid.parent_block_hash, bid.parent_block_root);
+        self.slots
+            .get(&bid.slot)
+            .and_then(|slot| slot.counts.get(&(parent, bid.builder_index)))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 /// Preferences by `(proposal_slot, dependent_root)`: the first valid one wins.
-type PreferencesCache = BTreeMap<(Slot, Root), gloas::SignedProposerPreferences>;
+type PreferencesCache = BTreeMap<(Slot, Root), PooledPreferences>;
+
+/// Preferences in the market, and whether this node still owes them a gossip
+/// publish of its own.
+#[derive(Debug)]
+struct PooledPreferences {
+    signed: gloas::SignedProposerPreferences,
+    /// Set while this node owes them a publish: its last publish reached no
+    /// peer. Cleared once a publish goes out. Never set for preferences gossip
+    /// delivered, which peers already relay. Kept with the entry so it is
+    /// pruned with it.
+    publish_owed: bool,
+}
 
 #[derive(Debug)]
 pub struct BuilderMarket {
@@ -115,33 +136,62 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl BuilderMarket {
-    // Bids: seen.execution_payload_bids + seen.best_execution_payload_bid + pool.
+    // Bids: seen.execution_payload_bid_counts + seen.best_execution_payload_bid
+    // + pool.
 
-    /// The spec's two seen rules, in order: `(slot, parent_hash, parent_root,
-    /// builder)` recorded -> `AlreadySeen`; value <= best for `(slot,
-    /// parent_hash, parent_root)` -> `NotHighestBid`.
+    /// The spec's seen rule that reads no state: value <= best for `(slot,
+    /// parent_hash, parent_root)` -> `NotHighestBid`. The other one, the
+    /// builder's bid limit, needs the builder's balance; see
+    /// [`Self::bid_count`].
     pub fn check_bid_seen(&self, bid: &gloas::ExecutionPayloadBid) -> Result<(), IgnoreReason> {
         lock(&self.bids).check(bid)
     }
 
-    /// Re-runs [`Self::check_bid_seen`] under the lock. If it passes, records
-    /// both seen keys and pools the bid. `false` = not recorded (race, or the
-    /// per-slot key cap). Prunes slots below `bid.slot - 1`.
+    /// The spec's `seen.execution_payload_bid_counts[(slot, parent_hash,
+    /// parent_root, builder)]`: how many bids this builder has had recorded
+    /// for the bid's slot and parent.
+    pub fn bid_count(&self, bid: &gloas::ExecutionPayloadBid) -> u64 {
+        lock(&self.bids).count(bid)
+    }
+
+    /// [`Self::record_bid_within`] with no bid limit, for a caller that
+    /// records each bid before validating the next, so the gossip rule's own
+    /// count check already held: tests and the spec vectors.
     pub fn record_bid(&self, signed: gloas::SignedExecutionPayloadBid) -> bool {
+        self.record_bid_within(signed, u64::MAX)
+    }
+
+    /// Re-runs [`Self::check_bid_seen`] and the bid-limit rule (count below
+    /// `bid_limit`, the limit the bid's stateful checks read) under the lock.
+    /// If both pass, counts the bid against its builder, raises the slot and
+    /// parent's best value and pools the bid. `false` = not recorded (race,
+    /// or the per-slot key cap). Prunes slots below `bid.slot - 1`.
+    ///
+    /// The limit is compared again here because bids are validated
+    /// concurrently: several of one builder's bids can pass the gossip rule's
+    /// count at once, each before the others are recorded, and without this
+    /// every one of them that outbid the last would be counted and forwarded,
+    /// as many as validate at the same time.
+    pub fn record_bid_within(
+        &self,
+        signed: gloas::SignedExecutionPayloadBid,
+        bid_limit: u64,
+    ) -> bool {
         let mut pool = lock(&self.bids);
-        if pool.check(&signed.message).is_err() {
+        if pool.check(&signed.message).is_err() || pool.count(&signed.message) >= bid_limit {
             return false;
         }
         let bid_slot = signed.message.slot;
         let slot = pool.slots.entry(bid_slot).or_default();
-        if slot.seen.len() >= MAX_SEEN_BID_KEYS_PER_SLOT {
-            return false;
-        }
         let parent = (
             signed.message.parent_block_hash,
             signed.message.parent_block_root,
         );
-        slot.seen.insert((parent, signed.message.builder_index));
+        let key = (parent, signed.message.builder_index);
+        if !slot.counts.contains_key(&key) && slot.counts.len() >= MAX_SEEN_BID_KEYS_PER_SLOT {
+            return false;
+        }
+        *slot.counts.entry(key).or_default() += 1;
         let entry = slot.parents.entry(parent).or_default();
         entry.best_value = Some(signed.message.value);
         entry.bids.push(signed);
@@ -207,7 +257,7 @@ impl BuilderMarket {
     ) -> Option<gloas::SignedProposerPreferences> {
         lock(&self.preferences)
             .get(&(proposal_slot, dependent_root))
-            .cloned()
+            .map(|pooled| pooled.signed.clone())
     }
 
     /// Every held preference whose proposal slot and dependent root match the
@@ -225,7 +275,7 @@ impl BuilderMarket {
                 proposal_slot.is_none_or(|wanted| wanted == *slot)
                     && dependent_root.is_none_or(|wanted| wanted == *root)
             })
-            .map(|(_, signed)| signed.clone())
+            .map(|(_, pooled)| pooled.signed.clone())
             .collect()
     }
 
@@ -242,11 +292,56 @@ impl BuilderMarket {
             return false;
         }
         *cache = cache.split_off(&(current_slot, Root::ZERO));
-        cache.insert(key, signed);
+        let pooled = PooledPreferences {
+            signed,
+            publish_owed: false,
+        };
+        cache.insert(key, pooled);
         while cache.len() > MAX_PREFERENCES {
             cache.pop_first();
         }
         cache.contains_key(&key)
+    }
+
+    /// Records whether `signed` is still owed a gossip publish by this node:
+    /// `owed` when no peer was handed it, not once a publish went out. Applies only to the very message pooled under its
+    /// key; one pruned, or other preferences pooled first, are left alone.
+    pub fn record_preferences_publish(
+        &self,
+        signed: &gloas::SignedProposerPreferences,
+        owed: bool,
+    ) {
+        let key = (signed.message.proposal_slot, signed.message.dependent_root);
+        if let Some(pooled) = lock(&self.preferences)
+            .get_mut(&key)
+            .filter(|pooled| pooled.signed == *signed)
+        {
+            pooled.publish_owed = owed;
+        }
+    }
+
+    /// Whether `signed` itself is pooled and still owed a publish by this
+    /// node (see [`Self::record_preferences_publish`]).
+    pub fn preferences_publish_owed(&self, signed: &gloas::SignedProposerPreferences) -> bool {
+        let key = (signed.message.proposal_slot, signed.message.dependent_root);
+        lock(&self.preferences)
+            .get(&key)
+            .is_some_and(|pooled| pooled.publish_owed && pooled.signed == *signed)
+    }
+
+    /// The pooled preferences still owed a publish (see
+    /// [`Self::record_preferences_publish`]) for a proposal slot after `slot`,
+    /// in slot order. Those for `slot` and earlier are left out: the slot has
+    /// started, so its proposer has chosen its bid and none can use them.
+    /// Peers still take them for the first `MAXIMUM_GOSSIP_CLOCK_DISPARITY`
+    /// of the slot, but that allows for clock skew; it does not make them
+    /// useful.
+    pub fn preferences_owed_a_publish(&self, slot: Slot) -> Vec<gloas::SignedProposerPreferences> {
+        lock(&self.preferences)
+            .iter()
+            .filter(|((proposal_slot, _), pooled)| *proposal_slot > slot && pooled.publish_owed)
+            .map(|(_, pooled)| pooled.signed.clone())
+            .collect()
     }
 
     pub fn prune_preferences_before(&self, slot: Slot) {
@@ -346,14 +441,22 @@ pub mod test_support {
         }
     }
 
-    /// `prefs` signed by its own `validator_index` under `state`'s preferences
-    /// domain at the proposal slot's epoch (the spec's).
+    /// `prefs` signed by its own `validator_index` under the preferences
+    /// domain of the proposal slot's epoch, as the spec's
+    /// `get_signed_proposer_preferences` signs (consensus-specs #5665): the
+    /// fork version `config` schedules for that epoch, and `state`'s genesis
+    /// validators root.
     pub fn sign_preferences(
         state: &BeaconState,
+        config: &crate::beacon::config::Config,
         prefs: gloas::ProposerPreferences,
     ) -> gloas::SignedProposerPreferences {
         let epoch = compute_epoch_at_slot(prefs.proposal_slot);
-        let domain = get_domain(state, constants::DOMAIN_PROPOSER_PREFERENCES, Some(epoch));
+        let domain = crate::beacon::gossip::proposer_preferences::proposer_preferences_domain(
+            config,
+            state.genesis_validators_root(),
+            epoch,
+        );
         let root = compute_signing_root(prefs.hash_tree_root(), domain);
         let signature = sign_for(prefs.validator_index as usize, root);
         gloas::SignedProposerPreferences {
@@ -448,19 +551,41 @@ mod tests {
         }
     }
 
+    /// consensus-specs #5805: a builder may bid again for a parent, as long
+    /// as each bid beats the best; the market counts them for the gossip
+    /// rule's bid limit.
     #[test]
-    fn a_builder_bids_once_per_parent() {
+    fn a_builders_bids_per_parent_are_counted() {
         let market = BuilderMarket::default();
+        assert_eq!(market.bid_count(&bid(10, 1, 5).message), 0);
         assert!(market.record_bid(bid(10, 1, 5)));
-        assert_eq!(
-            market.check_bid_seen(&bid(10, 1, 9).message),
-            Err(IgnoreReason::AlreadySeen)
-        );
-        assert!(!market.record_bid(bid(10, 1, 9)));
-        // Another parent hash is another key.
-        let mut other = bid(10, 1, 9);
+        assert_eq!(market.check_bid_seen(&bid(10, 1, 9).message), Ok(()));
+        assert!(market.record_bid(bid(10, 1, 9)));
+        assert_eq!(market.bid_count(&bid(10, 1, 10).message), 2);
+        // Another builder, and another parent hash, are other keys.
+        assert_eq!(market.bid_count(&bid(10, 2, 10).message), 0);
+        let mut other = bid(10, 1, 11);
         other.message.parent_block_hash = hash(9);
-        assert!(market.record_bid(other));
+        assert_eq!(market.bid_count(&other.message), 0);
+        assert!(market.record_bid(other.clone()));
+        assert_eq!(market.bid_count(&other.message), 1);
+    }
+
+    /// Two of a builder's bids that both passed the gossip rule's count, at
+    /// a limit of one, validated before either was recorded: the second is
+    /// refused when recorded, though it beats the first on value, so the
+    /// count never passes the limit.
+    #[test]
+    fn recording_holds_a_builder_to_its_bid_limit() {
+        let market = BuilderMarket::default();
+        assert!(market.record_bid_within(bid(10, 1, 5), 1));
+        assert!(!market.record_bid_within(bid(10, 1, 9), 1));
+        assert_eq!(market.bid_count(&bid(10, 1, 9).message), 1);
+        // Refused for the limit, so the best value did not move: another
+        // builder with its own limit still records above the first bid.
+        assert!(market.record_bid_within(bid(10, 2, 6), 1));
+        // A limit of zero records nothing.
+        assert!(!market.record_bid_within(bid(10, 3, 7), 0));
     }
 
     #[test]
@@ -611,6 +736,64 @@ mod tests {
         assert!(market.preferences(101, Root::repeat_byte(1)).is_some());
         // A message below everything held is itself the one dropped.
         assert!(!market.record_preferences(prefs(50, 1, 3), 0));
+    }
+
+    #[test]
+    fn an_owed_publish_is_remembered_until_one_goes_out() {
+        let market = BuilderMarket::default();
+        let held = prefs(40, 1, 3);
+        assert!(market.record_preferences(held.clone(), 38));
+        assert!(
+            !market.preferences_publish_owed(&held),
+            "recorded as published"
+        );
+
+        market.record_preferences_publish(&held, true);
+        assert!(market.preferences_publish_owed(&held));
+        // Only the held message itself: other preferences for its key are not.
+        let mut other = held.clone();
+        other.message.fee_recipient = ExecutionAddress::repeat_byte(9);
+        assert!(!market.preferences_publish_owed(&other));
+        market.record_preferences_publish(&other, false);
+        assert!(market.preferences_publish_owed(&held));
+
+        market.record_preferences_publish(&held, false);
+        assert!(!market.preferences_publish_owed(&held));
+
+        // A publish outcome for preferences not held records nothing.
+        let unheld = prefs(41, 1, 3);
+        market.record_preferences_publish(&unheld, true);
+        assert!(!market.preferences_publish_owed(&unheld));
+        assert!(market.preferences(41, Root::repeat_byte(1)).is_none());
+    }
+
+    /// Owed are the preferences whose publish failed and whose slot is still
+    /// ahead: a slot that has started is stale, and one that went out is not
+    /// owed anything.
+    #[test]
+    fn preferences_owed_a_publish_are_the_owed_ones_still_ahead() {
+        let market = BuilderMarket::default();
+        let started = prefs(40, 1, 3);
+        let current = prefs(41, 1, 3);
+        let ahead = prefs(42, 1, 3);
+        let other_root = prefs(42, 2, 3);
+        let delivered = prefs(43, 1, 3);
+        for signed in [&started, &current, &ahead, &other_root, &delivered] {
+            assert!(market.record_preferences(signed.clone(), 40));
+        }
+        for signed in [&started, &current, &ahead, &other_root] {
+            market.record_preferences_publish(signed, true);
+        }
+
+        assert_eq!(
+            market.preferences_owed_a_publish(41),
+            vec![ahead.clone(), other_root.clone()]
+        );
+        assert_eq!(
+            market.preferences_owed_a_publish(39),
+            vec![started, current, ahead, other_root]
+        );
+        assert!(market.preferences_owed_a_publish(43).is_empty());
     }
 
     #[test]

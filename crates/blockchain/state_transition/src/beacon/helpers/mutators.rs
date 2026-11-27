@@ -206,6 +206,13 @@ fn initiate_validator_exit_for_fork(
 /// The exit it starts, however, is genuinely fork-dependent, which is what
 /// [`initiate_validator_exit_for_fork`] exists to resolve.
 ///
+/// Gloas modifies the function (EIP-7732, consensus-specs #5719, first in
+/// v1.7.0-beta.4): it also empties every `builder_pending_payments` entry
+/// whose proposer is the slashed validator, so a builder never pays for a
+/// block from a slashed proposer, whichever slashing (proposer's or
+/// attester's) caught it. That replaced gloas's own `process_proposer_slashing`,
+/// which cleared only the slashed header's own slot's entry.
+///
 /// `active_balances` is block processing's cache, handed to that exit's churn
 /// limit: every caller is a slashing operation in a block, so a block slashing
 /// many validators reads the total active balance once rather than once per
@@ -248,6 +255,16 @@ pub fn slash_validator(
         whistleblower_index,
         whistleblower_reward - proposer_reward,
     )?;
+
+    // [New in Gloas:EIP7732] Remove pending builder payments for blocks
+    // proposed by the slashed validator.
+    if let BeaconState::Gloas(inner) = state {
+        for index in 0..inner.builder_pending_payments.len() {
+            if inner.builder_pending_payments[index].proposer_index == slashed_index {
+                inner.builder_pending_payments[index] = Default::default();
+            }
+        }
+    }
     Ok(())
 }
 
