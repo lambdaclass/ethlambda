@@ -45,8 +45,9 @@ use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Root, Slot};
 use crate::beacon::stf;
 use crate::beacon::stf::gloas::verify_execution_payload_bid_signature;
 
-/// Gloas p2p preset: the largest decompressed `SignedExecutionPayloadBid`.
-pub const MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE: usize = 196_932;
+/// Gloas p2p preset: the largest decompressed `SignedExecutionPayloadBid`,
+/// re-exported here beside the rules that read it.
+pub use crate::beacon::preset::MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE;
 
 /// The spec's `is_gas_limit_target_compatible`: whether `gas_limit` is what
 /// the EIP-1559 transition rule from `parent_gas_limit` allows when steering

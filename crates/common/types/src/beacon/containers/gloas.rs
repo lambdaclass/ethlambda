@@ -1472,4 +1472,57 @@ mod tests {
         let back = super::super::electra::AttesterSlashing::try_from(&decoded).unwrap();
         assert_eq!(back, electra_slashing);
     }
+
+    /// The preset's EIP-7688 byte bounds are the encodings of the largest
+    /// message each topic can carry. They are what replaces the progressive
+    /// types' missing limits, so one too low would refuse valid gossip.
+    #[test]
+    fn the_size_bounds_are_the_largest_valid_encodings() {
+        let max_indexed = || IndexedAttestation {
+            attesting_indices: vec![0; preset::max_validators_per_slot()].into(),
+            data: AttestationData::default(),
+            signature: BlsSignature([0; 96]),
+        };
+        let slashing = AttesterSlashing {
+            attestation_1: max_indexed(),
+            attestation_2: max_indexed(),
+        };
+        assert_eq!(
+            slashing.to_ssz().len(),
+            preset::max_attester_slashing_size()
+        );
+
+        let aggregate = SignedAggregateAndProof {
+            message: AggregateAndProof {
+                aggregator_index: 0,
+                aggregate: Attestation {
+                    aggregation_bits: AggregationBits::with_length(
+                        preset::max_validators_per_slot(),
+                    ),
+                    data: AttestationData::default(),
+                    signature: BlsSignature([0; 96]),
+                    committee_bits: CommitteeBits::default(),
+                },
+                selection_proof: BlsSignature([0; 96]),
+            },
+            signature: BlsSignature([0; 96]),
+        };
+        assert_eq!(
+            aggregate.to_ssz().len(),
+            preset::max_signed_aggregate_and_proof_size()
+        );
+
+        let commitments = vec![KzgCommitment::default(); preset::MAX_BLOB_COMMITMENTS_PER_BLOCK];
+        let bid = SignedExecutionPayloadBid {
+            message: ExecutionPayloadBid {
+                blob_kzg_commitments: commitments.into(),
+                ..Default::default()
+            },
+            signature: BlsSignature([0; 96]),
+        };
+        assert_eq!(
+            bid.to_ssz().len(),
+            preset::MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE
+        );
+    }
 }

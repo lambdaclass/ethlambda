@@ -107,7 +107,7 @@ a bid burst cannot starve blocks, columns or attestations. Whatever is accepted
 goes into the node's one shared `BuilderMarket`, which the Beacon API and block
 production read. Neither is ever queued: a message whose parent or dependent
 block is unknown is ignored. A bid is capped at 196,932 decompressed bytes
-(`Reject(Malformed)` above that). The node publishes both: a bid on the digest of
+(see the EIP-7688 bounds below). The node publishes both: a bid on the digest of
 its slot, preferences on the digest of the proposal slot, which in the epoch
 before gloas is the gloas digest already joined. Envelopes the node publishes
 itself are recorded as known payloads, since gossip never echoes them.
@@ -217,6 +217,18 @@ fork; `unsupported_fork` is kept for a fork the node does not follow
 an unbounded progressive bitlist, so one longer than electra's type bound is
 REJECTed first, reading its length without expanding it, since expanding is
 what the seen-set check does before any other.
+
+EIP-7688 makes the lists of four gloas messages progressive, which have no SSZ
+limit, so `gloas/p2p-interface.md` gives their byte bounds as numbers instead:
+`MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE`, `MAX_ATTESTER_SLASHING_SIZE` and
+`MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE` (preset values, each the largest
+encoding of the bounded type it replaces) and
+`compute_max_data_column_sidecar_size` (the largest blob count in the schedule).
+On a gloas digest's topic, a payload whose snappy header declares more bytes
+than its bound is REJECTed (`oversized`) before it is decompressed
+(`p2p/src/beacon/size_bounds.rs`). A gloas sidecar in a by-root or by-range
+answer is held to the same column bound, after its chunk is read and before it
+is decoded; a chunk over it ends the stream.
 
 Three deliberate departures from the gloas gossip rules, each for want of state
 this node does not keep. Where the specification rejects a message whose block

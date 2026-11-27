@@ -24,6 +24,7 @@ pub mod handler;
 pub mod messages;
 pub mod protocols;
 pub mod scoring;
+pub mod size_bounds;
 pub mod subnets;
 pub mod swarm;
 pub mod sync_committee;

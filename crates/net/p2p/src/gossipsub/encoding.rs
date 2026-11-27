@@ -27,11 +27,19 @@ impl From<snap::Error> for DecompressError {
 /// Rejects payloads whose claimed uncompressed size exceeds MAX_PAYLOAD_SIZE
 /// to prevent decompression bomb attacks.
 pub fn decompress_message(data: &[u8]) -> Result<Vec<u8>, DecompressError> {
+    decompress_message_within(data, MAX_PAYLOAD_SIZE)
+}
+
+/// [`decompress_message`] under a tighter bound: `max` or `MAX_PAYLOAD_SIZE`,
+/// whichever is lower. Checked against the length snappy declares, so an
+/// oversized payload is refused before anything is allocated for it.
+pub fn decompress_message_within(data: &[u8], max: usize) -> Result<Vec<u8>, DecompressError> {
+    let max = max.min(MAX_PAYLOAD_SIZE);
     let uncompressed_size = snap::raw::decompress_len(data)?;
-    if uncompressed_size > MAX_PAYLOAD_SIZE {
+    if uncompressed_size > max {
         return Err(DecompressError::TooLarge {
             size: uncompressed_size,
-            max: MAX_PAYLOAD_SIZE,
+            max,
         });
     }
     let mut uncompressed_data = vec![0u8; uncompressed_size];
@@ -60,5 +68,21 @@ mod tests {
     fn test_decode_block() {
         let block_bytes = include_bytes!("../../test_data/signed_block.ssz");
         let _block = SignedBlock::from_ssz_bytes(block_bytes).unwrap();
+    }
+
+    #[test]
+    fn a_tighter_bound_refuses_what_the_payload_ceiling_allows() {
+        let bound = 1_000;
+        let at_bound = super::compress_message(&vec![7u8; bound]);
+        assert_eq!(
+            super::decompress_message_within(&at_bound, bound).unwrap(),
+            vec![7u8; bound]
+        );
+        let over = super::compress_message(&vec![7u8; bound + 1]);
+        assert!(super::decompress_message(&over).is_ok());
+        assert!(matches!(
+            super::decompress_message_within(&over, bound),
+            Err(super::DecompressError::TooLarge { size, max }) if size == bound + 1 && max == bound
+        ));
     }
 }

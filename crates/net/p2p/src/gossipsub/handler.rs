@@ -28,7 +28,7 @@ use spawned_concurrency::tasks::Context;
 use tracing::{debug, error, info, trace, warn};
 
 use super::{
-    encoding::{compress_message, decompress_message},
+    encoding::{DecompressError, compress_message, decompress_message, decompress_message_within},
     messages::{
         AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND,
         attestation_subnet_topic, topic_kind,
@@ -38,7 +38,7 @@ use crate::beacon::column_checks::{ColumnArrival, check_and_forward, passed_rows
 use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
 use crate::beacon::decode::BeaconGossip;
 use crate::beacon::verdict::{self, Dispatch, GossipId, Validated};
-use crate::beacon::{BeaconWire, decode as beacon_decode, topics as beacon_topics};
+use crate::beacon::{BeaconWire, decode as beacon_decode, size_bounds, topics as beacon_topics};
 use crate::{P2PServer, metrics};
 
 /// What `P2PServer` does with a gossip message, whichever chain it came from.
@@ -90,11 +90,19 @@ pub async fn handle_gossip_message(
     );
 
     let compressed_len = message.data.len();
-    let Some(payload) = decompress(&message.data, kind) else {
-        if let Some(id) = beacon_id {
-            verdict::report(server, id, Outcome::Reject(RejectReason::Decompress));
+    let bound = beacon_payload_bound(server, message.topic.as_str(), kind);
+    let payload = match decompress(&message.data, kind, bound) {
+        Ok(payload) => payload,
+        Err(err) => {
+            if let Some(id) = beacon_id {
+                let reason = match err {
+                    DecompressError::TooLarge { .. } => RejectReason::Oversized,
+                    DecompressError::Snap(_) => RejectReason::Decompress,
+                };
+                verdict::report(server, id, Outcome::Reject(reason));
+            }
+            return;
         }
-        return;
     };
 
     match kind {
@@ -125,15 +133,32 @@ pub async fn handle_gossip_message(
 /// verbatim would give the metric one label value per subnet rather than one
 /// per family, the same collapse every other beacon gossip counter already
 /// does for those two families.
-fn decompress(data: &[u8], kind: &str) -> Option<Vec<u8>> {
-    decompress_message(data)
-        .inspect_err(|err| {
-            error!(%err, kind, "Failed to decompress gossipped message");
-            if let Some(metric_kind) = beacon_topics::metric_kind(kind) {
-                metrics::inc_beacon_gossip(metric_kind, "decompress_failed");
-            }
-        })
-        .ok()
+///
+/// `bound` is the topic's type-specific byte bound, when it has one the SSZ
+/// decoder does not enforce (see [`beacon_payload_bound`]).
+fn decompress(data: &[u8], kind: &str, bound: Option<usize>) -> Result<Vec<u8>, DecompressError> {
+    let decompressed = match bound {
+        Some(bound) => decompress_message_within(data, bound),
+        None => decompress_message(data),
+    };
+    decompressed.inspect_err(|err| {
+        error!(%err, kind, "Failed to decompress gossipped message");
+        if let Some(metric_kind) = beacon_topics::metric_kind(kind) {
+            metrics::inc_beacon_gossip(metric_kind, "decompress_failed");
+        }
+    })
+}
+
+/// The byte bound a beacon gossip payload on `topic` must decompress within,
+/// below `MAX_PAYLOAD_SIZE`: gloas's EIP-7688 bounds, by the fork of the
+/// topic's own digest (see [`crate::beacon::size_bounds`]). `None` on a lean
+/// node, and for every topic whose type bounds itself at decode.
+fn beacon_payload_bound(server: &P2PServer, topic: &str, kind: &str) -> Option<usize> {
+    let wire = server.wire.beacon()?;
+    let topic_fork = beacon_topics::topic_digest(topic)
+        .and_then(|digest| wire.schedule.fork_for_digest(digest))
+        .unwrap_or(wire.fork);
+    size_bounds::gossip_payload_bound(topic_fork, kind, &wire.config)
 }
 
 /// SSZ-decode a lean gossip payload, or `None` after logging why.

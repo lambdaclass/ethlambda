@@ -261,6 +261,10 @@ impl IgnoreReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     Decompress,
+    /// The uncompressed payload is larger than its type can encode to: a gloas
+    /// topic's EIP-7688 byte bound, since a progressive type has no limit of
+    /// its own.
+    Oversized,
     Decode,
     WrongSubnet,
     Malformed,
@@ -357,6 +361,7 @@ impl RejectReason {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Decompress => "decompress",
+            Self::Oversized => "oversized",
             Self::Decode => "decode",
             Self::WrongSubnet => "wrong_subnet",
             Self::Malformed => "malformed",
