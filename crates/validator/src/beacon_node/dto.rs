@@ -20,7 +20,7 @@
 //! | `AttesterDuty` | pubkey, validator_index, committee_index, committee_length, committees_at_slot, validator_committee_index, slot | all seven, all used |
 //! | Genesis | genesis_time, genesis_validators_root, genesis_fork_version | the first two; the fork version comes from `/config/spec` |
 //! | Syncing | head_slot, sync_distance, is_syncing, is_optimistic, el_offline | all five: is_syncing and is_optimistic gate signing; el_offline and sync_distance rank the node, stopping nothing; head_slot is recorded; head_slot and sync_distance are read leniently |
-//! | `ValidatorResponse` | index, balance, status, validator | index, status, validator.pubkey; the single-validator form also reads the activation, exit and withdrawable epochs |
+//! | `ValidatorResponse` | index, balance, status, validator | index, status, validator.pubkey and validator.slashed; the single-validator form also reads the activation, exit and withdrawable epochs |
 //! | `ProposerDuty` | pubkey, validator_index, slot | all three, all used |
 //! | `ProposerPreparation` | validator_index, fee_recipient | both, sent not read |
 //!
@@ -387,6 +387,13 @@ pub struct ValidatorEntryDto {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ValidatorInnerDto {
     pub pubkey: String,
+    /// Whether the validator has been slashed. The flag, not `status`, is
+    /// what says so: `status` names it only until the validator reaches
+    /// `withdrawal_possible`. Read as `false` from a node that leaves it out,
+    /// since refusing the whole answer over it would cost every key its
+    /// duties. See [`crate::slashed`].
+    #[serde(default)]
+    pub slashed: bool,
 }
 
 /// One entry of `POST /eth/v1/validator/liveness/{epoch}`'s answer.
@@ -1288,6 +1295,27 @@ mod tests {
         assert_eq!(entry.index, 1337);
         assert_eq!(entry.status, "active_ongoing");
         parse_pubkey(&entry.validator.pubkey).expect("pubkey parses");
+        assert!(!entry.validator.slashed);
+    }
+
+    /// `validator.slashed` is read, since a status of `withdrawal_*` no longer
+    /// says a validator was slashed; a node that leaves the flag out is read
+    /// as reporting it unslashed rather than refused.
+    #[test]
+    fn a_validator_entry_carries_its_slashed_flag() {
+        let slashed = VALIDATORS
+            .replace("active_ongoing", "withdrawal_done")
+            .replace(r#""slashed": false"#, r#""slashed": true"#);
+        let response: DataResponse<Vec<ValidatorEntryDto>> =
+            serde_json::from_str(&slashed).expect("parses");
+        assert_eq!(response.data[0].status, "withdrawal_done");
+        assert!(response.data[0].validator.slashed);
+
+        let without = VALIDATORS.replace(r#""slashed": false,"#, "");
+        assert!(!without.contains("slashed"), "the flag is gone");
+        let response: DataResponse<Vec<ValidatorEntryDto>> =
+            serde_json::from_str(&without).expect("parses without the flag");
+        assert!(!response.data[0].validator.slashed);
     }
 
     #[test]

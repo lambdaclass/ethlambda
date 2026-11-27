@@ -29,6 +29,16 @@ static VALIDATORS_RESOLVED: LazyLock<IntGauge> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Loaded keys the chain reports slashed, as of the last epoch refresh. Should
+/// read zero forever: see `crate::slashed`.
+static VALIDATORS_SLASHED: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "ethlambda_validator_validators_slashed",
+        "Loaded validator keys the chain reports slashed"
+    )
+    .unwrap()
+});
+
 static DUTIES_HELD: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "ethlambda_validator_duties_held",
@@ -537,6 +547,7 @@ static CLOCK_STEPS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
 pub fn init() {
     LazyLock::force(&VALIDATORS_LOADED);
     LazyLock::force(&VALIDATORS_RESOLVED);
+    LazyLock::force(&VALIDATORS_SLASHED);
     LazyLock::force(&DUTIES_HELD);
     LazyLock::force(&ATTESTATIONS_PUBLISHED_TOTAL);
     LazyLock::force(&ATTESTATION_FAILURES_TOTAL);
@@ -597,6 +608,10 @@ pub fn set_validators_loaded(count: u64) {
 
 pub fn set_validators_resolved(count: u64) {
     VALIDATORS_RESOLVED.set(count as i64);
+}
+
+pub fn set_validators_slashed(count: u64) {
+    VALIDATORS_SLASHED.set(count as i64);
 }
 
 pub fn set_duties_held(count: u64) {

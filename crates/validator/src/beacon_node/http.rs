@@ -1090,6 +1090,7 @@ impl BeaconNodeApi for HttpBeaconNode {
                     index: entry.index,
                     pubkey: parse_pubkey(&entry.validator.pubkey)?,
                     status: entry.status,
+                    slashed: entry.validator.slashed,
                 })
             })
             .collect()

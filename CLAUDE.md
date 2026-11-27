@@ -246,7 +246,7 @@ let _timing = metrics::time_state_transition();
 **All metrics use `ethlambda_metrics::*` re-exports** — the `ethlambda-metrics` crate re-exports
 prometheus types (`IntGauge`, `IntCounter`, `Histogram`, etc.) and provides `TimingGuard` + `gather_default_metrics()`.
 
-**Naming convention:** All metrics use `lean_` prefix (e.g., `lean_head_slot`, `lean_state_transition_time_seconds`).
+**Naming convention:** Node metrics use the `lean_` prefix (e.g., `lean_head_slot`, `lean_state_transition_time_seconds`); the validator client's (`crates/validator`) use `ethlambda_validator_` (e.g., `ethlambda_validator_validators_slashed`).
 
 ### Logging Patterns
 

@@ -705,6 +705,7 @@ mod tests {
             index,
             pubkey: pubkey(byte),
             status: status.to_string(),
+            slashed: false,
         }
     }
 
@@ -893,6 +894,7 @@ mod tests {
                 index,
                 pubkey: pubkey(byte),
                 status: "active_ongoing".to_string(),
+                slashed: false,
             })
             .collect();
         node
