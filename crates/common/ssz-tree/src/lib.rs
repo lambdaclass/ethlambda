@@ -80,6 +80,7 @@
 
 mod batch;
 mod cursor;
+mod flat_list;
 mod interface;
 mod iter;
 mod list;
@@ -90,6 +91,7 @@ mod update_map;
 mod vector;
 
 pub use cursor::{ElemCow, IterCow};
+pub use flat_list::{FlatList, FlatListOf};
 pub use interface::SortedReader;
 pub use iter::Iter;
 pub use list::{List, ListOf};
