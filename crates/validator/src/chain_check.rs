@@ -33,7 +33,7 @@ use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset::slots_per_epoch;
 use ethlambda_types::beacon::primitives::{Epoch, Version};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::beacon_node::dto::{encode_hex, fork_epoch_key, fork_version_key};
 use crate::beacon_node::fallback::FallbackBeaconNode;
@@ -297,6 +297,9 @@ pub struct ScheduleMerge {
     pub config: Config,
     /// One line per field that changed, old value to new.
     pub changes: Vec<String>,
+    /// Whether a fork's epoch or version is among `changes`, rather than only
+    /// the duty offsets or the gas limit schedule.
+    pub forks_changed: bool,
     /// One line per future fork the compatible nodes disagree about.
     pub disagreements: Vec<String>,
 }
@@ -400,11 +403,14 @@ const OFFSETS: [Offset; 10] = [
 /// disagreement. `Config::fork_at_epoch` would otherwise answer a fork for
 /// the epochs in between that matches no real one.
 ///
-/// The duty offsets and `GAS_LIMIT_SCHEDULE` are taken from the first of
-/// `nodes`, say or not, because an upgraded node may start serving the gloas
-/// offsets or a gas limit schedule, and they identify no chain. The caller
-/// passes what each node last served, so the first node stays the first
-/// through a round it does not answer.
+/// The duty offsets are taken from the first of `nodes`, say or not, because
+/// an upgraded node may start serving the gloas offsets, and they identify no
+/// chain. `GAS_LIMIT_SCHEDULE` is taken from the first of `nodes` that serves
+/// a non-empty one, for the same reason, and empty when none does: a node
+/// that leaves the key out (one that predates it, or Lighthouse while gloas
+/// is unscheduled) reads as an empty schedule, which must not erase the one
+/// another node serves. The caller passes what each node last served, so the
+/// first node stays the first through a round it does not answer.
 ///
 /// Everything else (genesis, slot duration, past forks) stays as it is.
 pub fn merge_schedule(
@@ -520,6 +526,8 @@ pub fn merge_schedule(
         changes.clear();
     }
 
+    let forks_changed = !changes.is_empty();
+
     if let Some((_, first)) = nodes.first() {
         for (key, get, set) in OFFSETS {
             if get(first) != get(&config) {
@@ -527,23 +535,32 @@ pub fn merge_schedule(
                 set(&mut config, get(first));
             }
         }
-        // The gas limit schedule too, for the same reason: it only names a
-        // default gas limit and identifies no chain. A node may start serving
-        // it later (Lighthouse leaves the key out while gloas is
-        // unscheduled), and [`run`] hands it to the proposer settings.
-        if first.gas_limit_schedule != config.gas_limit_schedule {
+    }
+    // The gas limit schedule too: it only names a default gas limit and
+    // identifies no chain. A node may start serving it later (Lighthouse
+    // leaves the key out while gloas is unscheduled), and [`run`] hands it
+    // to the proposer settings. Only a node that serves one has a say.
+    if !nodes.is_empty() {
+        let served = nodes
+            .iter()
+            .map(|(_, node)| &node.gas_limit_schedule)
+            .find(|schedule| !schedule.is_empty())
+            .cloned()
+            .unwrap_or_default();
+        if served != config.gas_limit_schedule {
             changes.push(format!(
                 "GAS_LIMIT_SCHEDULE {} -> {}",
                 gas_limit_schedule_text(&config.gas_limit_schedule),
-                gas_limit_schedule_text(&first.gas_limit_schedule)
+                gas_limit_schedule_text(&served)
             ));
-            config.gas_limit_schedule = first.gas_limit_schedule.clone();
+            config.gas_limit_schedule = served;
         }
     }
 
     ScheduleMerge {
         config,
         changes,
+        forks_changed,
         disagreements,
     }
 }
@@ -644,11 +661,20 @@ pub fn follow_schedule(
         return None;
     }
     let changes = merge.changes.join("; ");
-    warn!(
-        %epoch,
-        %changes,
-        "The beacon nodes changed the fork schedule; the validator client now follows it"
-    );
+    if merge.forks_changed {
+        warn!(
+            %epoch,
+            %changes,
+            "The beacon nodes changed the fork schedule; the validator client now follows it"
+        );
+    } else {
+        info!(
+            %epoch,
+            %changes,
+            "The beacon nodes changed a duty offset or the gas limit schedule; the validator \
+             client now follows it"
+        );
+    }
     Some(merge.config)
 }
 
@@ -863,6 +889,7 @@ mod tests {
         assert_eq!(merge.config.fork_epoch(ForkName::Gloas), NOW + 100);
         assert_eq!(merge.config.fork_version(ForkName::Gloas), [8, 0, 0, 0]);
         assert_eq!(merge.changes.len(), 2, "got {:?}", merge.changes);
+        assert!(merge.forks_changed);
         assert!(merge.disagreements.is_empty());
     }
 
@@ -988,8 +1015,9 @@ mod tests {
 
     /// A gas limit schedule the first node starts serving after startup (a
     /// Lighthouse node shows the key only once gloas is scheduled) is taken,
-    /// as the duty offsets are, and so is one it changes; the other nodes'
-    /// do not count.
+    /// as the duty offsets are, and so is one it changes; a later node's
+    /// counts only while every node before it serves none, so a node without
+    /// the key cannot erase a schedule another one serves.
     #[test]
     fn the_gas_limit_schedule_follows_the_first_node() {
         let current = Config::mainnet();
@@ -1004,13 +1032,25 @@ mod tests {
             )]
         );
 
+        assert!(!taken.forks_changed);
+
+        let other = with_gas_limit_schedule(NOW + 10, 100_000_000);
+        let both = merge(&current, &[(0, other.clone()), (1, served.clone())], NOW);
+        assert_eq!(both.config.gas_limit_schedule, other.gas_limit_schedule);
+
+        // The first node serves none: the second's is taken, and once it is
+        // held, the first node does not take it away.
         let second_only = merge(&current, &[(0, current.clone()), (1, served.clone())], NOW);
-        assert!(second_only.config.gas_limit_schedule.is_empty());
-        assert!(
-            second_only.changes.is_empty(),
-            "got {:?}",
-            second_only.changes
+        assert_eq!(
+            second_only.config.gas_limit_schedule,
+            served.gas_limit_schedule
         );
+        let kept = merge(&served, &[(0, current.clone()), (1, served.clone())], NOW);
+        assert!(kept.changes.is_empty(), "got {:?}", kept.changes);
+
+        // No node serves one any more: the schedule empties.
+        let dropped = merge(&served, &[(0, current.clone()), (1, current.clone())], NOW);
+        assert!(dropped.config.gas_limit_schedule.is_empty());
 
         let changed = with_gas_limit_schedule(NOW + 20, 300_000_000);
         let moved = merge(&served, &[(0, changed.clone())], NOW);

@@ -174,14 +174,24 @@ impl GasLimitSchedule {
 
     /// Whether a beacon node can run on this schedule: it holds at most
     /// [`MAX_GAS_LIMIT_SCHEDULE_ENTRIES`] entries, which is what its stored
-    /// row can hold, and it keeps the specification's two rules (no two
-    /// entries share an epoch, and none is before `gloas_fork_epoch`).
+    /// row can hold, and it keeps [`Self::check_rules`].
     pub fn check(&self, gloas_fork_epoch: Epoch) -> Result<(), GasLimitScheduleError> {
         if self.0.len() > MAX_GAS_LIMIT_SCHEDULE_ENTRIES {
             return Err(GasLimitScheduleError::TooManyEntries {
                 entries: self.0.len(),
             });
         }
+        self.check_rules(gloas_fork_epoch)
+    }
+
+    /// Whether the schedule keeps the specification's two rules (no two
+    /// entries share an epoch, and none is before `gloas_fork_epoch`), and
+    /// names no zero gas limit, which no validator could target (`--gas-limit`
+    /// and the keymanager refuse one too).
+    ///
+    /// Without [`Self::check`]'s bound on the entries: a validator client
+    /// reading a node's schedule stores none of it, and checks it with this.
+    pub fn check_rules(&self, gloas_fork_epoch: Epoch) -> Result<(), GasLimitScheduleError> {
         if let Some(entry) = self.0.iter().find(|entry| entry.epoch < gloas_fork_epoch) {
             return Err(GasLimitScheduleError::BeforeGloas {
                 epoch: entry.epoch,
@@ -196,6 +206,9 @@ impl GasLimitSchedule {
             return Err(GasLimitScheduleError::DuplicateEpoch {
                 epoch: pair[0].epoch,
             });
+        }
+        if let Some(entry) = self.0.iter().find(|entry| entry.gas_limit == 0) {
+            return Err(GasLimitScheduleError::ZeroGasLimit { epoch: entry.epoch });
         }
         Ok(())
     }
@@ -259,6 +272,8 @@ pub enum GasLimitScheduleError {
     },
     #[error("two entries share epoch {epoch}")]
     DuplicateEpoch { epoch: Epoch },
+    #[error("the entry at epoch {epoch} names a gas limit of zero")]
+    ZeroGasLimit { epoch: Epoch },
 }
 
 /// Zero bytes inside [`Config`]'s encoding: see "Stored in a row of its own"
@@ -1965,6 +1980,12 @@ mod tests {
         assert_eq!(
             duplicate.check(0),
             Err(GasLimitScheduleError::DuplicateEpoch { epoch: 10 })
+        );
+
+        let zero = GasLimitSchedule::from(vec![gas_limit_entry(10, 1), gas_limit_entry(20, 0)]);
+        assert_eq!(
+            zero.check(0),
+            Err(GasLimitScheduleError::ZeroGasLimit { epoch: 20 })
         );
         assert_eq!(GasLimitSchedule::default().check(Epoch::MAX), Ok(()));
     }

@@ -969,8 +969,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `--gas-limit` sets the target gas limit the preferences
   carry, which the node's own gloas payload is built toward; without it, the
   one the beacon node's `GAS_LIMIT_SCHEDULE` names for the proposal's epoch,
-  else 60M (the chain check re-reads the schedule from the first usable node, like the
-  duty offsets, and hands it to `ProposerSettings`).
+  else 60M (the chain check re-reads the schedule every round from the first usable
+  node that serves a non-empty one, and hands it to `ProposerSettings`; an unusable
+  schedule is ignored with a warning, not an error that costs the node).
   Every slot it probes each beacon node's `/eth/v1/node/syncing` a sixth of a
   slot before the boundary, on its own task (`beacon_node::health`, records
   in `NodeHealth`, shared by the fallback): a slot in which every node that

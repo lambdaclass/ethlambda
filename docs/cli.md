@@ -447,10 +447,14 @@ upgraded one is restarting. A fork the network cancels therefore needs a
 restart. A node that stops answering loses its say after three slots, so it cannot
 hold a fork at an epoch the network has postponed (unless the postponement comes in
 the fork's last three slots); the duty offsets and the gas limit schedule are still
-read from the first node through a round it misses. Those two are taken from the
-first node alone, since they identify no chain: a schedule it starts serving after
-startup (a Lighthouse node shows `GAS_LIMIT_SCHEDULE` only once gloas is scheduled)
-becomes the default gas limit from the next round on. A merge that would put a fork before the one it follows
+read from the first node through a round it misses. Those two identify no chain, so
+no vote is taken: the offsets come from the first node alone, and the gas limit
+schedule from the first node that serves a non-empty one, so a node that leaves the
+key out cannot erase another's. A schedule a node starts serving after startup (a
+Lighthouse node shows `GAS_LIMIT_SCHEDULE` only once gloas is scheduled) becomes the
+default gas limit from the next round on. A schedule the client cannot decode, or one
+that breaks the specification's rules or names a zero gas limit, is ignored with a
+warning rather than costing the client the node. A merge that would put a fork before the one it follows
 is refused whole and warned about. A fork that is already active is never moved: a
 node that reports another epoch or version for it is on another chain.
 The client does not need a restart for a fork the network schedules after it
