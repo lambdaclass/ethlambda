@@ -212,8 +212,11 @@ pub struct BlockRequest {
     /// This proposer's reveal for the slot's epoch, which the node needs
     /// before it can build a body.
     pub randao_reveal: BlsSignature,
-    /// Thirty-two bytes consensus never reads.
-    pub graffiti: Bytes32,
+    /// Thirty-two bytes consensus never reads, or `None` to send no
+    /// `graffiti` at all, so the beacon node applies its own default. 32 zero
+    /// bytes are a graffiti chosen to be empty, which a node may treat
+    /// differently.
+    pub graffiti: Option<Bytes32>,
     /// The `builder_boost_factor` to send, or `None` when builder proposals are
     /// off before gloas. `None` sends `0` and refuses a blinded answer; `Some`
     /// sends the factor and accepts one. From gloas the factor travels in
@@ -357,6 +360,9 @@ pub struct ValidatorEntry {
     pub index: ValidatorIndex,
     pub pubkey: BlsPubkey,
     pub status: String,
+    /// Whether the chain reports the validator slashed, which `status` stops
+    /// saying once it reaches `withdrawal_possible`. See [`crate::slashed`].
+    pub slashed: bool,
 }
 
 /// Whether the node saw one validator act in the epoch asked about. See

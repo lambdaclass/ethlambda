@@ -623,11 +623,15 @@ impl<B: BeaconNodeApi + 'static> RegistrationService<B> {
         if generation == self.signed_generation.load(Ordering::Acquire) {
             return;
         }
-        let known = self
+        let mut known = self
             .known
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // Less any key found slashed since: `known` is the last full send's
+        // set, which stays last epoch's while a full send that overran its
+        // epoch skips this one's (see `crate::slashed`).
+        known.retain(|pubkey| !self.context.slashed().contains(pubkey));
         if known.is_empty() {
             return;
         }
@@ -1088,6 +1092,40 @@ mod tests {
         assert_eq!(registrations.len(), 4);
         assert_eq!(registrations[3].message.pubkey, pubkeys[2]);
         assert_eq!(registrations[3].message.gas_limit, 30_000_000);
+    }
+
+    /// A key the last full send registered and a later refresh found slashed
+    /// is not re-signed by a per-slot send: a full send that overran its
+    /// epoch keeps that epoch's from replacing the keys it read.
+    #[tokio::test]
+    async fn register_changed_leaves_out_a_key_found_slashed_since_the_full_send() {
+        let (store, pubkeys) = store_with_keys(2);
+        let settings = settings(Some(H160([0xab; 20])));
+        let (service, node) = service(Config::mainnet(), settings.clone());
+        let store = Arc::new(RwLock::new(store));
+        service
+            .clone()
+            .register_all(0, pubkeys.clone(), store.clone())
+            .await;
+
+        let slashed = crate::beacon_node::ValidatorEntry {
+            index: 1,
+            pubkey: pubkeys[1],
+            status: "active_slashed".to_string(),
+            slashed: true,
+        };
+        service
+            .context
+            .slashed()
+            .observe(std::slice::from_ref(&slashed))
+            .expect("without the flag a slashed key stops nothing");
+        settings.set_gas_limit(&pubkeys[0], 30_000_000);
+        settings.set_gas_limit(&pubkeys[1], 30_000_000);
+        service.register_changed(0, store).await;
+
+        let registrations = node.registrations.lock().expect("lock");
+        assert_eq!(registrations.len(), 3);
+        assert_eq!(registrations[2].message.pubkey, pubkeys[0]);
     }
 
     fn refuse_registrations(node: &MockBeaconNode) {

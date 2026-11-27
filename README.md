@@ -364,6 +364,7 @@ beacon node.
 | `--secrets-dir` | One password file per keystore, named after the validator's public key |
 | `--suggested-fee-recipient` | Execution address for block rewards, `0x`-prefixed. Optional, but without it the beacon node picks an address that is not yours |
 | `--graffiti` | Text for proposed blocks, at most 32 bytes |
+| `--graffiti-file` | Per-validator graffiti in Lighthouse's `--graffiti-file` format, read again before every proposal. Conflicts with `--graffiti`, as in Lighthouse |
 | `--gas-limit` | The gas limit validators target. From gloas the beacon node builds this client's own payloads toward it. Without it, the gas limit the network's `GAS_LIMIT_SCHEDULE` names for the proposal's epoch (Sepolia's and Platåberget's name `200000000`), else `60000000` |
 | `--builder-proposals` | Propose builder blocks before gloas: register each validator with the beacon node's builder (`--builder` on an ethlambda node) and sign a blinded block when the builder's bid wins. Off by default. From gloas, with or without it, builders' p2p bids compete with the local payload (`--builder-boost-factor`, default `100`; `--builder-min-bid`, default `0`), and a block built on the winning bid is signed |
 | `--self-build-only` | Never sign a block built on a builder's payload: from gloas each block request asks for no bid, and a block built on one anyway is refused. A slot whose local payload cannot be built is missed. Off by default |

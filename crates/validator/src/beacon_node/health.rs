@@ -1248,6 +1248,7 @@ mod tests {
             index: 11,
             pubkey: BlsPubkey([1; 48]),
             status: "active_ongoing".to_string(),
+            slashed: false,
         }];
         let beacon_node = Arc::new(fallback(vec![node]));
         let context = Arc::new(SigningContext::new(

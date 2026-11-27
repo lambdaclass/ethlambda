@@ -64,6 +64,18 @@ one the node does not check:
   request, which costs bandwidth and CPU until the slot or epoch the caller
   named. A sync committee subscription is capped at the end of the next sync
   committee period; an attestation subnet's is not capped.
+- **How many custody groups the node holds.** Both
+  `beacon_committee_subscriptions` (every entry's, an aggregator's or not) and
+  `prepare_beacon_proposer` record every validator index they name as attached
+  to this node, with no check that the node runs it. Once an epoch the node raises its recorded
+  custody count to what those validators' effective balance requires
+  ([Validator custody](./beacon_wire.md#validator-custody)), and that record
+  never falls, as fulu's validator custody has it, so a caller naming
+  validators the node does not run raises its custody, and the bandwidth and
+  storage that go with it, for good: the advertised count at once, within the
+  groups it already holds, and the rest from the next start. Only a new data
+  directory forgets it. The named indices are kept in memory for two epochs
+  past their last mention, however many a caller names.
 - **When the node builds a block.** Every
   `GET /eth/v3/validator/blocks/{slot}` and
   `POST /eth/v4/validator/blocks/{slot}` request has the execution client
@@ -314,7 +326,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET`, `POST` | `/eth/v1/beacon/pool/bls_to_execution_changes` | JSON | The pool's `SignedBLSToExecutionChange`s; POST takes an array |
 | `POST` | `/eth/v1/beacon/pool/payload_attestations` | *(status only)* | Validate, pool and gossip `PayloadAttestationMessage`s (gloas; JSON or SSZ body) |
 | `GET` | `/eth/v1/beacon/pool/payload_attestations` | JSON | The pool's votes as aggregated `PayloadAttestation`s (gloas) |
-| `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet |
+| `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet; every entry's validator counts as attached, for validator custody |
 | `GET` | `/eth/v2/validator/aggregate_attestation` | JSON | The pooled votes for a data root and committee, aggregated |
 | `POST` | `/eth/v2/validator/aggregate_and_proofs` | *(status only)* | Validate and gossip `SignedAggregateAndProof`s (JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/pool/sync_committees` | *(status only)* | Validate, pool and gossip `SyncCommitteeMessage`s |
@@ -330,7 +342,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v1/beacon/execution_payload_bids` | *(status only)* | Validate, pool and gossip a builder's `SignedExecutionPayloadBid` (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/validator/proposer_preferences` | *(status only)* | Validate, cache and gossip `SignedProposerPreferences` (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/states/{state_id}/builders` | JSON | The gloas builder registry, filtered by id and status |
-| `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Record each validator's fee recipient for block production (see below) |
+| `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Record each validator's fee recipient for block production (see below), and that it is attached, for validator custody |
 | `POST` | `/eth/v1/validator/register_validator` | *(status only)* | Forwards builder registrations of active or pending validators to `--builder`, and sets their fee recipients |
 | `GET` | `/eth/v1/events` | SSE | Live stream of chain events (see below) |
 
@@ -433,6 +445,11 @@ the chain actor writes, so no request waits on the actor.
   attestation this node relays has passed the `beacon_attestation_{subnet_id}`
   checks first, and the ones accepted on a joined subnet are pooled. Joined
   subnets are left once their slot has passed, and never appear in `attnets`.
+  Every entry's validator, aggregator or not, is also recorded as attached to
+  this node, as `prepare_beacon_proposer`'s are: the p2p layer sizes its
+  custody by the attached validators' effective balance once an epoch, and
+  forgets a validator not named again for two epochs (see
+  [Validator custody](./beacon_wire.md#validator-custody)).
 - **`aggregate_attestation`** answers from the pool: every vote held for the
   data root and committee, as electra's `Attestation` with the BLS aggregate of
   their signatures; at a gloas slot the answer is `{version: "gloas", data}`
@@ -574,7 +591,8 @@ the chain actor writes, so no request waits on the actor.
   `1a2b…` under ethlambda at `3c4d…`. The execution client's half comes from
   `engine_getClientVersionV1`, asked alongside the payload build and given up
   on after `EL_VERSION_TIMEOUT`, and is left out when it cannot be had
-  (`hello LA3c4d`). The
+  (`hello LA3c4d`). A request without `graffiti` is read as an empty one, so
+  its block carries the suffix alone (`RH1a2bLA3c4d`). The
   suffix shrinks rather than cutting the validator's text short, in
   Lighthouse's tiers, and is appended to every block with no opt-out; the
   `graffiti_policy` parameter Lighthouse's validator client sends is not read.
@@ -732,8 +750,15 @@ which is before the chain actor has imported it; a block still unknown after
 that is a `400` (`unknown block`). The envelope must fulfill the block's bid
 (builder index and block hash), the blobs must match the bid's commitments, the
 signature must verify under `DOMAIN_BEACON_BUILDER` against the block's
-post-state, and every data column built from the blobs must verify against the
-commitments and cell proofs; any failure is a `400`. A success is `200` once the
+post-state, and every data column built from the blobs must carry one cell and
+one proof per commitment; when the blobs came in the body, its cell proofs must
+also verify against the commitments. Any failure is a `400`. The cached blobs'
+proofs are not verified here: they came from this node's own execution client
+(`engine_getPayload`'s blobs bundle), which checked them when it admitted their
+blob transactions, and Lighthouse and Prysm publish their own columns unverified
+too. They are verified once, after gossip: this node's own copy of each column
+goes through p2p's chain checks, KZG proofs included, before it is stored
+(`column_checks.rs`). A success is `200` once the
 envelope and all `NUMBER_OF_COLUMNS` gloas data column sidecars are handed to
 P2P, which gossips them together. A node that does not subscribe to a column's
 subnet publishes through gossipsub fanout.
@@ -1042,6 +1067,10 @@ no IP. `metadata` is the `MetaData` the node answers peers with over req/resp,
 read at request time, so `syncnets` and `seq_number` follow the sync committee
 subnets a validator client asks for. That `seq_number` versions `MetaData`
 alone: the p2p specification counts it separately from the ENR's `seq`.
+`metadata.custody_group_count` is `MetaData` v3's: the count the node started
+with (the ENR's `cgc`), or higher once validator custody has raised it at
+runtime, which the ENR cannot follow until a restart (see
+[Validator custody](./beacon_wire.md#validator-custody)).
 
 `/eth/v1/node/peers`, `/eth/v1/node/peers/{peer_id}` and
 `/eth/v1/node/peer_count` read the p2p layer's table of connected peers at

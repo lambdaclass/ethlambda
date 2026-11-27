@@ -33,6 +33,6 @@ pub use target_balance_cache::{TargetBalanceCache, TargetBalances};
 // is unaffected by which module owns it.
 pub use state_writer::CacheKey;
 pub use store::{
-    Chain, DB_VERSION, ForkCheckpoints, GetForkchoiceStoreError, HeadVoteWindow,
+    Chain, CustodyRecord, DB_VERSION, ForkCheckpoints, GetForkchoiceStoreError, HeadVoteWindow,
     MAX_RESUMABLE_DB_STATE_AGE, NEW_PAYLOAD_CAP, Store,
 };

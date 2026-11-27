@@ -358,6 +358,12 @@ impl JustifiedBalances {
             })
     }
 
+    /// How many validators the checkpoint state's registry held: an index at
+    /// or past it did not exist then.
+    pub fn validator_count(&self) -> usize {
+        self.effective_increments.len()
+    }
+
     /// The checkpoint these balances were derived from.
     pub fn checkpoint(&self) -> Checkpoint {
         self.checkpoint
