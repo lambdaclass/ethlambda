@@ -261,11 +261,12 @@ pub struct ImportTimings {
     /// verdict makes `on_block` run again shows as the second transition it
     /// is, and a held block still shows the one it paid for. The `engine` pair
     /// spans this one and its row subtracts it, so the rows still sum to the
-    /// end-to-end time instead of counting the overlap twice. `None` whenever
-    /// no speculation was computed: every import that sent no request (no
-    /// execution client, or no payload to ask about), and a request for a
-    /// block `fork_choice::speculate_transition` declined. Nothing overlapped
-    /// then, and the `engine` row is its whole pair.
+    /// end-to-end time instead of counting the overlap twice. Computed for
+    /// every block, a request or not: without one (no execution client, or
+    /// no payload to ask about) nothing overlaps, the `engine` pair is a zero
+    /// taken before it, and `on_block` still takes it in place of its own.
+    /// `None` only for a block `fork_choice::speculate_transition` declined,
+    /// which `on_block` then refuses before any transition.
     pub stf_speculative_start: Option<Instant>,
     pub stf_speculative_end: Option<Instant>,
     /// Beacon: what became of that speculative transition, set by

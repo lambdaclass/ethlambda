@@ -100,11 +100,12 @@ unrealized justification). The block's state-transition time is then the two
 spans added together (less `writer_wait`), as the import's log line and
 `lean_block_import_phase_seconds{phase="stf"}` count it. When it is discarded
 (an `Invalid` verdict), `stf_start`..`stf_done` runs the transition again, and
-the two spans are both transitions the import paid for. A block with no
-speculation writes no `cl_*` rows, and its `stf_start`..`stf_done` is the
-whole transition: no request was sent (no execution client, or a block with no
-payload to ask about: pre-merge or gloas), or `speculate_transition` declined
-the block.
+the two spans are both transitions the import paid for. The transition is
+computed ahead of `on_block` for every block, so a block nobody was asked
+about (no execution client, or no payload to ask about: pre-merge or gloas)
+writes `cl_*` rows too, with no `el_*` rows beside them. Only a block
+`speculate_transition` declined writes none, which `on_block` refuses before
+any transition.
 
 `el_start` and `el_end` are Silver's `el_sent` and `el_verdict` under
 ethlambda's own names, and `cl_*` was `stf_spec_*` in earlier nightly builds:

@@ -5245,8 +5245,10 @@ pub fn on_block(
     )
 }
 
-/// The state transition of one block, computed before the execution client's
-/// verdict on its payload is known.
+/// The state transition of one block, computed ahead of [`on_block`]: while the
+/// execution client is asked about its payload, when there is one to ask
+/// about, and on its own otherwise, which keeps the import's store writes a
+/// step of their own (the chain actor's `cl` and `store` sections).
 ///
 /// Opaque on purpose: the only thing a holder can do with one is hand it to
 /// [`on_block_speculative`], which decides whether it may stand in for the
@@ -5364,6 +5366,34 @@ impl SpeculativeTransition {
     }
 }
 
+/// [New in Gloas:EIP7732] The check [`on_block`] makes right after finding the
+/// parent's post-state: a gloas block that builds on its parent's full payload
+/// needs that payload verified by `on_execution_payload_envelope`. Returns the
+/// parent's payload status for a gloas block and `None` before gloas.
+///
+/// One function for both callers, so [`speculate_transition`] refuses exactly
+/// the blocks `on_block` would refuse here.
+fn check_parent_payload(
+    store: &Store,
+    signed_block: &SignedBeaconBlock,
+    parent_root: Root,
+    rules: ForkRules,
+) -> Result<Option<PayloadStatus>> {
+    match rules {
+        ForkRules::Gloas => {
+            let parent_status = get_parent_payload_status(store, signed_block)?;
+            if parent_status == PayloadStatus::Full {
+                verify(
+                    is_payload_verified(store, parent_root),
+                    "is_payload_verified(store, block.parent_root)",
+                )?;
+            }
+            Ok(Some(parent_status))
+        }
+        ForkRules::PreGloas => Ok(None),
+    }
+}
+
 /// The checks [`on_block`] makes between finding the parent's post-state and
 /// the data-availability check: the block is not from the future, it is later
 /// than the finalized epoch's first slot, and its parent descends from the
@@ -5436,20 +5466,22 @@ fn check_timely_and_on_the_finalized_chain(
 /// on its own lookup and reports it there.
 ///
 /// Also `None` for a block `on_block` would refuse before its own transition:
-/// one that already has a post-state, one from the future, one at or before
-/// the finalized epoch's first slot, or one whose parent does not descend from
-/// the finalized checkpoint (see [`check_timely_and_on_the_finalized_chain`],
-/// which both run). A block arriving over req/resp carries no gossip-checked
+/// one that already has a post-state, a gloas block whose parent's full
+/// payload is not verified (see [`check_parent_payload`]), one from the
+/// future, one at or before the finalized epoch's first slot, or one whose
+/// parent does not descend from the finalized checkpoint (see
+/// [`check_timely_and_on_the_finalized_chain`]); both functions are the ones
+/// `on_block` runs. A block arriving over req/resp carries no gossip-checked
 /// signature, and the transition checks it only after advancing the parent's
 /// state to the block's slot, so without this a block `on_block` rejects for
-/// free could make the actor run that advance first. Two of `on_block`'s
-/// guards are left to the caller, since neither can fire for a block the actor
+/// free could make the actor run that advance first. One of `on_block`'s
+/// guards is left to the caller, since it cannot fire for a block the actor
 /// speculates on: data availability, which `process_block` checks before it
-/// asks the execution client, and gloas's parent-payload check, since a gloas
-/// block carries no payload to ask about. An error the store reports for the
-/// known-root, parent-state or `LiveChain` read is `None` too, for the reason
-/// above. The finalized checkpoint and the store's clock are read the way the
-/// import path already reads them before it gets here
+/// gets here. An error the store reports for the known-root, parent-state or
+/// `LiveChain` read is `None` too, for the reason above; the gloas check's
+/// parent-block read panics on one, as the same read in `on_block` does,
+/// which runs next. The finalized checkpoint and the store's clock are
+/// read the way the import path already reads them before it gets here
 /// (`process_or_pend_block`, `process_block`), so this adds no panic that path
 /// lacks.
 ///
@@ -5468,6 +5500,8 @@ pub fn speculate_transition(
         return None;
     }
     let parent_state = store.get_state(&parent_root).ok().flatten()?;
+    let rules = ForkRules::of(signed_block.fork_name());
+    check_parent_payload(store, signed_block, parent_root, rules).ok()?;
     let index = store.get_live_chain().ok()?;
     check_timely_and_on_the_finalized_chain(store, signed_block, parent_root, config, &index)
         .ok()?;
@@ -5613,19 +5647,7 @@ pub fn on_block_speculative(
     // (recorded once the block is stored, below) rather than decoded again on
     // every head computation.
     let rules = ForkRules::of(signed_block.fork_name());
-    let parent_status = match rules {
-        ForkRules::Gloas => {
-            let parent_status = get_parent_payload_status(store, &signed_block)?;
-            if parent_status == PayloadStatus::Full {
-                verify(
-                    is_payload_verified(store, parent_root),
-                    "is_payload_verified(store, block.parent_root)",
-                )?;
-            }
-            Some(parent_status)
-        }
-        ForkRules::PreGloas => None,
-    };
+    let parent_status = check_parent_payload(store, &signed_block, parent_root, rules)?;
     let payload_link = rules.payload_link(parent_status);
 
     // `mut`, and kept alive for the rest of this function: the finalized-chain
