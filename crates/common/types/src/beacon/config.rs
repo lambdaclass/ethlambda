@@ -2143,18 +2143,25 @@ mod tests {
     fn the_min_transaction_gas_row_round_trips() {
         let value = MinTransactionGas(21_000);
         assert_eq!(value.to_row_ssz(), 21_000u64.to_le_bytes());
-        assert_eq!(MinTransactionGas::from_row_ssz(&value.to_row_ssz()), Ok(value));
+        assert_eq!(
+            MinTransactionGas::from_row_ssz(&value.to_row_ssz()),
+            Ok(value)
+        );
         assert!(MinTransactionGas::from_row_ssz(&[0]).is_err());
     }
 
-    /// Quoted on the way out, as the Beacon API writes integers; quoted or
-    /// bare on the way in, as a `config.yaml` and a node's spec give it.
+    /// Quoted on the way out, as the Beacon API writes integers. On the way
+    /// in, quoted in a node's spec (JSON), and quoted or bare in a
+    /// `config.yaml`: `quoted_or_bare` reads a string, which YAML gives for a
+    /// bare scalar too and JSON does not.
     #[test]
     fn min_transaction_gas_serializes_as_a_quoted_number() {
         let json = serde_json::to_value(Config::mainnet()).expect("serializes");
         assert_eq!(json["MIN_TRANSACTION_GAS"], serde_json::json!("4096"));
+        let parsed: MinTransactionGas = serde_json::from_str("\"21000\"").expect("parses");
+        assert_eq!(parsed, 21_000u64);
         for text in ["\"21000\"", "21000"] {
-            let parsed: MinTransactionGas = serde_json::from_str(text).expect("parses");
+            let parsed: MinTransactionGas = serde_yaml_ng::from_str(text).expect("parses");
             assert_eq!(parsed, 21_000u64);
         }
         assert_eq!(format!("{:?}", MinTransactionGas(21_000)), "21000");
