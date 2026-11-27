@@ -92,6 +92,29 @@ pub fn subnets_of(duty: &SyncDutyDto) -> BTreeSet<u64> {
         .collect()
 }
 
+/// Every seat `duties` hold at `slot`: one (validator, key, subnet) for each
+/// subnet of each duty ([`subnets_of`]). What the contribution step decides
+/// for and, in distributed mode, what is exchanged with the middleware ahead
+/// of it ([`crate::distributed`]): read from one place, so the exchange
+/// cannot come to cover other seats than the step reads. A duty whose pubkey
+/// cannot be read holds none, and is reported.
+pub fn seats_of(slot: Slot, duties: &[SyncDutyDto]) -> Vec<(ValidatorIndex, BlsPubkey, u64)> {
+    let mut seats = Vec::new();
+    for duty in duties {
+        let pubkey = match parse_pubkey(&duty.pubkey) {
+            Ok(pubkey) => pubkey,
+            Err(err) => {
+                error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
+                continue;
+            }
+        };
+        for subnet in subnets_of(duty) {
+            seats.push((duty.validator_index, pubkey, subnet));
+        }
+    }
+    seats
+}
+
 pub struct SyncCommitteeService<B> {
     beacon_node: Arc<B>,
     context: Arc<SigningContext>,
@@ -235,19 +258,7 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         // and each within the signing budget. With distributed mode on, the
         // combined proofs fetched at the start of the slot instead, and a
         // pair with none is not selected (see `crate::distributed`).
-        let mut seats = Vec::new();
-        for duty in duties {
-            let pubkey = match parse_pubkey(&duty.pubkey) {
-                Ok(pubkey) => pubkey,
-                Err(err) => {
-                    error!(%slot, validator = duty.validator_index, %err, "Duty carried an unreadable pubkey");
-                    continue;
-                }
-            };
-            for subnet in subnets_of(duty) {
-                seats.push((duty.validator_index, pubkey, subnet));
-            }
-        }
+        let seats = seats_of(slot, duties);
         let proofs = sign_all(seats.iter().map(|(_, pubkey, subnet)| {
             (
                 *pubkey,

@@ -88,7 +88,7 @@ use crate::keys::ValidatorStore;
 use crate::signing::{SigningContext, sign_all, sign_all_within};
 use crate::slot_clock::SlotClock;
 use crate::subscriptions::{self, SUBSCRIPTION_SIGNING_BUDGET};
-use crate::sync_committee::subnets_of;
+use crate::sync_committee::seats_of;
 
 /// The selection proof exchanges of a client running with `--distributed`.
 pub struct Distributed<B> {
@@ -651,23 +651,16 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
         budget: Duration,
     ) -> usize {
         let deadline = tokio::time::Instant::now() + budget;
-        let mut seats = Vec::new();
-        for duty in duties {
-            let Ok(pubkey) = parse_pubkey(&duty.pubkey) else {
-                continue;
-            };
-            for subnet in subnets_of(duty) {
-                seats.push((duty.validator_index, pubkey, subnet));
-            }
-        }
-        let exchanges = seats
-            .into_iter()
-            .map(|(validator, pubkey, subnet)| async move {
-                let seat = self.exchange_seat(slot, validator, pubkey, subnet, store);
-                tokio::time::timeout_at(deadline, seat)
-                    .await
-                    .unwrap_or(Seat::Late)
-            });
+        // The seats the contribution step reads, from where it reads them.
+        let exchanges =
+            seats_of(slot, duties)
+                .into_iter()
+                .map(|(validator, pubkey, subnet)| async move {
+                    let seat = self.exchange_seat(slot, validator, pubkey, subnet, store);
+                    tokio::time::timeout_at(deadline, seat)
+                        .await
+                        .unwrap_or(Seat::Late)
+                });
 
         let (mut combined, mut uncombined, mut late) = (0, 0, 0);
         let mut refused = Vec::new();
