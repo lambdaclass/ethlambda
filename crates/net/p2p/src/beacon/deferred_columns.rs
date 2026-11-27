@@ -43,7 +43,9 @@
 //! sidecar's: the first pass runs on it directly, and a recheck counts only
 //! when the sidecar the chain actor parked is equal to it, since the actor
 //! parks the first copy of each key it is given, which may be another
-//! source's.
+//! source's. Each check names the held verdict it was run for by its gossip
+//! message, so a verdict that comes back after that one expired leaves
+//! another copy now held under the key alone.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -52,6 +54,7 @@ use ethlambda_state_transition::beacon::gossip::Outcome;
 use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::beacon::preset::NUMBER_OF_COLUMNS;
 use ethlambda_types::beacon::primitives::Root;
+use libp2p::gossipsub::MessageId;
 use spawned_concurrency::tasks::Context;
 use tracing::{debug, warn};
 
@@ -63,6 +66,10 @@ use crate::{MESSAGE_CACHE_WINDOW, P2PServer, p2p_protocol};
 /// supernode sees queued within one [`MESSAGE_CACHE_WINDOW`]. A sidecar that
 /// finds it full is reported at once, as before.
 const CAPACITY: usize = 4 * NUMBER_OF_COLUMNS;
+
+/// Per column index, the held verdict (by its gossip message) a check was run
+/// for, and so the only one its verdict may settle.
+pub(crate) type Decides = Vec<(u64, MessageId)>;
 
 /// One held verdict.
 struct Held {
@@ -121,6 +128,20 @@ impl DeferredColumns {
         self.held.remove(key)
     }
 
+    /// The message whose verdict is held for `key`.
+    fn held_id(&self, key: &(Root, u64)) -> Option<MessageId> {
+        self.held.get(key).map(|held| held.id.message_id.clone())
+    }
+
+    /// [`Self::take`], only while the verdict held for `key` is still
+    /// `message_id`'s.
+    fn take_held(&mut self, key: &(Root, u64), message_id: &MessageId) -> Option<Held> {
+        if self.held.get(key)?.id.message_id != *message_id {
+            return None;
+        }
+        self.held.remove(key)
+    }
+
     /// Take every verdict held for [`MESSAGE_CACHE_WINDOW`] or longer.
     fn take_expired(&mut self, now: Instant) -> Vec<Held> {
         let expired: Vec<(Root, u64)> = self
@@ -155,12 +176,13 @@ pub(crate) fn defer(
 ) -> Option<(GossipId, Box<DataColumnSidecar>)> {
     let now = Instant::now();
     report_expired(server, now);
-    let received_at = id.received_at;
+    let (received_at, message_id) = (id.received_at, id.message_id.clone());
     if let Some(id) = server.deferred_columns.hold(id, queued, &sidecar) {
         return Some((id, sidecar));
     }
     let arrival = ColumnArrival::received("gossip", received_at);
-    check(server, ctx, vec![*sidecar], arrival);
+    let decides = vec![(sidecar.index(), message_id)];
+    check(server, ctx, vec![*sidecar], arrival, decides);
     None
 }
 
@@ -175,14 +197,19 @@ pub(crate) fn recheck(
     if server.deferred_columns.len() == 0 {
         return column_checks::check_and_forward(server, sidecars, ColumnArrival::Recheck);
     }
-    let mut awaited: HashMap<Root, Vec<DataColumnSidecar>> = HashMap::new();
+    // Per block: the sidecars a held verdict waits on, and those verdicts.
+    let mut awaited: HashMap<Root, (Vec<DataColumnSidecar>, Decides)> = HashMap::new();
     let mut rest = Vec::new();
     for sidecar in sidecars {
         match server.deferred_columns.holds(&sidecar) {
-            Some(true) => awaited
-                .entry(sidecar.block_root())
-                .or_default()
-                .push(sidecar),
+            Some(true) => {
+                let key = (sidecar.block_root(), sidecar.index());
+                let (group, decides) = awaited.entry(key.0).or_default();
+                if let Some(message_id) = server.deferred_columns.held_id(&key) {
+                    decides.push((key.1, message_id));
+                }
+                group.push(sidecar);
+            }
             Some(false) => {
                 // The actor parked another copy of this key, so the held one
                 // is never judged: its queue verdict stands.
@@ -199,19 +226,21 @@ pub(crate) fn recheck(
     if !rest.is_empty() {
         column_checks::check_and_forward(server, rest, ColumnArrival::Recheck);
     }
-    for (_, group) in awaited {
-        check(server, ctx, group, ColumnArrival::Recheck);
+    for (_, (group, decides)) in awaited {
+        check(server, ctx, group, ColumnArrival::Recheck, decides);
     }
 }
 
 /// [`column_checks::check_and_forward_then`] on `sidecars`, all of one block,
 /// with a callback that sends their verdicts back to the p2p actor to
-/// [`settle`].
+/// [`settle`]. `decides` names, per column, the held verdict (by its gossip
+/// message) these checks are run for.
 fn check(
     server: &P2PServer,
     ctx: &Context<P2PServer>,
     sidecars: Vec<DataColumnSidecar>,
     arrival: ColumnArrival,
+    decides: Decides,
 ) {
     let Some(block_root) = sidecars.first().map(DataColumnSidecar::block_root) else {
         return;
@@ -221,6 +250,7 @@ fn check(
         let message = p2p_protocol::DeferredColumnsChecked {
             block_root,
             verdicts,
+            decides,
         };
         let _ = back
             .send(message)
@@ -232,16 +262,27 @@ fn check(
 /// Report the held verdicts of `block_root`'s columns that `verdicts` decide.
 /// A parked sidecar decides nothing yet: the recheck once its block imports
 /// does.
+///
+/// A verdict settles only the held verdict its checks were run for
+/// (`decides`, from [`check`]). That one may have expired while they ran, and
+/// its key then gone to another copy whose own checks have not decided yet:
+/// a verdict on one copy's bytes says nothing of another's, so that copy
+/// stays held.
 pub(crate) fn settle(
     server: &mut P2PServer,
     block_root: Root,
     verdicts: Vec<(u64, ColumnVerdict)>,
+    decides: Decides,
 ) {
     for (index, verdict) in verdicts {
         if verdict == ColumnVerdict::Parked {
             continue;
         }
-        let Some(held) = server.deferred_columns.take(&(block_root, index)) else {
+        let Some((_, message_id)) = decides.iter().find(|(decided, _)| *decided == index) else {
+            continue;
+        };
+        let key = (block_root, index);
+        let Some(held) = server.deferred_columns.take_held(&key, message_id) else {
             continue;
         };
         let outcome = match verdict {
@@ -431,6 +472,9 @@ mod tests {
                 (2, ColumnVerdict::Unjudged),
                 (3, ColumnVerdict::Parked),
             ],
+            (0..4u64)
+                .map(|index| (index, MessageId::new(&[index as u8])))
+                .collect(),
         );
 
         assert!(matches!(
@@ -460,12 +504,45 @@ mod tests {
         assert!(held.is_none());
         assert!(server.seen_block_columns.record(root, 0));
 
-        settle(&mut server, root, vec![(0, ColumnVerdict::Delivered)]);
+        let decides = vec![(0, MessageId::new(&[0]))];
+        settle(
+            &mut server,
+            root,
+            vec![(0, ColumnVerdict::Delivered)],
+            decides,
+        );
 
         assert!(matches!(
             reported(&mut commands).as_slice(),
             [MessageAcceptance::Ignore]
         ));
+    }
+
+    /// A verdict settles only the copy its checks ran on. That copy's hold
+    /// expired meanwhile and the key is now held for another copy, whose own
+    /// checks have not decided: it stays held, unreported and unrecorded.
+    #[tokio::test]
+    async fn a_verdict_on_an_expired_copy_leaves_the_next_copy_held() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let (swarm_handle, mut commands) = SwarmHandle::capturing();
+        server.swarm_handle = swarm_handle;
+        let root = Root::repeat_byte(1);
+        let held = server
+            .deferred_columns
+            .hold(id(2, Instant::now()), QUEUED, &sidecar(1, 0));
+        assert!(held.is_none());
+
+        let expired_copy = vec![(0, MessageId::new(&[1]))];
+        settle(
+            &mut server,
+            root,
+            vec![(0, ColumnVerdict::Delivered)],
+            expired_copy,
+        );
+
+        assert!(reported(&mut commands).is_empty());
+        assert_eq!(server.deferred_columns.len(), 1);
+        assert!(!server.seen_block_columns.contains(root, 0));
     }
 
     /// The execution-layer path published and stored these very bytes, which
@@ -484,7 +561,13 @@ mod tests {
         assert!(held.is_none());
 
         let stored = ColumnVerdict::Dropped(Outcome::Ignore(IgnoreReason::AlreadyStored));
-        settle(&mut server, Root::repeat_byte(1), vec![(0, stored)]);
+        let decides = vec![(0, MessageId::new(&[9]))];
+        settle(
+            &mut server,
+            Root::repeat_byte(1),
+            vec![(0, stored)],
+            decides,
+        );
 
         assert!(matches!(
             reported(&mut commands).as_slice(),
@@ -504,7 +587,13 @@ mod tests {
         assert!(held.is_none());
 
         let stored = ColumnVerdict::Dropped(Outcome::Ignore(IgnoreReason::AlreadyStored));
-        settle(&mut server, Root::repeat_byte(1), vec![(0, stored)]);
+        let decides = vec![(0, MessageId::new(&[0]))];
+        settle(
+            &mut server,
+            Root::repeat_byte(1),
+            vec![(0, stored)],
+            decides,
+        );
 
         assert!(matches!(
             reported(&mut commands).as_slice(),

@@ -2034,12 +2034,14 @@ pub(crate) trait P2PProtocol: Send + Sync {
     #[allow(dead_code)] // sent by the column checks' completion callback
     fn column_answer_checked(&self, report: ColumnReport) -> Result<(), ActorError>;
     /// A gloas gossip sidecar whose verdict is held has been through the
-    /// chain checks: report what they decided. See [`beacon::deferred_columns`].
+    /// chain checks: report what they decided for the held verdicts they were
+    /// run for (`decides`, by gossip message). See [`beacon::deferred_columns`].
     #[allow(dead_code)] // sent by the column checks' completion callback
     fn deferred_columns_checked(
         &self,
         block_root: H256,
         verdicts: Vec<(u64, beacon::column_checks::ColumnVerdict)>,
+        decides: beacon::deferred_columns::Decides,
     ) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_envelope_fetch(&self, block_root: H256) -> Result<(), ActorError>;
@@ -2145,7 +2147,7 @@ impl P2PServer {
         msg: p2p_protocol::DeferredColumnsChecked,
         _ctx: &Context<Self>,
     ) {
-        beacon::deferred_columns::settle(self, msg.block_root, msg.verdicts);
+        beacon::deferred_columns::settle(self, msg.block_root, msg.verdicts, msg.decides);
     }
 
     #[send_handler]
