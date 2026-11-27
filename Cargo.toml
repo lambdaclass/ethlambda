@@ -92,8 +92,13 @@ hex = "0.4"
 hmac = "0.12"
 base64 = "0.22"
 
-spawned-concurrency = "0.5.0"
-spawned-rt = "0.5.0"
+# Spawned 0.8.0: deferred replies, OTP lifecycle and deterministic runtime adapters.
+# Keep these direct dependencies on the same release to share actor types.
+# `metrics`: the actor runtime's own counters (mailbox depth, queue wait,
+# handler time, actor exits), appended to `/metrics` by ethlambda-rpc.
+spawned-concurrency = { version = "0.8.0", features = ["metrics"] }
+spawned-rt = { version = "0.8.0" }
+spawned-test = { version = "0.8.0" }
 tokio = "1.0"
 tokio-util = "0.7"
 

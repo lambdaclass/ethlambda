@@ -2,19 +2,18 @@
 //!
 //! The rules live in `ethlambda_state_transition::beacon::gossip`; this module
 //! decides where each half runs and what happens to the result. Cheap checks
-//! run inline in the p2p actor. Stateful checks run on a `spawn_blocking`
-//! thread, bounded by one of three pools depending on the kind: a block or a
+//! run inline in the p2p actor. Stateful checks run off it as a job owned by
+//! the actor, bounded by one of three pools depending on the kind: a block or a
 //! column draws from [`P2PServer::gossip_validation_permits`], an aggregate or
 //! a subnet attestation from [`P2PServer::attestation_validation_permits`] (see
 //! that field's own documentation for why they must not share one), a sync
 //! committee message or contribution from
 //! [`P2PServer::sync_validation_permits`]. Either way
-//! the blocking task sends a [`GossipVerdict`] back to the actor. Every beacon
+//! the job delivers one [`GossipVerdict`] back to the actor. Every beacon
 //! gossip message ends in exactly one [`report`]: gossipsub holds each one
 //! until then.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ethlambda_network_api::{
     AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource, GossipEvent,
@@ -39,7 +38,10 @@ use ethlambda_types::beacon::primitives::{Root, ValidatorIndex};
 use libp2p::PeerId;
 use libp2p::gossipsub::{MessageAcceptance, MessageId};
 use spawned_concurrency::message::Message;
-use spawned_concurrency::tasks::{Context, Handler};
+use spawned_concurrency::send_handler;
+use spawned_concurrency::tasks::{
+    BlockingJobPermit, Context, Handler, JobError, JobOptions, JobOutcome,
+};
 use tracing::{debug, error, warn};
 
 use crate::beacon::column_checks;
@@ -173,6 +175,24 @@ impl Validated {
             Self::SyncContribution(signed) => {
                 gossip::sync_committee::contribution_stateful_checks(store, signed)
             }
+        }
+    }
+
+    /// A copy of this object to send on if its stateful checks overrun
+    /// [`STATEFUL_CHECK_DEADLINE`], when the object itself is still inside the
+    /// running check. Only a column gets one: [`Self::forward`] sends a
+    /// column on without a verdict, through [`column_checks`], exactly as it
+    /// does on `Ignore(Overloaded)`. Every other kind is dropped on an
+    /// `Ignore` (a block too, since its signature may not have been checked),
+    /// so a copy would be dropped unused.
+    ///
+    /// Taken for every column, since a deadline cannot be known in advance. A
+    /// column is a few tens of kilobytes, which is small next to the KZG
+    /// checks the copy waits on.
+    fn unjudged_copy(&self) -> Option<Self> {
+        match self {
+            Self::Column(sidecar) => Some(Self::Column(sidecar.clone())),
+            _ => None,
         }
     }
 
@@ -600,11 +620,16 @@ pub(crate) enum Dispatch {
     Validate(Validated),
 }
 
-/// A blocking task's verdict, sent back to the p2p actor.
+/// A stateful check's job ended: the terminal message of the job
+/// [`spawn_stateful_checks`] starts, so it arrives exactly once per object,
+/// whether the check returned, panicked or overran
+/// [`STATEFUL_CHECK_DEADLINE`].
 pub(crate) struct GossipVerdict {
     id: GossipId,
-    outcome: Outcome,
-    object: Validated,
+    checked: JobOutcome<(Outcome, Validated)>,
+    /// What goes on when the check overran its deadline, the object itself
+    /// being still inside it: [`Validated::unjudged_copy`].
+    unjudged: Option<Validated>,
 }
 
 impl Message for GossipVerdict {
@@ -645,17 +670,62 @@ pub(crate) fn settle_message(
     settle(server, outcome, object)
 }
 
+#[send_handler]
 impl Handler<GossipVerdict> for P2PServer {
     async fn handle(&mut self, msg: GossipVerdict, _ctx: &Context<Self>) {
         let GossipVerdict {
             id,
-            outcome,
-            object,
+            checked,
+            unjudged,
         } = msg;
-        let outcome = settle_message(self, &id.message_id, outcome, &object);
         let received_at = id.received_at;
-        if report(self, id, outcome) {
-            object.forward(self, received_at, outcome);
+        match checked {
+            Ok((outcome, object)) => {
+                let outcome = settle_message(self, &id.message_id, outcome, &object);
+                // Only an Accept or a Queue forwards from here.
+                if report(self, id, outcome) {
+                    object.forward(self, received_at, outcome);
+                }
+            }
+            // The check still runs, holding its permit; its result will be
+            // dropped. Its object goes on as it would on `Overloaded` (see
+            // `report_overloaded`): a column through the copy taken for
+            // this, which `forward` sends through `column_checks`, so a slow
+            // check of a valid column does not leave the chain actor to learn
+            // of it through a by-root fetch. A block is dropped, as there.
+            Err(JobError::DeadlineExceeded) => {
+                warn!(
+                    kind = id.kind,
+                    deadline_secs = STATEFUL_CHECK_DEADLINE.as_secs(),
+                    forwarded = unjudged.is_some(),
+                    "Beacon gossip validation overran its deadline; reporting Ignore"
+                );
+                let outcome = Outcome::Ignore(IgnoreReason::ValidationTimeout);
+                report(self, id, outcome);
+                if let Some(object) = unjudged {
+                    object.forward(self, received_at, outcome);
+                }
+            }
+            // A panic inside validation (a `Store` read's `.expect()` on a DB
+            // error, say) must still produce a verdict, or gossipsub would hold
+            // the message until its cache evicts it. Nothing goes on: the
+            // check failed rather than ran out of time.
+            Err(JobError::Panicked(panic_message)) => {
+                error!(
+                    panic_message,
+                    "Beacon gossip validation panicked; reporting Ignore(Internal)"
+                );
+                report(self, id, Outcome::Ignore(IgnoreReason::Internal));
+            }
+            // `JobError` is `#[non_exhaustive]`: a way of
+            // ending spawned adds later still yields the one verdict.
+            _ => {
+                error!(
+                    kind = id.kind,
+                    "Beacon gossip validation ended without a result; reporting Ignore(Internal)"
+                );
+                report(self, id, Outcome::Ignore(IgnoreReason::Internal));
+            }
         }
     }
 }
@@ -723,8 +793,18 @@ fn pool_of(object: &Validated) -> &'static str {
     }
 }
 
-/// Run `object`'s stateful checks on a blocking thread. The verdict comes back
-/// to the actor as a [`GossipVerdict`].
+/// How long an object's stateful checks may run before it is reported
+/// `Ignore(ValidationTimeout)` anyway. One mainnet slot: a check that has not
+/// finished by then is hung, and gossipsub would otherwise hold its message
+/// until the cache evicts it. Past it the check's own result is dropped, but
+/// a column still goes on, as on `Ignore(Overloaded)` (see
+/// [`Validated::unjudged_copy`]); a block is dropped, as on that outcome.
+pub(crate) const STATEFUL_CHECK_DEADLINE: Duration = Duration::from_secs(12);
+
+/// Run `object`'s stateful checks off the actor, as a job owned by the p2p
+/// actor. The verdict comes back as one [`GossipVerdict`], also when the check
+/// panics or overruns [`STATEFUL_CHECK_DEADLINE`], and never after the actor
+/// began to stop (the job is cancelled with it).
 ///
 /// A block or a column draws its permit from
 /// [`P2PServer::gossip_validation_permits`]; an aggregate or a subnet
@@ -742,7 +822,14 @@ fn pool_of(object: &Validated) -> &'static str {
 /// every such block off the chain actor. None was measured overloaded on the
 /// mainnet followers over the 24 hours before this changed. An aggregate or a
 /// subnet attestation is not forwarded on this outcome either: see
-/// [`Validated::forward`]'s own documentation for why.
+/// [`Validated::forward`]'s own documentation for why. A check that overruns
+/// [`STATEFUL_CHECK_DEADLINE`] is treated the same way, with
+/// `Ignore(ValidationTimeout)`.
+///
+/// The check runs as a blocking job (`pipe_blocking`, on Tokio's blocking
+/// pool). The p2p actor's native-job budget is
+/// [`STATEFUL_CHECK_PERMITS`](crate::STATEFUL_CHECK_PERMITS), the
+/// sum of these pools, so the pools stay the only bound.
 pub(crate) fn spawn_stateful_checks(
     server: &P2PServer,
     ctx: &Context<P2PServer>,
@@ -752,70 +839,114 @@ pub(crate) fn spawn_stateful_checks(
     let pool = pool_of(&object);
     let Ok(permit) = permits_for(server, &object).clone().try_acquire_owned() else {
         metrics::inc_validation_permit_exhausted(pool);
-        let received_at = id.received_at;
-        let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
-        report(server, id, outcome);
-        object.forward(server, received_at, outcome);
+        report_overloaded(server, id, object);
         return;
     };
+    // Reserve the job before `id` and `object` move into it, so a refusal
+    // still has them for its one verdict.
+    let job = match ctx.reserve_blocking_job(checks_options(STATEFUL_CHECK_DEADLINE)) {
+        Ok(job) => job,
+        Err(err) => {
+            // Only when the actor is stopping (`OwnerStopping`), or at its
+            // 1024 deferred credits, far above the 352 permits.
+            warn!(%err, "Could not start a gossip check");
+            report_overloaded(server, id, object);
+            return;
+        }
+    };
     let store = server.store.clone();
-    let actor = ctx.actor_ref();
     let in_use = metrics::PoolInUse::new(pool);
     let task = metrics::BlockingTask::new(id.kind);
-    tokio::task::spawn_blocking(move || {
+    let unjudged = object.unjudged_copy();
+    pipe_checks(job, id, unjudged, move || {
         let _permit = permit;
         let _in_use = in_use;
         let _run = task.start();
         let mut object = object;
-        let outcome = guarded(|| object.stateful_checks(&store));
-        let _ = actor
-            .send(GossipVerdict {
-                id,
-                outcome,
-                object,
-            })
-            .inspect_err(|_| warn!("P2P actor stopped before a gossip verdict arrived"));
+        let outcome = object.stateful_checks(&store);
+        (outcome, object)
     });
 }
 
-/// `checks()`, with a panic turned into `Ignore(Internal)`.
-///
-/// A panic inside validation (a `Store` read's `.expect()` on a DB error, say)
-/// must still produce a verdict, or gossipsub would hold the message until its
-/// cache evicts it. The blocking thread's permit is unaffected either way: it
-/// drops on unwind exactly as it would on a normal return.
-pub(crate) fn guarded(checks: impl FnOnce() -> Outcome) -> Outcome {
-    catch_unwind(AssertUnwindSafe(checks)).unwrap_or_else(|payload| {
-        let panic_message = payload
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("<non-string panic payload>");
-        error!(
-            panic_message,
-            "Beacon gossip validation panicked; reporting Ignore(Internal)"
-        );
-        Outcome::Ignore(IgnoreReason::Internal)
-    })
+/// Report `object` `Ignore(Overloaded)` without checking it, and send it on
+/// as that outcome allows (see [`spawn_stateful_checks`]).
+fn report_overloaded(server: &P2PServer, id: GossipId, object: Validated) {
+    let received_at = id.received_at;
+    let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
+    report(server, id, outcome);
+    object.forward(server, received_at, outcome);
+}
+
+/// The options a stateful check is reserved with: its `deadline`, counted
+/// from the reservation, which the check starts right after.
+fn checks_options(deadline: Duration) -> JobOptions {
+    JobOptions::new().deadline(deadline)
+}
+
+/// Run `checks` as the reserved blocking `job` (reserved with
+/// [`checks_options`]) and deliver its one [`GossipVerdict`] (also on a
+/// panic, as `JobError::Panicked`). `unjudged` is what goes on if the job
+/// overruns its deadline ([`Validated::unjudged_copy`]); it is dropped
+/// otherwise.
+fn pipe_checks(
+    job: BlockingJobPermit<P2PServer>,
+    id: GossipId,
+    unjudged: Option<Validated>,
+    checks: impl FnOnce() -> (Outcome, Validated) + Send + 'static,
+) {
+    job.pipe_blocking(
+        move |_job| checks(),
+        move |checked| {
+            // Only a missed deadline leaves no object to send on: drop the
+            // copy here otherwise, rather than carry it through the mailbox.
+            let unjudged = unjudged.filter(|_| matches!(checked, Err(JobError::DeadlineExceeded)));
+            GossipVerdict {
+                id,
+                checked,
+                unjudged,
+            }
+        },
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use ethlambda_network_api::P2PToBlockChain;
+    use ethlambda_network_api::ToP2PToBlockChainRef as _;
+    use ethlambda_network_api::p2p_to_block_chain::{
+        NewBlock, NewExecutionPayloadEnvelope, NewPayloadAttestationMessage, NewProposerPreferences,
+    };
     use ethlambda_state_transition::beacon::gossip::{QueueReason, RejectReason};
-    use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::{
         AttestationData, Checkpoint, electra, gloas, phase0,
     };
-    use spawned_concurrency::error::ActorError;
+    use spawned_test::tasks::{Mock, MockRef, in_actor};
 
     use super::*;
-    use crate::test_support::{
-        RecordingChain, envelope, unconnected_beacon_server, valid_shaped_sidecar,
-    };
+    use crate::test_support::{envelope, unconnected_beacon_server, valid_shaped_sidecar};
+
+    /// A chain actor stand-in that takes every send and logs it.
+    fn recording_chain(server: &mut P2PServer) -> MockRef {
+        let chain = Mock::new().allow_sends().start();
+        server.blockchain = Some(chain.to_p2p_to_block_chain_ref());
+        chain
+    }
+
+    /// A chain actor stand-in that fails the test on any message at all.
+    fn silent_chain(server: &mut P2PServer) -> MockRef {
+        let chain = Mock::new().start();
+        server.blockchain = Some(chain.to_p2p_to_block_chain_ref());
+        chain
+    }
+
+    /// Assert the chain actor was sent nothing. `forward` sends synchronously,
+    /// so once the mock has handled what was sent before, the log is complete.
+    async fn assert_nothing_sent(chain: &MockRef) {
+        chain.settle().await;
+        assert_eq!(chain.received(), []);
+    }
 
     /// A minimal fulu block for a given `(slot, proposer)`: `settle` and
     /// `record_seen` only ever read those two fields plus the root passed
@@ -1027,8 +1158,7 @@ mod tests {
     #[tokio::test]
     async fn only_an_accepted_gossip_block_is_announced() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let chain = Arc::new(RecordingChain::default());
-        server.blockchain = Some(chain.clone());
+        let chain = recording_chain(&mut server);
         let block = || Validated::Block {
             block: Box::new(fulu_block(5, 1)),
             block_root: Root::repeat_byte(1),
@@ -1046,17 +1176,23 @@ mod tests {
             Outcome::Ignore(IgnoreReason::Overloaded),
         );
 
+        chain.settle().await;
+        let announcements: Vec<_> = chain
+            .take_all::<NewBlock>()
+            .into_iter()
+            .map(|sent| sent.announcement)
+            .collect();
         assert_eq!(
-            *chain.announcements.lock().unwrap(),
+            announcements,
             [BlockAnnouncement::Announce, BlockAnnouncement::Silent]
         );
+        chain.assert_no_unexpected();
     }
 
     #[tokio::test]
     async fn an_overloaded_aggregate_is_not_forwarded() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let chain = Arc::new(RecordingChain::default());
-        server.blockchain = Some(chain.clone());
+        let chain = silent_chain(&mut server);
         let object = Validated::Aggregate {
             aggregate: Box::new(phase0_aggregate(5, 1)),
             attesting_indices: Vec::new(),
@@ -1068,7 +1204,7 @@ mod tests {
             Outcome::Ignore(IgnoreReason::Overloaded),
         );
 
-        assert!(chain.aggregates.lock().unwrap().is_empty());
+        assert_nothing_sent(&chain).await;
     }
 
     /// A block reaches the chain actor only on the outcomes that mean its
@@ -1077,34 +1213,24 @@ mod tests {
     #[tokio::test]
     async fn only_an_accepted_or_queued_block_is_forwarded() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let forwarded = |server: &mut P2PServer, outcome: Outcome| {
-            let chain = Arc::new(RecordingChain::default());
-            server.blockchain = Some(chain.clone());
+        let cases = [
+            (Outcome::Accept, true),
+            (Outcome::Queue(QueueReason::ParentNotReady), true),
+            (Outcome::Ignore(IgnoreReason::Overloaded), false),
+            (Outcome::Ignore(IgnoreReason::SignatureUnverified), false),
+            (Outcome::Reject(RejectReason::BadSignature), false),
+        ];
+        for (outcome, expected) in cases {
+            let chain = recording_chain(&mut server);
             let object = Validated::Block {
                 block: Box::new(fulu_block(5, 1)),
                 block_root: Root::repeat_byte(5),
             };
-            object.forward(server, Instant::now(), outcome);
-            !chain.announcements.lock().unwrap().is_empty()
-        };
-
-        assert!(forwarded(&mut server, Outcome::Accept));
-        assert!(forwarded(
-            &mut server,
-            Outcome::Queue(QueueReason::ParentNotReady)
-        ));
-        assert!(!forwarded(
-            &mut server,
-            Outcome::Ignore(IgnoreReason::Overloaded)
-        ));
-        assert!(!forwarded(
-            &mut server,
-            Outcome::Ignore(IgnoreReason::SignatureUnverified)
-        ));
-        assert!(!forwarded(
-            &mut server,
-            Outcome::Reject(RejectReason::BadSignature)
-        ));
+            object.forward(&server, Instant::now(), outcome);
+            chain.settle().await;
+            let forwarded = !chain.take_all::<NewBlock>().is_empty();
+            assert_eq!(forwarded, expected, "{outcome:?}");
+        }
     }
 
     /// An accepted electra aggregate is what block production packs other
@@ -1247,8 +1373,7 @@ mod tests {
     #[tokio::test]
     async fn a_subnet_attestation_is_never_forwarded_even_on_accept() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let chain = Arc::new(RecordingChain::default());
-        server.blockchain = Some(chain.clone());
+        let chain = silent_chain(&mut server);
         let object = Validated::Attestation {
             attestation: Box::new(electra_attestation(5, 1)),
             subnet_id: 0,
@@ -1256,7 +1381,7 @@ mod tests {
 
         object.forward(&server, Instant::now(), Outcome::Accept);
 
-        assert!(chain.aggregates.lock().unwrap().is_empty());
+        assert_nothing_sent(&chain).await;
     }
 
     /// A sink that keeps what p2p reported, with a switchable audience.
@@ -1310,78 +1435,6 @@ mod tests {
             panic!("expected exactly one single attestation event, got {events:?}");
         };
         assert_eq!(**attestation, electra_attestation(5, 1));
-    }
-
-    /// What `forward` handed the chain actor, by method.
-    #[derive(Debug, PartialEq)]
-    enum Sent {
-        Envelope,
-        PayloadAttestation,
-        ProposerPreferences(u64),
-    }
-
-    /// A chain actor stand-in that reports only the gloas deliveries.
-    struct GloasRecorder(tokio::sync::mpsc::UnboundedSender<Sent>);
-
-    impl P2PToBlockChain for GloasRecorder {
-        fn new_block(
-            &self,
-            _block: SignedBeaconBlock,
-            _source: BlockSource,
-            _arrival: BlockArrival,
-            _announcement: BlockAnnouncement,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_attestation(&self, _attestation: SignedAttestation) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_aggregated_attestation(
-            &self,
-            _attestation: SignedAggregatedAttestation,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_data_column_sidecars(
-            &self,
-            _sidecars: Vec<DataColumnSidecar>,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn data_column_sidecars_awaiting_parent(
-            &self,
-            _sidecars: Vec<DataColumnSidecar>,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_beacon_aggregate(
-            &self,
-            _aggregate: Box<SignedAggregateAndProof>,
-            _attesting_indices: Vec<ValidatorIndex>,
-            _arrival: AggregateArrival,
-        ) -> Result<(), ActorError> {
-            Ok(())
-        }
-        fn new_execution_payload_envelope(
-            &self,
-            _envelope: Box<SignedExecutionPayloadEnvelope>,
-            _arrival: BlockArrival,
-        ) -> Result<(), ActorError> {
-            let _ = self.0.send(Sent::Envelope);
-            Ok(())
-        }
-        fn new_payload_attestation_message(
-            &self,
-            _message: PayloadAttestationMessage,
-            _arrival: BlockArrival,
-        ) -> Result<(), ActorError> {
-            let _ = self.0.send(Sent::PayloadAttestation);
-            Ok(())
-        }
-        fn new_proposer_preferences(&self, proposal_slot: u64) -> Result<(), ActorError> {
-            let _ = self.0.send(Sent::ProposerPreferences(proposal_slot));
-            Ok(())
-        }
     }
 
     pub(crate) fn payload_attestation(slot: u64, validator: u64) -> PayloadAttestationMessage {
@@ -1443,27 +1496,25 @@ mod tests {
     #[tokio::test]
     async fn an_envelope_is_forwarded_on_accept_and_queue_only() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
-        server.blockchain = Some(Arc::new(GloasRecorder(sender)));
+        let chain = recording_chain(&mut server);
 
         let forward = |outcome| {
             Validated::Envelope(Box::new(envelope(1, 3))).forward(&server, Instant::now(), outcome)
         };
         forward(Outcome::Accept);
-        assert_eq!(received.try_recv(), Ok(Sent::Envelope));
         forward(Outcome::Queue(QueueReason::BlockUnknown));
-        assert_eq!(received.try_recv(), Ok(Sent::Envelope));
         forward(Outcome::Ignore(IgnoreReason::Overloaded));
         forward(Outcome::Reject(RejectReason::BadSignature));
-        assert!(received.try_recv().is_err());
+        chain.settle().await;
+        assert_eq!(chain.count::<NewExecutionPayloadEnvelope>(), 2);
+        assert_eq!(chain.received().len(), 2);
     }
 
     /// A payload attestation reaches the chain actor on `Accept` alone.
     #[tokio::test]
     async fn a_payload_attestation_is_forwarded_on_accept_only() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
-        server.blockchain = Some(Arc::new(GloasRecorder(sender)));
+        let chain = recording_chain(&mut server);
 
         let forward = |outcome| {
             Validated::PayloadAttestation(payload_attestation(5, 1)).forward(
@@ -1475,9 +1526,10 @@ mod tests {
         forward(Outcome::Ignore(IgnoreReason::UnknownBlock));
         forward(Outcome::Ignore(IgnoreReason::Overloaded));
         forward(Outcome::Reject(RejectReason::NotInPtc));
-        assert!(received.try_recv().is_err());
         forward(Outcome::Accept);
-        assert_eq!(received.try_recv(), Ok(Sent::PayloadAttestation));
+        chain.settle().await;
+        assert_eq!(chain.count::<NewPayloadAttestationMessage>(), 1);
+        assert_eq!(chain.received().len(), 1);
     }
 
     /// An accepted payload attestation is pooled for block production, with
@@ -1651,8 +1703,7 @@ mod tests {
     #[tokio::test]
     async fn only_accepted_preferences_reach_the_chain_actor_and_only_as_a_slot() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
-        server.blockchain = Some(Arc::new(GloasRecorder(sender)));
+        let chain = recording_chain(&mut server);
 
         for outcome in [
             Outcome::Accept,
@@ -1661,7 +1712,7 @@ mod tests {
         ] {
             bid_object(&server, bid(5, 3, 10)).forward(&server, Instant::now(), outcome);
         }
-        assert!(received.try_recv().is_err());
+        assert_nothing_sent(&chain).await;
 
         for outcome in [
             Outcome::Queue(QueueReason::BlockUnknown),
@@ -1674,13 +1725,18 @@ mod tests {
                 outcome,
             );
         }
-        assert!(received.try_recv().is_err());
+        assert_nothing_sent(&chain).await;
+
         Validated::ProposerPreferences(Box::new(preferences(40, 5))).forward(
             &server,
             Instant::now(),
             Outcome::Accept,
         );
-        assert_eq!(received.try_recv(), Ok(Sent::ProposerPreferences(40)));
+        chain.settle().await;
+        assert_eq!(chain.received().len(), 1);
+        let sent: Vec<NewProposerPreferences> = chain.take_all();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].proposal_slot, 40);
     }
 
     /// Bids and preferences draw from a pool of their own, so a burst of them
@@ -1779,15 +1835,6 @@ mod tests {
             disposition(Outcome::Reject(RejectReason::BadSignature)),
             (MessageAcceptance::Reject, false)
         ));
-    }
-
-    #[test]
-    fn a_panicking_check_is_ignored_rather_than_propagated() {
-        assert_eq!(
-            guarded(|| panic!("a DB read failed")),
-            Outcome::Ignore(IgnoreReason::Internal)
-        );
-        assert_eq!(guarded(|| Outcome::Accept), Outcome::Accept);
     }
 
     /// The compressed BLS12-381 G2 generator: a signature that decodes and
@@ -1966,8 +2013,7 @@ mod tests {
     #[tokio::test]
     async fn sync_committee_gossip_never_reaches_the_chain_actor() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
-        server.blockchain = Some(Arc::new(GloasRecorder(sender)));
+        let chain = silent_chain(&mut server);
         for outcome in [
             Outcome::Accept,
             Outcome::Queue(QueueReason::BlockUnknown),
@@ -1981,7 +2027,7 @@ mod tests {
                 outcome,
             );
         }
-        assert!(received.try_recv().is_err());
+        assert_nothing_sent(&chain).await;
     }
 
     /// The sync pool is its own: exhausting it must not starve the block and
@@ -2022,5 +2068,152 @@ mod tests {
             attestation_before
         );
         drop(held);
+    }
+
+    // ---- The job that carries a stateful check (spawned 0.8 `pipe_blocking`) ----
+
+    /// A gossip id under a metric `kind` of the test's own, so the global
+    /// verdict counters tell its verdicts apart from every other test's.
+    fn test_id(kind: &'static str) -> GossipId {
+        GossipId {
+            message_id: MessageId::new(kind.as_bytes()),
+            propagation_source: PeerId::random(),
+            received_at: Instant::now(),
+            kind,
+        }
+    }
+
+    /// Start `checks` on a running p2p actor under `kind`, with `deadline`
+    /// and `unjudged` as what goes on if it is missed. The actor's chain
+    /// actor is a recording mock, returned with it.
+    async fn run_checks(
+        kind: &'static str,
+        deadline: Duration,
+        unjudged: Option<Validated>,
+        checks: impl FnOnce() -> (Outcome, Validated) + Send + 'static,
+    ) -> (spawned_concurrency::tasks::ActorRef<P2PServer>, MockRef) {
+        use spawned_concurrency::tasks::ActorStart as _;
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let chain = recording_chain(&mut server);
+        let server = server.start();
+        in_actor(&server, move |_, ctx| {
+            let job = ctx
+                .reserve_blocking_job(checks_options(deadline))
+                .expect("the p2p actor runs");
+            pipe_checks(job, test_id(kind), unjudged, checks)
+        })
+        .await;
+        (server, chain)
+    }
+
+    /// Wait (up to 5 s) until `kind` has at least `n` verdicts.
+    async fn verdicts_reach(kind: &'static str, n: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while metrics::beacon_gossip_verdicts(kind, "", "").0 < n {
+            assert!(Instant::now() < deadline, "{kind}: fewer than {n} verdicts");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_check_still_yields_exactly_one_verdict() {
+        const KIND: &str = "test_panicking_check";
+        let (server, _chain) = run_checks(KIND, Duration::from_secs(5), None, || {
+            panic!("a DB read failed")
+        })
+        .await;
+        verdicts_reach(KIND, 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            metrics::beacon_gossip_verdicts(KIND, "ignore", "internal"),
+            (1, 1)
+        );
+        server.child_handle().stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_check_is_reported_at_its_deadline_and_its_late_result_dropped() {
+        const KIND: &str = "test_hung_check";
+        let (server, chain) = run_checks(KIND, Duration::from_millis(50), None, || {
+            std::thread::sleep(Duration::from_millis(500));
+            (Outcome::Accept, sync_message_object(5, 11, 1, vec![(1, 0)]))
+        })
+        .await;
+        verdicts_reach(KIND, 1).await;
+        assert_eq!(
+            metrics::beacon_gossip_verdicts(KIND, "ignore", "validation_timeout"),
+            (1, 1)
+        );
+        // The check returns Accept long after: no second verdict.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(metrics::beacon_gossip_verdicts(KIND, "", "").0, 1);
+        assert_nothing_sent(&chain).await;
+        server.child_handle().stop();
+    }
+
+    /// A block whose check overruns its deadline never reaches the chain
+    /// actor, as an overloaded one does not: its signature may be
+    /// unchecked. The check's late `Accept` sends nothing either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_block_check_forwards_nothing() {
+        const KIND: &str = "test_hung_block_check";
+        let block = || Validated::Block {
+            block: Box::new(fulu_block(5, 1)),
+            block_root: Root::repeat_byte(1),
+        };
+        let unjudged = block().unjudged_copy();
+        assert!(unjudged.is_none());
+        let (server, chain) = run_checks(KIND, Duration::from_millis(50), unjudged, move || {
+            std::thread::sleep(Duration::from_millis(500));
+            (Outcome::Accept, block())
+        })
+        .await;
+        verdicts_reach(KIND, 1).await;
+        assert_eq!(
+            metrics::beacon_gossip_verdicts(KIND, "ignore", "validation_timeout"),
+            (1, 1)
+        );
+        // Past the check's late return: still one verdict, and no block.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(metrics::beacon_gossip_verdicts(KIND, "", "").0, 1);
+        assert_nothing_sent(&chain).await;
+        server.child_handle().stop();
+    }
+
+    /// Only a column has a copy to send on without a verdict.
+    #[test]
+    fn only_columns_have_an_unjudged_copy() {
+        let block = Validated::Block {
+            block: Box::new(fulu_block(5, 1)),
+            block_root: Root::repeat_byte(1),
+        };
+        assert!(block.unjudged_copy().is_none());
+        let aggregate = Validated::Aggregate {
+            aggregate: Box::new(phase0_aggregate(5, 1)),
+            attesting_indices: Vec::new(),
+        };
+        assert!(aggregate.unjudged_copy().is_none());
+        let sync_message = sync_message_object(5, 11, 1, vec![(1, 0)]);
+        assert!(sync_message.unjudged_copy().is_none());
+        let column = Validated::Column(Box::new(DataColumnSidecar::Fulu(valid_shaped_sidecar(
+            5, 0,
+        ))));
+        assert!(matches!(column.unjudged_copy(), Some(Validated::Column(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_verdict_reaches_an_actor_that_stopped_during_the_check() {
+        const KIND: &str = "test_check_during_stop";
+        let (server, _chain) = run_checks(KIND, Duration::from_secs(5), None, || {
+            std::thread::sleep(Duration::from_millis(300));
+            (Outcome::Accept, sync_message_object(5, 11, 1, vec![(1, 0)]))
+        })
+        .await;
+        // Let the job start, then stop the actor while the check still runs.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server.child_handle().stop();
+        server.join().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(metrics::beacon_gossip_verdicts(KIND, "", "").0, 0);
     }
 }

@@ -180,8 +180,8 @@ pub(crate) fn publish_and_forward(server: &mut P2PServer, sidecars: Vec<DataColu
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
+    use ethlambda_network_api::ToP2PToBlockChainRef as _;
+    use ethlambda_network_api::p2p_to_block_chain::NewDataColumnSidecars;
     use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome};
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::fork::ForkName;
@@ -191,13 +191,15 @@ mod tests {
     use crate::beacon::verdict::{Validated, settle_message};
     use crate::gossipsub::decompress_message;
     use crate::swarm_adapter::{SwarmCommand, SwarmHandle};
-    use crate::test_support::{RecordingChain, unconnected_beacon_server, valid_shaped_sidecar};
+    use crate::test_support::{unconnected_beacon_server, valid_shaped_sidecar};
+    use spawned_test::tasks::{Mock, MockRef};
 
     const SLOT: u64 = 5;
     const PROPOSER: u64 = 7;
 
-    /// A server whose node custodies `custody`, wired to a recording chain.
-    async fn server_custodying(custody: &[u64]) -> (P2PServer, Arc<RecordingChain>) {
+    /// A server whose node custodies `custody`, wired to a chain actor
+    /// stand-in that takes every send and logs it.
+    async fn server_custodying(custody: &[u64]) -> (P2PServer, MockRef) {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
         let crate::Wire::Beacon(beacon) = &mut server.wire else {
             unreachable!("unconnected_beacon_server builds a beacon wire");
@@ -206,8 +208,8 @@ mod tests {
         // The test server's digest is a placeholder; a held digest is what
         // lets the columns be published.
         beacon.topics.fork_digest = beacon.digest_for_slot(SLOT);
-        let chain = Arc::new(RecordingChain::default());
-        server.blockchain = Some(chain.clone());
+        let chain = Mock::new().allow_sends().start();
+        server.blockchain = Some(chain.to_p2p_to_block_chain_ref());
         (server, chain)
     }
 
@@ -215,14 +217,18 @@ mod tests {
         DataColumnSidecar::Fulu(valid_shaped_sidecar(SLOT, index))
     }
 
-    fn forwarded_indices(chain: &RecordingChain) -> Vec<Vec<u64>> {
-        chain
-            .sidecar_batches
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|batch| batch.iter().map(DataColumnSidecar::index).collect())
-            .collect()
+    /// Each `new_data_column_sidecars` batch's column indices, in arrival
+    /// order. `publish_and_forward` sends synchronously, so once the mock has
+    /// handled what was sent before, the log is complete.
+    async fn forwarded_indices(chain: &MockRef) -> Vec<Vec<u64>> {
+        chain.settle().await;
+        let batches = chain
+            .take_all::<NewDataColumnSidecars>()
+            .into_iter()
+            .map(|sent| sent.sidecars.iter().map(DataColumnSidecar::index).collect())
+            .collect();
+        chain.assert_no_unexpected();
+        batches
     }
 
     #[tokio::test]
@@ -231,7 +237,7 @@ mod tests {
 
         publish_and_forward(&mut server, vec![sidecar(1), sidecar(2)]);
 
-        assert_eq!(forwarded_indices(&chain), [vec![1, 2]]);
+        assert_eq!(forwarded_indices(&chain).await, [vec![1, 2]]);
         assert!(server.seen_columns.contains(SLOT, PROPOSER, 1));
         assert!(server.seen_columns.contains(SLOT, PROPOSER, 2));
     }
@@ -282,7 +288,7 @@ mod tests {
 
         publish_and_forward(&mut server, vec![sidecar(1), sidecar(2)]);
 
-        assert_eq!(forwarded_indices(&chain), [vec![1, 2]]);
+        assert_eq!(forwarded_indices(&chain).await, [vec![1, 2]]);
         let mut published = 0;
         while let Ok(command) = commands.try_recv() {
             if let SwarmCommand::Publish { .. } = command {
@@ -341,7 +347,7 @@ mod tests {
 
         publish_and_forward(&mut server, vec![sidecar(1), sidecar(9)]);
 
-        assert_eq!(forwarded_indices(&chain), [vec![1]]);
+        assert_eq!(forwarded_indices(&chain).await, [vec![1]]);
         assert!(!server.seen_columns.contains(SLOT, PROPOSER, 9));
     }
 
@@ -351,6 +357,6 @@ mod tests {
 
         publish_and_forward(&mut server, vec![sidecar(9)]);
 
-        assert!(forwarded_indices(&chain).is_empty());
+        assert!(forwarded_indices(&chain).await.is_empty());
     }
 }

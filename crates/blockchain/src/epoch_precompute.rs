@@ -35,6 +35,7 @@ use ethlambda_types::beacon::containers::BeaconState;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::primitives::H256;
 use spawned_concurrency::message::Message;
+use spawned_concurrency::send_handler;
 use spawned_concurrency::tasks::{Context, Handler, send_after};
 use tracing::{debug, info, warn};
 
@@ -218,7 +219,7 @@ impl BlockChainServer {
             {
                 let committee_cache = self.store.committee_cache();
                 let warming = ClearOnDrop(Arc::clone(&self.key_sums_warming));
-                tokio::task::spawn_blocking(move || {
+                spawned_rt::tasks::spawn_blocking(move || {
                     let _warming = warming;
                     warm_epoch_key_sums(&committee_cache, &state, candidate_epoch)
                 });
@@ -245,7 +246,7 @@ impl BlockChainServer {
         let config = self.store.config();
         let actor = ctx.actor_ref();
         let committee_cache = self.store.committee_cache();
-        tokio::task::spawn_blocking(move || {
+        spawned_rt::tasks::spawn_blocking(move || {
             let _running = crate::metrics::EpochPrecomputeRunning::start();
             let result = {
                 let _timing = stf_metrics::time_epoch_precompute();
@@ -287,12 +288,14 @@ impl Drop for ClearOnDrop {
     }
 }
 
+#[send_handler]
 impl Handler<EpochPrecomputeCheck> for BlockChainServer {
     async fn handle(&mut self, msg: EpochPrecomputeCheck, ctx: &Context<Self>) {
         self.maybe_start_epoch_precompute(Trigger::Timer { slot: msg.slot }, ctx);
     }
 }
 
+#[send_handler]
 impl Handler<EpochPrecomputed> for BlockChainServer {
     async fn handle(&mut self, msg: EpochPrecomputed, _ctx: &Context<Self>) {
         self.epoch_precompute_in_flight = None;

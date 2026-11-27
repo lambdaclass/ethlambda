@@ -33,19 +33,22 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::aggregation::{
-    AggregateProduced, AggregationDeadline, AggregationDone, AggregationSession,
-    EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, MAX_AGGREGATION_JOBS,
-    PRIOR_WORKER_JOIN_TIMEOUT, aggregation_deadline, run_aggregation_worker,
+    AGGREGATION_JOB, AggregateProduced, AggregationDone, AggregationSession,
+    EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, MAX_AGGREGATION_JOBS, aggregation_deadline,
+    run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::{SyncStatusTracker, SyncThresholds};
 use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
+use spawned_concurrency::message::Message;
 use spawned_concurrency::protocol;
+use spawned_concurrency::send_handler;
+use spawned_concurrency::system::{ExecutionGroup, SystemError};
 use spawned_concurrency::tasks::{
-    Actor, ActorRef, ActorStart, Backend, Context, Handler, send_after,
+    Actor, ActorRef, ActorStart, Context, Handler, JobHandle, JobKey, JobOptions, JobOutcome,
+    send_after,
 };
-use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, trace, warn};
 
@@ -83,6 +86,8 @@ pub mod key_manager;
 pub mod metrics;
 pub mod payload_attributes;
 pub mod reaggregate;
+#[cfg(test)]
+mod sim_tests;
 pub mod spec_test_runner;
 pub mod store;
 mod sync_status;
@@ -247,12 +252,16 @@ impl BlockChain {
     /// touched it, so this is a programming error to catch here rather than
     /// a runtime condition to branch on. Use [`Self::spawn_beacon`] for a
     /// beacon store.
+    ///
+    /// The actor is admitted to `group`, which owns its thread and stops it on
+    /// shutdown; see [`Self::start_actor`] for what kind of group it needs.
     pub fn spawn(
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         config: BlockChainConfig,
         events: EventBus,
-    ) -> BlockChain {
+        group: &ExecutionGroup,
+    ) -> Result<BlockChain, SystemError> {
         assert_eq!(
             store.chain(),
             Chain::Lean,
@@ -285,6 +294,7 @@ impl BlockChain {
             skip_redundant_aggregation,
             proposer_config,
             pre_merge_coverage: None,
+            proposal_in_flight: None,
         };
 
         // Warm the XMSS signing caches for the next duties before the first
@@ -325,6 +335,7 @@ impl BlockChain {
             None,
             constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
             Default::default(),
+            group,
         )
     }
 
@@ -356,6 +367,7 @@ impl BlockChain {
     /// `preparation` says which proposers the `payload_attributes` event is
     /// published for: the fee recipients the Beacon API records, shared with
     /// it, and `--always-prepare-payload`.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_beacon(
         store: Store,
         sync_status_controller: SyncStatusController,
@@ -364,7 +376,8 @@ impl BlockChain {
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
         preparation: PayloadPreparation,
-    ) -> BlockChain {
+        group: &ExecutionGroup,
+    ) -> Result<BlockChain, SystemError> {
         assert_eq!(
             store.chain(),
             Chain::Beacon,
@@ -383,6 +396,7 @@ impl BlockChain {
             engine,
             safe_slots_to_import_optimistically,
             payload_attributes::PayloadAttributesPublisher::new(preparation),
+            group,
         )
     }
 
@@ -401,6 +415,13 @@ impl BlockChain {
     /// passes the specification's own default for
     /// `safe_slots_to_import_optimistically`, which nothing on that arm reads,
     /// and an inert `payload_attributes` publisher.
+    ///
+    /// `group` must give the actor a thread of its own: its handlers are long
+    /// synchronous CPU (block import, state transition, signing) that would
+    /// starve a shared async runtime. `run_node` passes a one-worker
+    /// `thread_group`, which is what `Backend::Thread` gave it before: a
+    /// dedicated native thread driving the handlers, plus a one-worker Tokio
+    /// runtime for its timers and the aggregation worker's `spawn_blocking`.
     #[allow(clippy::too_many_arguments)]
     fn start_actor(
         mut store: Store,
@@ -412,7 +433,8 @@ impl BlockChain {
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
         payload_attributes: payload_attributes::PayloadAttributesPublisher,
-    ) -> BlockChain {
+        group: &ExecutionGroup,
+    ) -> Result<BlockChain, SystemError> {
         let genesis_time = store.config().genesis_time;
 
         // Payloads verified before a restart have no recorded verdict, since
@@ -456,8 +478,9 @@ impl BlockChain {
             events,
             duties,
         }
-        // Own thread: these handlers are long synchronous CPU that starves a shared runtime.
-        .start_with_backend(Backend::Thread);
+        // Own thread: these handlers are long synchronous CPU that starves a
+        // shared runtime. See this function's doc for what `group` must be.
+        .start_on(group)?;
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
             .duration_since(SystemTime::now())
             .unwrap_or_default();
@@ -466,7 +489,7 @@ impl BlockChain {
             handle.context(),
             block_chain_protocol::Tick,
         );
-        BlockChain { handle }
+        Ok(BlockChain { handle })
     }
 
     pub fn actor_ref(&self) -> &ActorRef<BlockChainServer> {
@@ -736,6 +759,35 @@ struct LeanDuties {
     /// single-threaded message loop, so no synchronization is needed.
     /// Observability-only.
     pre_merge_coverage: Option<coverage::CoverageSnapshot>,
+
+    /// Our block from the moment its seal job starts until the seal comes
+    /// back (and the block is imported, or the proposal fails). See
+    /// [`ProposalInFlight`].
+    proposal_in_flight: Option<ProposalInFlight>,
+}
+
+/// A proposal whose seal job is still running, and the interval-1 duty held
+/// for it.
+///
+/// Sealing runs off the actor, so the actor's own ticks go on meanwhile. Our
+/// validators' attestations for the block's slot must see that block as
+/// head, so an interval-1 tick that comes first holds them here instead of
+/// signing the parent, and [`BlockChainServer::end_proposal`] runs them once
+/// the block is imported (or the proposal fails). Lean-only.
+struct ProposalInFlight {
+    slot: u64,
+    /// The seal job, cancelled if a newer proposal supersedes this one.
+    seal: JobHandle,
+    held_attestations: Option<AttestationDuty>,
+}
+
+/// One interval-1 attestation duty, with the values its tick read, so a
+/// duty held for [`ProposalInFlight`] acts on them as the tick would have.
+#[derive(Clone, Copy)]
+struct AttestationDuty {
+    slot: u64,
+    is_aggregator: bool,
+    num_validators: u64,
 }
 
 impl LeanDuties {
@@ -1313,10 +1365,25 @@ impl BlockChainServer {
                         slot - 1,
                     );
                 }
-                if self.sync_status.duties_allowed() {
-                    self.produce_attestations(slot, is_aggregator);
-                } else if !self.lean().key_manager.validator_ids().is_empty() {
-                    info!(%slot, "Skipping attestations while syncing");
+
+                // Our own block for this slot is still sealing: hold the
+                // duty until it is imported (see `ProposalInFlight`), so our
+                // validators vote for it rather than for its parent.
+                let duty = AttestationDuty {
+                    slot,
+                    is_aggregator,
+                    num_validators,
+                };
+                if let Some(proposal) = self
+                    .lean_mut()
+                    .proposal_in_flight
+                    .as_mut()
+                    .filter(|proposal| proposal.slot == slot)
+                {
+                    info!(%slot, "Holding attestations until our block for this slot is imported");
+                    proposal.held_attestations = Some(duty);
+                } else {
+                    self.attestation_duty(duty);
                 }
 
                 // Schedule the early-aggregation window check. This tick is
@@ -1330,21 +1397,6 @@ impl BlockChainServer {
                         EarlyAggregationCheck,
                     );
                 }
-
-                // Warm the XMSS signing caches for the next slot so the signing
-                // paths don't have to, now that this slot's attestations are
-                // signed: a key caches one bottom subtree, so warming any earlier
-                // evicts the subtree this slot's attestation signs with whenever
-                // the two slots straddle a subtree boundary. This lands before
-                // interval 4 signs the next slot's block. A skipped interval-1
-                // tick costs only latency, since `sign` rebuilds the subtree
-                // itself on a miss. Runs off the actor so a subtree boundary
-                // doesn't stall the tick.
-                let next_slot = slot + 1;
-                let proposer = self.get_our_proposer(next_slot, num_validators);
-                self.lean_mut()
-                    .key_manager
-                    .prepare_keys_in_background(next_slot as u32, proposer);
             }
 
             // ==== interval 2 ====
@@ -1359,7 +1411,7 @@ impl BlockChainServer {
                         .as_ref()
                         .is_some_and(|session| session.session_id == slot);
                     if !already_started {
-                        self.start_aggregation_session(slot, ctx).await;
+                        self.start_aggregation_session(slot, ctx);
                     }
                 } else {
                     metrics::inc_aggregator_skipped_not_aggregator();
@@ -1375,11 +1427,12 @@ impl BlockChainServer {
             //
             // Build and publish the NEXT slot's block here, one interval early,
             // so the heavy leanVM work happens during this otherwise-idle
-            // interval. `propose_block` blocks the actor for the build and aligns
-            // publication to the slot boundary. Doing the whole proposal here —
-            // rather than stashing it for the interval-0 tick — keeps it robust:
-            // `on_tick` skips the interval-0 tick whenever this build overruns
-            // its interval.
+            // interval. `propose_block` builds and signs on the actor and seals
+            // on a blocking job; when the seal comes back the block is imported
+            // and published at the slot boundary from a job of its own, off the
+            // actor's mailbox. Doing the whole proposal here — rather than
+            // stashing it for the interval-0 tick — keeps it robust: `on_tick`
+            // skips the interval-0 tick once the build has advanced the store.
             SlotInterval::EndOfSlot => {
                 let next_slot = slot + 1;
                 let next_proposer = self
@@ -1387,7 +1440,7 @@ impl BlockChainServer {
                     .filter(|_| self.sync_status.duties_allowed());
 
                 if let Some(validator_id) = next_proposer {
-                    self.propose_block(next_slot, validator_id).await;
+                    self.propose_block(next_slot, validator_id, ctx);
                 }
             }
         }
@@ -1446,35 +1499,28 @@ impl BlockChainServer {
     }
 
     /// Kick off a committee-signature aggregation session:
-    /// 1. If a prior session is still running (pathological), warn and join it.
-    /// 2. Snapshot the aggregation inputs from the store, capped at a single job
+    /// 1. Snapshot the aggregation inputs from the store, capped at a single job
     ///    when we propose next slot.
-    /// 3. Spawn a `spawn_blocking` worker that streams results back as messages.
-    /// 4. Schedule the `AggregationDeadline` self-message at one interval out.
+    /// 2. Start the worker as a keyed blocking job: that cancels a prior
+    ///    session's job (pathological: it overran a whole slot) and fences its
+    ///    queued results, without waiting for its thread.
     ///
     /// Both entry points land here — the interval-2 tick and the early
     /// 2/3-threshold trigger — so the proposer cap applies to whichever one
     /// starts the slot's session. Lean-only.
-    async fn start_aggregation_session(&mut self, slot: u64, ctx: &Context<Self>) {
+    fn start_aggregation_session(&mut self, slot: u64, ctx: &Context<Self>) {
         if let Some(prior) = self.lean_mut().current_aggregation.take() {
-            prior.cancel.cancel();
-            if !prior.worker.is_finished() {
+            if prior.job.is_running() {
                 warn!(
                     prior_session_id = prior.session_id,
                     new_session_id = slot,
-                    "Prior aggregation worker still running at next session start; joining before proceeding"
+                    "Prior aggregation worker still running at next session start; cancelling it"
                 );
             }
-            match tokio::time::timeout(PRIOR_WORKER_JOIN_TIMEOUT, prior.worker).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => warn!(?err, "Prior aggregation worker task ended abnormally"),
-                Err(_) => warn!(
-                    timeout_secs = PRIOR_WORKER_JOIN_TIMEOUT.as_secs(),
-                    "Timed out joining prior aggregation worker"
-                ),
-            }
+            // Also fences its queued results. The keyed start below would do
+            // the same, but only if this slot has anything to aggregate.
+            prior.job.cancel();
         }
-
         let attestation_committee_count = self.lean().attestation_committee_count;
         coverage::emit_agg_start_new_coverage(&self.store, attestation_committee_count);
 
@@ -1507,9 +1553,9 @@ impl BlockChainServer {
         let time_config = self.store.config().time_grid();
         let t2_ms = time_config.genesis_time_ms()
             + SlotInterval::Aggregation.to_ms_since_genesis(slot, &time_config);
-        // Interval-2 boundary as a wall-clock instant; the worker holds each
-        // produced aggregate until this before sending it back, so nothing
-        // reaches gossip early.
+        // Interval-2 boundary as a wall-clock instant; an aggregate produced
+        // before it is emitted at it (`emit_at_blocking`), so nothing reaches
+        // gossip early.
         let publish_at = SystemTime::UNIX_EPOCH + Duration::from_millis(t2_ms);
         let now_ms = unix_now_ms();
         let early = now_ms < t2_ms;
@@ -1524,36 +1570,34 @@ impl BlockChainServer {
             );
         }
 
-        // Independent token per session. Shutdown propagates via our
-        // #[stopped] hook which cancels any current session; the deadline
-        // timer cancels this specific session at +`aggregation_deadline`.
-        let cancel = CancellationToken::new();
-        let actor_ref = ctx.actor_ref();
-
-        let worker_cancel = cancel.clone();
-        let worker_actor = actor_ref.clone();
-        let worker = tokio::task::spawn_blocking(move || {
-            run_aggregation_worker(
-                snapshot,
-                worker_actor,
-                worker_cancel,
+        // Soft deadline: past it the worker starts no new proof (see
+        // `aggregation_deadline`).
+        let stop_starting_at =
+            Instant::now() + aggregation_deadline(time_config.milliseconds_per_interval());
+        let opts = JobOptions::new().key(AGGREGATION_JOB);
+        let started = ctx.pipe_blocking(
+            opts,
+            move |job_ctx| {
+                run_aggregation_worker(snapshot, &job_ctx, session_id, publish_at, stop_starting_at)
+            },
+            move |outcome| AggregationDone {
                 session_id,
-                publish_at,
-            );
-        });
-
-        let _deadline_timer = send_after(
-            aggregation_deadline(time_config.milliseconds_per_interval()),
-            ctx.clone(),
-            AggregationDeadline { session_id },
+                outcome,
+            },
         );
-
-        self.lean_mut().current_aggregation = Some(AggregationSession {
-            session_id,
-            early,
-            cancel,
-            worker,
-        });
+        match started {
+            Ok(job) => {
+                self.lean_mut().current_aggregation = Some(AggregationSession {
+                    session_id,
+                    early,
+                    job,
+                });
+            }
+            Err(err) => {
+                error!(%slot, %err, "Could not start the aggregation worker");
+                metrics::inc_aggregator_skipped_other(1);
+            }
+        }
     }
 
     /// Early-aggregation trigger: start the slot's session ahead of the
@@ -1631,7 +1675,7 @@ impl BlockChainServer {
             min_group_sigs,
             "Early-aggregation threshold met"
         );
-        self.start_aggregation_session(slot, ctx).await;
+        self.start_aggregation_session(slot, ctx);
     }
 
     /// Returns the validator ID if any of our validators is the proposer for
@@ -1646,6 +1690,76 @@ impl BlockChainServer {
             return None;
         };
         lean.our_proposer(slot, num_validators)
+    }
+
+    /// The interval-1 attestation duty: sign and publish our validators'
+    /// attestations for the duty's slot (unless the sync gate holds duties
+    /// back), then warm the signing keys for the next slot. Runs at the
+    /// interval-1 tick, or later from [`Self::end_proposal`] when the tick
+    /// held it for our own block. Lean-only.
+    fn attestation_duty(&mut self, duty: AttestationDuty) {
+        let AttestationDuty {
+            slot,
+            is_aggregator,
+            num_validators,
+        } = duty;
+        if self.sync_status.duties_allowed() {
+            self.produce_attestations(slot, is_aggregator);
+        } else if !self.lean().key_manager.validator_ids().is_empty() {
+            info!(%slot, "Skipping attestations while syncing");
+        }
+
+        // Warm the XMSS signing caches for the next slot so the signing
+        // paths don't have to, now that this slot's attestations are
+        // signed: a key caches one bottom subtree, so warming any earlier
+        // evicts the subtree this slot's attestation signs with whenever
+        // the two slots straddle a subtree boundary (which is why a held
+        // duty holds this too). This lands before interval 4 signs the next
+        // slot's block. A skipped interval-1 tick costs only latency, since
+        // `sign` rebuilds the subtree itself on a miss. Runs off the actor so
+        // a subtree boundary doesn't stall the tick.
+        let next_slot = slot + 1;
+        let proposer = self.get_our_proposer(next_slot, num_validators);
+        self.lean_mut()
+            .key_manager
+            .prepare_keys_in_background(next_slot as u32, proposer);
+    }
+
+    /// The proposal for `slot` ended: its block was imported, or it failed.
+    /// Runs the attestation duty the interval-1 tick held for it, if any.
+    ///
+    /// Every way a proposal ends must come through here (or through
+    /// [`Self::release_held_attestations`] when a newer one supersedes it),
+    /// or our validators never attest for that slot. Lean-only.
+    fn end_proposal(&mut self, slot: u64) {
+        let Some(proposal) = self
+            .lean_mut()
+            .proposal_in_flight
+            .take_if(|proposal| proposal.slot == slot)
+        else {
+            return;
+        };
+        self.release_held_attestations(proposal);
+    }
+
+    /// Run the attestation duty held for `proposal`, while its slot lasts.
+    ///
+    /// Past the slot the duty is dropped, as a tick overrunning interval 1
+    /// would drop it: an attestation for a slot that has ended only arrives
+    /// after every vote of the round was counted.
+    fn release_held_attestations(&mut self, proposal: ProposalInFlight) {
+        let Some(duty) = proposal.held_attestations else {
+            return;
+        };
+        let current_slot = self.wall_clock_slot();
+        if current_slot != duty.slot {
+            warn!(
+                slot = duty.slot,
+                current_slot, "Dropping held attestations: their slot ended before our block"
+            );
+            return;
+        }
+        self.attestation_duty(duty);
     }
 
     /// Lean-only.
@@ -1701,22 +1815,39 @@ impl BlockChainServer {
 
     /// Build the target slot's block and publish it, one interval early.
     ///
-    /// Runs at the previous slot's interval 4, blocking the actor for the build
-    /// (the expensive part is the leanVM single-message → multi-message
-    /// aggregate merge). It first
-    /// advances the store to the target slot's interval 0 (accepting
-    /// attestations) so the block is built on exactly the interval-0 state a
-    /// non-prebuilding proposer would see, then builds and publishes — aligned
-    /// to the slot boundary: if the build finishes before the slot opens we wait
-    /// out the remainder so the block is not published early; if it overran (the
-    /// common case under load) we publish at once. The whole proposal is
-    /// self-contained here, so it never depends on the interval-0 tick — which
-    /// `handle_tick` skips whenever this build overruns its interval.
+    /// Runs at the previous slot's interval 4. It first advances the store to
+    /// the target slot's interval 0 (accepting attestations) so the block is
+    /// built on exactly the interval-0 state a non-prebuilding proposer would
+    /// see, builds it and signs its root on the actor (both need the store or
+    /// the stateful XMSS keys), then hands the expensive part (the leanVM
+    /// single-message → multi-message aggregate merge) to a blocking job owned
+    /// by this actor. The actor keeps serving its mailbox meanwhile, and a
+    /// shutdown cancels the job and fences its result, so a block is never
+    /// published after the actor began to stop. [`BlockSealed`] carries the
+    /// seal back; the block is imported there and published at the slot
+    /// boundary (see [`Self::on_block_sealed`]).
+    ///
+    /// Until then the proposal is in flight ([`ProposalInFlight`]): the
+    /// slot's interval-1 attestations wait for the block, so our validators
+    /// vote for it. A proposal still in flight when the next one starts has
+    /// sealed for a whole slot: the new one supersedes it, and its block is
+    /// never published, since the new block is built without it.
     ///
     /// Lean-only: a beacon follower has no validator duties, so it never
     /// proposes.
-    async fn propose_block(&mut self, slot: u64, validator_id: u64) {
+    fn propose_block(&mut self, slot: u64, validator_id: u64, ctx: &Context<Self>) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
+
+        if let Some(stale) = self.lean_mut().proposal_in_flight.take() {
+            stale.seal.cancel();
+            warn!(
+                %slot,
+                stale_slot = stale.slot,
+                "Our previous block is still sealing a slot later; dropping it for this proposal"
+            );
+            metrics::inc_block_building_failures();
+            self.release_held_attestations(stale);
+        }
 
         let time_config = self.store.config().time_grid();
         let slot_start_ms = time_config.genesis_time_ms()
@@ -1728,8 +1859,9 @@ impl BlockChainServer {
         // this slot's interval 0 (accepting attestations) before building — one
         // interval ahead of the interval-4 tick we are running in — so the block
         // is built on the interval-0 state rather than the previous slot's end
-        // state. Building early is safe because we publish below (nothing is
-        // stashed for a later tick), and the real interval-0 tick is then skipped
+        // state. Building early is safe because nothing waits on a later tick
+        // (the seal job's result is imported and published from
+        // `on_block_sealed`), and the real interval-0 tick is then skipped
         // by the idempotency guard in `on_tick`, since the store clock is already
         // here.
         //
@@ -1767,73 +1899,173 @@ impl BlockChainServer {
             block.body.attestations.iter(),
         );
 
-        // Sign the block root, wrap the signature as a singleton single-message
-        // aggregate, and merge it with every attestation aggregate into the
-        // block's multi-message aggregate.
-        let head_state = self.store.head_state();
-        let Ok(signed_block) = block_builder::seal_block(
-            &head_state,
-            &mut self.lean_mut().key_manager,
-            block,
-            single_message_aggregates,
-        )
-        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to seal block")) else {
+        // Sign the block root here (the XMSS keys are stateful), then wrap the
+        // signature as a singleton single-message aggregate and merge it with
+        // every attestation aggregate on a blocking job.
+        let Ok(proposer_signature) =
+            block_builder::sign_proposal(&mut self.lean_mut().key_manager, &block)
+                .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to sign block"))
+        else {
             metrics::inc_block_building_failures();
             return;
         };
-
-        // Stop timing here: the build is done, and the alignment wait below must
-        // not count toward the block-building metric.
-        drop(timing);
-
-        info!(%slot, %validator_id, "Finished building block");
-
-        let now_ms = unix_now_ms();
-
-        // Align publication to the slot boundary. If the build finished before
-        // the slot opened, wait out the remainder so the block is not published
-        // early; if it overran, publish immediately.
-        if now_ms < slot_start_ms {
-            let wait_ms = slot_start_ms.saturating_sub(now_ms);
-            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        let head_state = self.store.head_state();
+        // Keyed: a newer proposal cancels this one and fences its result.
+        let opts = JobOptions::new().key(JobKey::new("block-proposal"));
+        let started = ctx.pipe_blocking(
+            opts,
+            move |_job| {
+                let sealed = block_builder::seal_signed_block(
+                    &head_state,
+                    block,
+                    proposer_signature,
+                    single_message_aggregates,
+                );
+                // Stop timing with the seal: the alignment wait must not count
+                // toward the block-building metric.
+                drop(timing);
+                sealed
+            },
+            move |outcome| BlockSealed {
+                slot,
+                validator_id,
+                slot_start_ms,
+                outcome,
+            },
+        );
+        match started {
+            Ok(seal) => {
+                self.lean_mut().proposal_in_flight = Some(ProposalInFlight {
+                    slot,
+                    seal,
+                    held_attestations: None,
+                });
+            }
+            Err(err) => {
+                error!(%slot, %validator_id, %err, "Could not start sealing the block");
+                metrics::inc_block_building_failures();
+            }
         }
-
-        self.process_and_publish_block(slot, validator_id, signed_block)
-            .await;
     }
 
-    /// Import a freshly built block locally, then publish it to gossip. On
-    /// import failure, logs and counts it, and returns without publishing.
-    /// Lean-only: the block this builds and imports is always a lean
-    /// [`SignedBlock`].
-    async fn process_and_publish_block(
+    /// The seal job of [`Self::propose_block`] ended. Fenced: this never runs
+    /// for a replaced proposal or once the actor began to stop.
+    ///
+    /// The block is imported here at once, even before its slot opens: the
+    /// build already advanced the store clock to the slot's interval 0, so
+    /// the store takes it as it would at the boundary, and an early import
+    /// leaves no actor turn between the boundary and publication. Import
+    /// still gates publication: a block that fails it is never published.
+    /// Publication is then aligned to the slot boundary off the actor (see
+    /// [`Self::publish_at_slot_start`]). Last, the proposal ends, which runs
+    /// the attestations the interval-1 tick held for this block, after the
+    /// block is published so peers know the head they vote for.
+    async fn on_block_sealed(&mut self, msg: BlockSealed, ctx: &Context<Self>) {
+        let BlockSealed {
+            slot,
+            validator_id,
+            slot_start_ms,
+            outcome,
+        } = msg;
+        let sealed = match outcome {
+            Ok(Ok(signed_block)) => Some(signed_block),
+            Ok(Err(err)) => {
+                error!(%slot, %validator_id, %err, "Failed to seal block");
+                metrics::inc_block_building_failures();
+                None
+            }
+            Err(err) => {
+                error!(%slot, %validator_id, %err, "Block seal job failed");
+                metrics::inc_block_building_failures();
+                None
+            }
+        };
+        if let Some(signed_block) = sealed {
+            info!(%slot, %validator_id, "Finished building block");
+            if self
+                .import_built_block(slot, validator_id, signed_block.clone())
+                .await
+            {
+                self.publish_at_slot_start(slot, validator_id, slot_start_ms, signed_block, ctx);
+            }
+        }
+        self.end_proposal(slot);
+    }
+
+    /// Import a block this node built. On failure, logs and counts it and
+    /// returns `false`: the block must not be published. Lean-only: the block
+    /// this imports is always a lean [`SignedBlock`].
+    async fn import_built_block(
         &mut self,
         slot: u64,
         validator_id: u64,
         signed_block: SignedBlock,
-    ) {
+    ) -> bool {
         let block_root = signed_block.message.hash_tree_root();
         let attestations = signed_block.message.body.attestations.len();
         let timings = ImportTimings::starting_now();
         let (timings, outcome) = self
-            .process_block(SignedBeaconBlock::Lean(signed_block.clone()), timings)
+            .process_block(SignedBeaconBlock::Lean(signed_block), timings)
             .await;
         self.log_import_report(slot, block_root, attestations, &outcome, timings);
         if let Err(err) = outcome {
             error!(%slot, %validator_id, %err, "Failed to process built block");
             metrics::inc_block_building_failures();
+            return false;
+        }
+        metrics::inc_block_building_success();
+        true
+    }
+
+    /// Publish a block this node built and imported, aligned to its slot's
+    /// start: at once if the slot has opened, otherwise from a job that holds
+    /// it until then.
+    ///
+    /// The job runs off the actor (on its group's helper runtime), so work
+    /// queued in the actor's mailbox meanwhile (a gossip block's import, say)
+    /// cannot push publication past the boundary. It is cancelled with the
+    /// actor, so a block is never published after the actor began to stop;
+    /// a stop between the import and the boundary leaves the block imported
+    /// here but unpublished. Lean-only.
+    fn publish_at_slot_start(
+        &self,
+        slot: u64,
+        validator_id: u64,
+        slot_start_ms: u64,
+        signed_block: SignedBlock,
+        ctx: &Context<Self>,
+    ) {
+        let p2p = self.p2p.clone();
+        let wait_ms = slot_start_ms.saturating_sub(unix_now_ms());
+        if wait_ms == 0 {
+            publish_built_block(p2p.as_ref(), slot, validator_id, signed_block);
             return;
         }
-
-        metrics::inc_block_building_success();
-
-        if let Some(ref p2p) = self.p2p {
-            let _ = p2p
-                .publish_block(signed_block)
-                .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to publish block"));
-        }
-
-        info!(%slot, %validator_id, "Published block");
+        let job = match ctx.reserve_job(JobOptions::new()) {
+            Ok(job) => job,
+            Err(err) => {
+                // Only when the actor is stopping, or at its deferred-job
+                // bound: never publish a block before its slot instead.
+                error!(%slot, %validator_id, %err, "Could not hold the block until its slot; not publishing it");
+                return;
+            }
+        };
+        job.pipe(
+            move |job_ctx| async move {
+                // The simulator's clock under `spawned_sim`, Tokio's otherwise.
+                spawned_rt::tasks::sleep(Duration::from_millis(wait_ms)).await;
+                // A cancelled job's future is dropped mid-sleep; this covers a
+                // cancellation that lands as the sleep ends.
+                if !job_ctx.is_cancelled() {
+                    publish_built_block(p2p.as_ref(), slot, validator_id, signed_block);
+                }
+            },
+            move |outcome| BlockPublicationEnded {
+                slot,
+                validator_id,
+                outcome,
+            },
+        );
     }
 
     /// Run block import, emit the resulting chain events, and refresh
@@ -2609,7 +2841,7 @@ impl BlockChainServer {
         };
         report.observe();
         ethlambda_telemetry::emit(|| report.telemetry_events());
-        // `process_and_publish_block` also reaches here outside any
+        // `import_built_block` also reaches here outside any
         // `on_block`; harmless, since a locally built block has no source
         // label and so is never recorded.
         if report.imported_here()
@@ -4435,35 +4667,6 @@ impl BlockChainServer {
             block_chain_protocol::Tick,
         );
     }
-
-    /// Actor lifecycle hook: wait for any in-flight aggregation worker to exit
-    /// before the actor is fully stopped. We cancel the session's token and
-    /// wait up to PRIOR_WORKER_JOIN_TIMEOUT for the worker's current
-    /// `aggregate_job` call to finish (the proof itself cannot be interrupted).
-    /// Lean-only: a beacon follower never starts an aggregation session.
-    #[stopped]
-    async fn on_stopped(&mut self, _ctx: &Context<Self>) {
-        let ChainDuties::Lean(lean) = &mut self.duties else {
-            return;
-        };
-        let Some(session) = lean.current_aggregation.take() else {
-            return;
-        };
-        session.cancel.cancel();
-        match tokio::time::timeout(PRIOR_WORKER_JOIN_TIMEOUT, session.worker).await {
-            Ok(Ok(())) => {
-                info!(
-                    session_id = session.session_id,
-                    "Aggregation worker joined on shutdown"
-                );
-            }
-            Ok(Err(err)) => warn!(?err, "Aggregation worker task ended abnormally on shutdown"),
-            Err(_) => warn!(
-                timeout_secs = PRIOR_WORKER_JOIN_TIMEOUT.as_secs(),
-                "Timed out joining aggregation worker on shutdown"
-            ),
-        }
-    }
 }
 
 // --- Manual Handler impls for network-api messages ---
@@ -4474,6 +4677,7 @@ use ethlambda_network_api::p2p_to_block_chain::{
     NewProposerPreferences,
 };
 
+#[send_handler]
 impl Handler<InitP2P> for BlockChainServer {
     async fn handle(&mut self, msg: InitP2P, _ctx: &Context<Self>) {
         self.p2p = Some(msg.p2p);
@@ -4481,6 +4685,7 @@ impl Handler<InitP2P> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<NewBlock> for BlockChainServer {
     async fn handle(&mut self, msg: NewBlock, ctx: &Context<Self>) {
         let arrival_ms = unix_now_ms();
@@ -4594,6 +4799,7 @@ impl Handler<NewBlock> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<NewExecutionPayloadEnvelope> for BlockChainServer {
     async fn handle(&mut self, msg: NewExecutionPayloadEnvelope, ctx: &Context<Self>) {
         // Beacon-only: lean has no execution payload envelopes.
@@ -4611,6 +4817,7 @@ impl Handler<NewExecutionPayloadEnvelope> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<NewPayloadAttestationMessage> for BlockChainServer {
     async fn handle(&mut self, msg: NewPayloadAttestationMessage, ctx: &Context<Self>) {
         // Beacon-only: lean has no payload timeliness committee.
@@ -4634,6 +4841,7 @@ impl Handler<NewPayloadAttestationMessage> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<NewProposerPreferences> for BlockChainServer {
     async fn handle(&mut self, msg: NewProposerPreferences, ctx: &Context<Self>) {
         // Beacon-only, and only the next slot's preferences change an event:
@@ -4647,6 +4855,7 @@ impl Handler<NewProposerPreferences> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<NewAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAttestation, ctx: &Context<Self>) {
         // Lean-only. A beacon node subscribes to no attestation subnet, so
@@ -4679,6 +4888,7 @@ impl Handler<NewAttestation> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<NewAggregatedAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAggregatedAttestation, _ctx: &Context<Self>) {
         // Lean-only: beacon gossip aggregates are out of scope for this actor.
@@ -4691,6 +4901,7 @@ impl Handler<NewAggregatedAttestation> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<NewDataColumnSidecars> for BlockChainServer {
     async fn handle(&mut self, msg: NewDataColumnSidecars, ctx: &Context<Self>) {
         self.on_checked_data_columns(msg.sidecars).await;
@@ -4701,12 +4912,14 @@ impl Handler<NewDataColumnSidecars> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<DataColumnSidecarsAwaitingParent> for BlockChainServer {
     async fn handle(&mut self, msg: DataColumnSidecarsAwaitingParent, _ctx: &Context<Self>) {
         self.park_data_columns(msg.sidecars);
     }
 }
 
+#[send_handler]
 impl Handler<NewBeaconAggregate> for BlockChainServer {
     async fn handle(&mut self, msg: NewBeaconAggregate, _ctx: &Context<Self>) {
         // Beacon-only: nothing subscribes a lean node to this topic, so a
@@ -4727,60 +4940,55 @@ impl Handler<NewBeaconAggregate> for BlockChainServer {
 // Aggregation message handlers (worker → actor, actor → self for deadline)
 // -------------------------------------------------------------------------
 //
-// All four are lean-only: a beacon follower never starts an aggregation
+// All three are lean-only: a beacon follower never starts an aggregation
 // session, so none of these messages are ever sent to one in practice. Each
 // still opens with the `else { return }` guard rather than reaching for
 // `lean()`, because a handler is the actor's outer boundary: dropping a
 // message that does not apply to this chain is a real outcome there, while
 // below it the same situation is a dispatch bug. See `ChainDuties`.
 
+#[send_handler]
 impl Handler<AggregateProduced> for BlockChainServer {
     async fn handle(&mut self, msg: AggregateProduced, _ctx: &Context<Self>) {
-        let ChainDuties::Lean(lean) = &self.duties else {
+        let ChainDuties::Lean(_) = &self.duties else {
             return;
         };
-        let arrival_ms = unix_now_ms();
+        // No session check: this is an emit of the current session's job,
+        // fenced by the framework once a newer session (or a stop) cancelled
+        // it, and delivered no earlier than the interval-2 boundary (the
+        // worker schedules an early one with `emit_at_blocking`).
+        self.publish_own_aggregate(msg.output);
+    }
+}
 
-        // Drop results from a prior session (or from an unexpected late worker).
-        // Current session may be None if the actor already cleaned it up; accept
-        // the message only when ids match.
-        let current = lean.current_aggregation.as_ref().map(|s| s.session_id);
-        if current != Some(msg.session_id) {
-            trace!(
-                incoming_session_id = msg.session_id,
-                current_session_id = ?current,
-                "Dropping stale aggregate produced for non-current session"
-            );
-            return;
-        }
+impl BlockChainServer {
+    /// Apply and gossip an aggregate this node produced, at or after the
+    /// interval-2 boundary. Lean-only.
+    fn publish_own_aggregate(&mut self, output: aggregation::AggregatedGroupOutput) {
+        let arrival_ms = unix_now_ms();
 
         // Count our own aggregate in the same series as gossip-received ones,
         // so an aggregator does not report an empty aggregate arrival profile.
-        // Delivery of this message is held to the interval-2 boundary upstream,
-        // so a local aggregate lands near zero unless proving overran the
-        // interval. Sharing one series with received aggregates is deliberate
-        // and costs little in practice: a late aggregate is late for every node
-        // at once, so both populations are dominated by production time rather
-        // than propagation and their distributions look alike.
+        // Delivery is held to the interval-2 boundary, so a local aggregate
+        // lands near zero unless proving overran the interval. Sharing one
+        // series with received aggregates is deliberate and costs little in
+        // practice: a late aggregate is late for every node at once, so both
+        // populations are dominated by production time rather than
+        // propagation and their distributions look alike.
         metrics::observe_gossip_aggregation_arrival(arrival_ms, &self.store.config().time_grid());
 
-        // Publish alignment is enforced upstream: the worker delays delivery of
-        // this message until the interval-2 boundary, so by the time it lands
-        // the aggregate is safe to apply and gossip immediately.
-        aggregation::apply_aggregated_group(&mut self.store, &msg.output);
+        aggregation::apply_aggregated_group(&mut self.store, &output);
 
         // Surface our own freshly produced aggregate, the counterpart of the
         // gossip-received path in `on_gossip_aggregated_attestation` (we never
         // receive our own aggregate back over gossip). Low-rate.
-        self.events.publish_lean_aggregate(
-            msg.output.participants.clone(),
-            msg.output.hashed.data().clone(),
-        );
+        self.events
+            .publish_lean_aggregate(output.participants.clone(), output.hashed.data().clone());
 
         if let Some(ref p2p) = self.p2p {
             let aggregate = SignedAggregatedAttestation {
-                data: msg.output.hashed.data().clone(),
-                proof: msg.output.proof,
+                data: output.hashed.data().clone(),
+                proof: output.proof,
             };
             let _ = p2p
                 .publish_aggregated_attestation(aggregate)
@@ -4789,6 +4997,7 @@ impl Handler<AggregateProduced> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<EarlyAggregationCheck> for BlockChainServer {
     async fn handle(&mut self, _msg: EarlyAggregationCheck, ctx: &Context<Self>) {
         let ChainDuties::Lean(_) = &self.duties else {
@@ -4798,27 +5007,36 @@ impl Handler<EarlyAggregationCheck> for BlockChainServer {
     }
 }
 
+#[send_handler]
 impl Handler<AggregationDone> for BlockChainServer {
     async fn handle(&mut self, msg: AggregationDone, _ctx: &Context<Self>) {
         let ChainDuties::Lean(lean) = &self.duties else {
             return;
         };
         aggregation::finalize_aggregation_session(&self.store);
-        metrics::observe_committee_signatures_aggregation(msg.total_elapsed);
-
-        let aggregation_elapsed = msg.total_elapsed;
         let early = lean
             .current_aggregation
             .as_ref()
             .is_some_and(|s| s.session_id == msg.session_id && s.early);
+        let summary = match msg.outcome {
+            Ok(summary) => summary,
+            Err(err) => {
+                // A proof panicked: the session ends here, as a failed one.
+                error!(session_id = msg.session_id, %err, "Aggregation worker failed");
+                return;
+            }
+        };
+        metrics::observe_committee_signatures_aggregation(summary.total_elapsed);
+
+        let aggregation_elapsed = summary.total_elapsed;
         info!(
             ?aggregation_elapsed,
             session_id = msg.session_id,
-            groups_considered = msg.groups_considered,
-            groups_aggregated = msg.groups_aggregated,
-            total_raw_sigs = msg.total_raw_sigs,
-            total_children = msg.total_children,
-            cancelled = msg.cancelled,
+            groups_considered = summary.groups_considered,
+            groups_aggregated = summary.groups_aggregated,
+            total_raw_sigs = summary.total_raw_sigs,
+            total_children = summary.total_children,
+            cancelled = summary.cancelled,
             early,
             aggregation_deadline_ms =
                 aggregation_deadline(self.store.config().milliseconds_per_interval()).as_millis()
@@ -4828,17 +5046,70 @@ impl Handler<AggregationDone> for BlockChainServer {
     }
 }
 
-impl Handler<AggregationDeadline> for BlockChainServer {
-    async fn handle(&mut self, msg: AggregationDeadline, _ctx: &Context<Self>) {
-        let ChainDuties::Lean(lean) = &self.duties else {
+/// A proposal's seal job ended: the terminal message of the job
+/// [`BlockChainServer::propose_block`] starts. Lean-only.
+pub(crate) struct BlockSealed {
+    slot: u64,
+    validator_id: u64,
+    slot_start_ms: u64,
+    outcome: JobOutcome<Result<SignedBlock, block_builder::SealError>>,
+}
+impl Message for BlockSealed {
+    type Result = ();
+}
+
+/// The job holding an imported block until its slot opened ended: the
+/// terminal message of the job [`BlockChainServer::publish_at_slot_start`]
+/// starts. Fenced, like every job's: never delivered once the actor began to
+/// stop. Lean-only.
+pub(crate) struct BlockPublicationEnded {
+    slot: u64,
+    validator_id: u64,
+    outcome: JobOutcome<()>,
+}
+impl Message for BlockPublicationEnded {
+    type Result = ();
+}
+
+#[send_handler]
+impl Handler<BlockSealed> for BlockChainServer {
+    async fn handle(&mut self, msg: BlockSealed, ctx: &Context<Self>) {
+        let ChainDuties::Lean(_) = &self.duties else {
             return;
         };
-        if let Some(session) = &lean.current_aggregation
-            && session.session_id == msg.session_id
-        {
-            session.cancel.cancel();
-        }
+        self.on_block_sealed(msg, ctx).await;
     }
+}
+
+#[send_handler]
+impl Handler<BlockPublicationEnded> for BlockChainServer {
+    async fn handle(&mut self, msg: BlockPublicationEnded, _ctx: &Context<Self>) {
+        // The job published the block itself; only a failure is news here.
+        let BlockPublicationEnded {
+            slot,
+            validator_id,
+            outcome,
+        } = msg;
+        let _ = outcome
+            .inspect_err(|err| error!(%slot, %validator_id, %err, "Block publication job failed"));
+    }
+}
+
+/// Gossip a block this node built and imported. Free of the actor, so the
+/// publication job of [`BlockChainServer::publish_at_slot_start`] can call it
+/// off the actor's thread.
+fn publish_built_block(
+    p2p: Option<&BlockChainToP2PRef>,
+    slot: u64,
+    validator_id: u64,
+    signed_block: SignedBlock,
+) {
+    if let Some(p2p) = p2p {
+        let _ = p2p
+            .publish_block(signed_block)
+            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to publish block"));
+    }
+    info!(%slot, %validator_id, "Published block");
 }
 
 /// The `verdict` a `block_events` row records for an execution client's answer.
@@ -5121,7 +5392,9 @@ mod tests {
             },
         };
 
-        let _ = BlockChain::spawn(store, HashMap::new(), config, EventBus::default());
+        let system = spawned_concurrency::system::ActorSystem::new().unwrap();
+        let group = system.thread_group("chain", 1).unwrap();
+        let _ = BlockChain::spawn(store, HashMap::new(), config, EventBus::default(), &group);
     }
 
     #[test]
@@ -5136,6 +5409,8 @@ mod tests {
             DEFAULT_MILLISECONDS_PER_SLOT,
         );
 
+        let system = spawned_concurrency::system::ActorSystem::new().unwrap();
+        let group = system.thread_group("chain", 1).unwrap();
         let _ = BlockChain::spawn_beacon(
             store,
             SyncStatusController::default(),
@@ -5144,6 +5419,7 @@ mod tests {
             None,
             constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
             PayloadPreparation::default(),
+            &group,
         );
     }
 
@@ -7805,6 +8081,145 @@ mod tests {
             panic!("expected block_gossip, got {:?}", emitted[0]);
         };
         assert_eq!((gossip.slot, gossip.block), (4, root));
+    }
+
+    // ---- Jobs owned by the chain actor (spawned 0.8) ----
+    //
+    // The block seal and the aggregation worker rely on three properties of
+    // a keyed `pipe_blocking` job, checked here on a running chain actor:
+    // a newer job under the same key fences everything the older one still
+    // has queued (its emits and its terminal message); an actor stop
+    // delivers nothing more; and a panic ends the job with one terminal
+    // message.
+
+    use spawned_concurrency::tasks::JobError;
+    use spawned_test::tasks::in_actor;
+    use std::sync::Mutex;
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// A job's emit or terminal message, logged when dispatched.
+    struct Logged(Log, String);
+    impl Message for Logged {
+        type Result = ();
+    }
+    #[send_handler]
+    impl Handler<Logged> for BlockChainServer {
+        async fn handle(&mut self, msg: Logged, _ctx: &Context<Self>) {
+            msg.0.lock().unwrap().push(msg.1);
+        }
+    }
+
+    /// Start a keyed blocking job named `name` that waits `before`, emits
+    /// one `Logged`, waits `after`, then (with `panic`) panics. Run it in the
+    /// chain actor's turn with `in_actor`.
+    fn keyed_job(
+        log: &Log,
+        name: &'static str,
+        before: Duration,
+        after: Duration,
+        panic: bool,
+    ) -> impl FnOnce(&mut BlockChainServer, &Context<BlockChainServer>) + Send + 'static {
+        let (emit_log, done_log) = (log.clone(), log.clone());
+        move |_, ctx| {
+            let opts = JobOptions::new().key(AGGREGATION_JOB);
+            ctx.pipe_blocking(
+                opts,
+                move |job| {
+                    std::thread::sleep(before);
+                    let _ = job.emit_blocking(Logged(emit_log, format!("{name}: emit")));
+                    std::thread::sleep(after);
+                    assert!(!panic, "{name}: proof panicked");
+                },
+                move |outcome| {
+                    let what = match outcome {
+                        Ok(()) => "done".to_string(),
+                        Err(JobError::Panicked(m)) => format!("panicked ({m})"),
+                        Err(err) => err.to_string(),
+                    };
+                    Logged(done_log, format!("{name}: {what}"))
+                },
+            )
+            .expect("the job starts");
+        }
+    }
+
+    async fn settle_for(ms: u64) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_newer_keyed_job_fences_everything_the_older_one_has_queued() {
+        let actor = beacon_server(beacon_store_at_slot_10()).start();
+        let log = Log::default();
+        // The first job emits at once, then keeps running; the second replaces
+        // it while the first's emit sits in the mailbox behind it (both starts
+        // are queued before the first runs), the case the session-id checks
+        // used to cover by hand.
+        let old = keyed_job(
+            &log,
+            "old",
+            Duration::ZERO,
+            Duration::from_millis(200),
+            false,
+        );
+        let new = keyed_job(
+            &log,
+            "new",
+            Duration::from_millis(50),
+            Duration::ZERO,
+            false,
+        );
+        tokio::join!(in_actor(&actor, old), in_actor(&actor, new));
+        settle_for(500).await;
+        let log = log.lock().unwrap().clone();
+        assert!(!log.iter().any(|entry| entry.starts_with("old")), "{log:?}");
+        assert_eq!(
+            log.iter()
+                .filter(|e| e.starts_with("new"))
+                .collect::<Vec<_>>(),
+            ["new: emit", "new: done"]
+        );
+        actor.child_handle().stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_during_a_job_delivers_none_of_its_messages() {
+        let actor = beacon_server(beacon_store_at_slot_10()).start();
+        let log = Log::default();
+        in_actor(
+            &actor,
+            keyed_job(
+                &log,
+                "seal",
+                Duration::from_millis(150),
+                Duration::ZERO,
+                false,
+            ),
+        )
+        .await;
+        settle_for(30).await;
+        actor.child_handle().stop();
+        actor.join().await;
+        settle_for(300).await;
+        assert_eq!(*log.lock().unwrap(), Vec::<String>::new());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_job_ends_with_one_terminal_message() {
+        let actor = beacon_server(beacon_store_at_slot_10()).start();
+        let log = Log::default();
+        in_actor(
+            &actor,
+            keyed_job(&log, "proof", Duration::ZERO, Duration::ZERO, true),
+        )
+        .await;
+        settle_for(300).await;
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["proof: emit", "proof: panicked (proof: proof panicked)"]
+        );
+        actor.child_handle().stop();
     }
 
     // -----------------------------------------------------------------
