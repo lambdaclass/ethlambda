@@ -52,6 +52,7 @@ pub mod sync_committee;
 #[cfg(test)]
 mod test_support;
 
+pub use aggregation::PqAggregateTransport;
 pub use error::{Error, Result};
 
 /// Run this process on the preset the beacon node reports, before anything
@@ -177,6 +178,9 @@ pub struct ValidatorConfig {
     /// `xmss_cache_url`), so a key loads instead of being built. See
     /// [`load_xmss_cache`].
     pub xmss_cache_url: Option<String>,
+    /// How this client's PQ aggregates are broadcast, which decides what its
+    /// aggregators sign. See [`PqAggregateTransport`].
+    pub pq_aggregate_transport: PqAggregateTransport,
 
     /// Read the beacon nodes' event streams, so attestations and sync
     /// committee messages go out when the slot's block arrives and payload
@@ -509,7 +513,8 @@ pub async fn run(config: ValidatorConfig, stop: impl Future<Output = &'static st
     let attestation =
         AttestationService::new(beacon_node.clone(), context.clone(), protection.clone())
             .with_clock(clock.clone());
-    let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
+    let aggregation = AggregationService::new(beacon_node.clone(), context.clone())
+        .with_pq_transport(config.pq_aggregate_transport);
     let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
     let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());
 

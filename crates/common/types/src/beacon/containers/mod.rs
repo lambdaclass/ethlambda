@@ -50,6 +50,7 @@ pub mod gloas;
 pub mod gloas_family;
 pub mod phase0;
 pub mod pq;
+pub mod proof_chunks;
 pub mod shared;
 
 pub use gloas_family::{GloasFamily, GloasFamilyMut};

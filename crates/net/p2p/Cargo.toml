@@ -52,6 +52,14 @@ libp2p-mplex = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "
 
 snap = "1.1"
 
+# The Waggle transport (`src/waggle`), at the versions Lighthouse's
+# `dknopik/waggle` uses, all already in the lockfile through libp2p.
+async-channel = "2.5"
+asynchronous-codec = "0.7"
+bytes = "1"
+prost = "0.14"
+unsigned-varint = "0.8"
+
 # Only to name the TCP muxer's error type, `Either<yamux::Error, io::Error>`,
 # which libp2p-core builds from this crate and does not re-export. Read by
 # `disconnect_cause` to say why a TCP peer's connection ended.
@@ -91,3 +99,7 @@ hex.workspace = true
 # `test-utils` for `helpers::test_state`: a test that needs a stored post-state
 # builds one with it.
 ethlambda-state-transition = { workspace = true, features = ["test-utils"] }
+# `tests/waggle_swarm.rs` runs two swarms over an in-memory, unencrypted
+# transport.
+libp2p = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "2f14d0ec9665a01cfb6a02326c90628c4bba521c", features = ["plaintext"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

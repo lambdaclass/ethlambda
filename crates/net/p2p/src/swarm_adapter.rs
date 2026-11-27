@@ -77,6 +77,18 @@ pub enum SwarmCommand {
     /// [`scoring::refresh`] and [`crate::beacon::transition::apply`], which
     /// sends them ahead of the topics it joins).
     SetTopicScoreParams(Vec<(IdentTopic, TopicScoreParams)>),
+    /// Subscribe to a Waggle topic, answering with the receiver of its events,
+    /// or `None` if it is subscribed already. Dropping the receiver
+    /// unsubscribes.
+    WaggleSubscribe {
+        topic: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<
+            Option<async_channel::Receiver<crate::waggle::TopicEvent>>,
+        >,
+    },
+    /// Close every connection to a peer that misbehaved outside gossipsub,
+    /// which scores it no lower for it.
+    Disconnect(PeerId),
     /// A verdict for a gossip message gossipsub is holding (beacon only).
     ReportValidation {
         message_id: libp2p::gossipsub::MessageId,
@@ -148,6 +160,27 @@ impl SwarmHandle {
             .cmd_tx
             .send(SwarmCommand::Subscribe(topic))
             .inspect_err(|_| debug!("Swarm adapter closed, cannot subscribe"));
+    }
+
+    /// See [`SwarmCommand::WaggleSubscribe`].
+    pub fn waggle_subscribe(
+        &self,
+        topic: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<
+            Option<async_channel::Receiver<crate::waggle::TopicEvent>>,
+        >,
+    ) {
+        let _ = self
+            .cmd_tx
+            .send(SwarmCommand::WaggleSubscribe { topic, reply })
+            .inspect_err(|_| debug!("Swarm adapter closed, cannot subscribe on Waggle"));
+    }
+
+    pub fn disconnect(&self, peer_id: PeerId) {
+        let _ = self
+            .cmd_tx
+            .send(SwarmCommand::Disconnect(peer_id))
+            .inspect_err(|_| debug!("Swarm adapter closed, cannot disconnect"));
     }
 
     pub fn unsubscribe(&self, topic: libp2p::gossipsub::IdentTopic) {
@@ -537,6 +570,13 @@ fn disconnect_graylisted_peers(swarm: &mut libp2p::Swarm<Behaviour>) {
 
 pub(crate) fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
     match cmd {
+        SwarmCommand::WaggleSubscribe { topic, reply } => {
+            let events = swarm.behaviour_mut().waggle.subscribe(topic);
+            let _ = reply.send(events);
+        }
+        SwarmCommand::Disconnect(peer_id) => {
+            let _ = swarm.disconnect_peer_id(peer_id);
+        }
         SwarmCommand::Publish { topic, data } => {
             swarm
                 .behaviour_mut()

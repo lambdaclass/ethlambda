@@ -780,6 +780,61 @@ pub struct SignedAggregateAndProof {
     pub signature: XmssSignature,
 }
 
+/// What an aggregator signs when its proof is broadcast in chunks over Waggle
+/// (the "Fast leanVM Proof Broadcast" draft EIP): its [`AggregateAndProof`]
+/// with `proof_chunks_root`, the commitment to the proof's chunks
+/// ([`super::proof_chunks::compute_proof_chunks_root`]), in place of the
+/// proof. A peer verifies each chunk on its own against this root, so the
+/// header travels with the first chunk a peer is sent and the proof never
+/// travels whole.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
+pub struct AggregateHeader {
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub aggregator_index: ValidatorIndex,
+    pub aggregate: Attestation,
+    pub proof_chunks_root: Root,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
+pub struct SignedAggregateHeader {
+    pub message: AggregateHeader,
+    pub signature: XmssSignature,
+}
+
+/// What a validator client posts to `aggregate_and_proofs` for its aggregate
+/// to be broadcast over Waggle: the header its aggregator signed and the proof
+/// that header commits to, which the beacon node splits into chunks. Not a
+/// consensus container; the shape is Lighthouse's PQ branch's
+/// `SignedPqAggregate`.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, SszEncode, SszDecode,
+)]
+pub struct SignedPqAggregate {
+    pub signed_aggregate_header: SignedAggregateHeader,
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
+    pub proof: AttestationProof,
+}
+
 /// What the Beacon API's `aggregate_attestation` answers at a PQ slot: a
 /// committee's network aggregate and the proof of its attesters'
 /// signatures, which the aggregator wraps in its `AggregateAndProof`. Not a
@@ -1106,6 +1161,41 @@ mod tests {
         assert_eq!(
             AggregationCommitteeWindow::from_ssz_bytes(&bytes).unwrap(),
             window
+        );
+    }
+
+    /// The Waggle submission's JSON is Lighthouse's `SignedPqAggregate`: the
+    /// header under `signed_aggregate_header`, and the proof as one hex string.
+    #[test]
+    fn a_waggle_submission_serializes_as_lighthouses() {
+        let submission = SignedPqAggregate {
+            signed_aggregate_header: SignedAggregateHeader {
+                message: AggregateHeader {
+                    aggregator_index: 9,
+                    aggregate: Attestation {
+                        aggregation_bits: ProgressiveBitlist::with_length(2),
+                        data: Default::default(),
+                        committee_bits: Default::default(),
+                    },
+                    proof_chunks_root: Root::repeat_byte(1),
+                },
+                signature: Default::default(),
+            },
+            proof: AttestationProof::try_from(vec![0xab, 0xcd]).expect("fits"),
+        };
+        let json = serde_json::to_value(&submission).expect("serializes");
+        assert_eq!(json["proof"], "0xabcd");
+        assert_eq!(
+            json["signed_aggregate_header"]["message"]["aggregator_index"],
+            "9"
+        );
+        assert!(json["signed_aggregate_header"]["message"]["proof_chunks_root"].is_string());
+        let back: SignedPqAggregate = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, submission);
+        let ssz = submission.to_ssz();
+        assert_eq!(
+            SignedPqAggregate::from_ssz_bytes(&ssz).expect("decodes"),
+            submission
         );
     }
 

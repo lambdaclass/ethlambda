@@ -50,6 +50,7 @@ use crate::beacon::constants::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_PTC_ATTESTER,
     LEAF_OFFSET_AGGREGATE_AND_PROOF, LEAF_OFFSET_PTC_ATTESTER,
 };
+use crate::beacon::containers::proof_chunks::compute_proof_chunks_root;
 use crate::beacon::containers::{BeaconState, SignedBeaconBlock, pq};
 use crate::beacon::fork_choice::Store;
 use crate::beacon::helpers::accessors::{
@@ -59,15 +60,15 @@ use crate::beacon::helpers::misc::{
     compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch,
 };
 use crate::beacon::helpers::pq::{
-    compute_xmss_attestation_leaf_index, compute_xmss_leaf_index, get_aggregation_committee,
-    get_attestation_statements, get_attesting_indices, get_committee_indices,
-    is_valid_indexed_attestation, try_verify_aggregates, xmss_verify,
+    AggregateStatement, compute_xmss_attestation_leaf_index, compute_xmss_leaf_index,
+    get_aggregation_committee, get_attestation_statements, get_attesting_indices,
+    get_committee_indices, is_valid_indexed_attestation, try_verify_aggregates, xmss_verify,
 };
 use crate::beacon::helpers::predicates::{is_slashable_attestation_data, is_slashable_validator};
 use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    CommitteeIndex, Epoch, HashTreeRoot as _, Root, Slot, ValidatorIndex,
+    CommitteeIndex, Epoch, HashTreeRoot as _, Root, Slot, ValidatorIndex, XmssSignature,
 };
 use crate::beacon::stf;
 
@@ -204,21 +205,17 @@ pub fn aggregate_key(signed: &pq::SignedAggregateAndProof) -> Option<AggregateKe
     let [committee_index] = get_committee_indices(&aggregate.committee_bits)[..] else {
         return None;
     };
-    Some(AggregateKey {
-        data_root: aggregate.data.hash_tree_root(),
+    Some(key_of(
+        aggregate,
         committee_index,
-        target_epoch: aggregate.data.target.epoch,
-        aggregator_index: signed.message.aggregator_index,
-    })
+        signed.message.aggregator_index,
+    ))
 }
 
 /// The aggregate's bits, expanded. Only after [`aggregate_cheap_checks`] has
 /// bounded their length.
 pub fn aggregation_bits(signed: &pq::SignedAggregateAndProof) -> Vec<bool> {
-    let bits = &signed.message.aggregate.aggregation_bits;
-    (0..bits.len())
-        .map(|index| bits.get(index).unwrap_or(false))
-        .collect()
+    expand_bits(&signed.message.aggregate)
 }
 
 /// The rules that read only the message, the clock and the seen cache: the
@@ -229,8 +226,22 @@ pub fn aggregate_cheap_checks(
     signed: &pq::SignedAggregateAndProof,
     now_ms: u64,
 ) -> Result<(), Outcome> {
-    let config = store.config();
     let aggregate = &signed.message.aggregate;
+    let seen = (seen, signed.message.aggregator_index);
+    attestation_message_rules(Some(seen), store, aggregate, now_ms).map(|_| ())
+}
+
+/// The rules [`aggregate_cheap_checks`] applies, for an aggregate by
+/// `aggregator_index` when `seen` names the cache to check it against, and
+/// without that cache's two rules otherwise. Returns the one committee the
+/// aggregate names.
+fn attestation_message_rules(
+    seen: Option<(&SeenAggregates, ValidatorIndex)>,
+    store: &Store,
+    aggregate: &pq::Attestation,
+    now_ms: u64,
+) -> Result<CommitteeIndex, Outcome> {
+    let config = store.config();
     let data = &aggregate.data;
     // [REJECT] The bitfield fits every committee of a slot, read without
     // expanding it: everything below expands it.
@@ -242,13 +253,16 @@ pub fn aggregate_cheap_checks(
         return Err(Outcome::Reject(RejectReason::DataIndexOutOfRange));
     }
     // [REJECT] Exactly one committee is specified by the committee bits.
-    let Some(key) = aggregate_key(signed) else {
+    let [committee_index] = get_committee_indices(&aggregate.committee_bits)[..] else {
         return Err(Outcome::Reject(RejectReason::CommitteeBits));
     };
-    let bits = aggregation_bits(signed);
+    let bits = expand_bits(aggregate);
     // [IGNORE] Not a covered superset, and [IGNORE] the first for this epoch
     // and aggregator.
-    seen.verdict_parts(&key, &bits)?;
+    if let Some((seen, aggregator_index)) = seen {
+        let key = key_of(aggregate, committee_index, aggregator_index);
+        seen.verdict_parts(&key, &bits)?;
+    }
     // [IGNORE] Not from a future slot.
     if is_future_slot(&config, data.slot, now_ms) {
         return Err(Outcome::Ignore(IgnoreReason::FutureSlot));
@@ -267,7 +281,27 @@ pub fn aggregate_cheap_checks(
     if !bits.iter().any(|&bit| bit) {
         return Err(Outcome::Reject(RejectReason::NoParticipants));
     }
-    Ok(())
+    Ok(committee_index)
+}
+
+fn key_of(
+    aggregate: &pq::Attestation,
+    committee_index: CommitteeIndex,
+    aggregator_index: ValidatorIndex,
+) -> AggregateKey {
+    AggregateKey {
+        data_root: aggregate.data.hash_tree_root(),
+        committee_index,
+        target_epoch: aggregate.data.target.epoch,
+        aggregator_index,
+    }
+}
+
+fn expand_bits(aggregate: &pq::Attestation) -> Vec<bool> {
+    let bits = &aggregate.aggregation_bits;
+    (0..bits.len())
+        .map(|index| bits.get(index).unwrap_or(false))
+        .collect()
 }
 
 /// The rules that need the vote block's state. `Ok` is `Accept`, carrying the
@@ -277,7 +311,44 @@ pub fn aggregate_stateful_checks(
     signed: &pq::SignedAggregateAndProof,
 ) -> Result<Vec<ValidatorIndex>, Outcome> {
     let aggregate_and_proof = &signed.message;
-    let aggregate = &aggregate_and_proof.aggregate;
+    let signed_message = SignedMessage {
+        aggregator_index: aggregate_and_proof.aggregator_index,
+        aggregate: &aggregate_and_proof.aggregate,
+        message_root: aggregate_and_proof.hash_tree_root(),
+        signature: &signed.signature,
+    };
+    let checked = aggregate_state_rules(store, &signed_message)?;
+    // [Modified in PQ] [REJECT] The aggregate stark is valid.
+    verify_aggregate_proof(&checked.statements, &aggregate_and_proof.proof)?;
+    Ok(checked.attesting_indices)
+}
+
+/// What an aggregator signed, whichever container carries it: an
+/// `AggregateAndProof` on gossipsub, an `AggregateHeader` on Waggle.
+struct SignedMessage<'a> {
+    aggregator_index: ValidatorIndex,
+    aggregate: &'a pq::Attestation,
+    /// The `hash_tree_root` of the signed container.
+    message_root: Root,
+    signature: &'a XmssSignature,
+}
+
+/// What [`aggregate_state_rules`] found: everything the proof is then checked
+/// against.
+struct StateChecked {
+    committee_index: CommitteeIndex,
+    attesting_indices: Vec<ValidatorIndex>,
+    statements: Vec<AggregateStatement>,
+}
+
+/// Every rule of an aggregate that needs the vote block's state but the
+/// proof's: the signature, the committee, the aggregator, and the ancestry
+/// and payload status of the vote.
+fn aggregate_state_rules(
+    store: &Store,
+    signed: &SignedMessage<'_>,
+) -> Result<StateChecked, Outcome> {
+    let aggregate = signed.aggregate;
     let data = &aggregate.data;
     let target_epoch = data.target.epoch;
     let config = store.config();
@@ -288,7 +359,7 @@ pub fn aggregate_stateful_checks(
     )?;
 
     // The pubkey-only signature first, before any committee derivation.
-    let aggregator_index = aggregate_and_proof.aggregator_index;
+    let aggregator_index = signed.aggregator_index;
     let Ok(aggregator) = state.pq_validator(aggregator_index) else {
         return Err(Outcome::Reject(RejectReason::UnknownValidator));
     };
@@ -296,23 +367,23 @@ pub fn aggregate_stateful_checks(
     // aggregate leaf.
     let domain =
         get_domain_from_schedule(&config, &state, DOMAIN_AGGREGATE_AND_PROOF, target_epoch);
-    let signing_root = compute_signing_root(aggregate_and_proof.hash_tree_root(), domain);
+    let signing_root = compute_signing_root(signed.message_root, domain);
     let leaf_index = compute_xmss_leaf_index(data.slot, LEAF_OFFSET_AGGREGATE_AND_PROOF)
         .map_err(|_| Outcome::Reject(RejectReason::AggregatorSignature))?;
     if !xmss_verify(
         &aggregator.pubkey(),
         leaf_index,
         signing_root,
-        &signed.signature,
+        signed.signature,
     ) {
         return Err(Outcome::Reject(RejectReason::AggregatorSignature));
     }
 
     let committees = store.committee_cache();
     let epoch_committees = committees.committees(&state, target_epoch);
-    let committee_index = aggregate_key(signed)
-        .expect("aggregate_cheap_checks rejects an aggregate with no single committee")
-        .committee_index;
+    let [committee_index] = get_committee_indices(&aggregate.committee_bits)[..] else {
+        return Err(Outcome::Reject(RejectReason::CommitteeBits));
+    };
     // [REJECT] The committee index is within the expected range.
     if committee_index >= epoch_committees.committees_per_slot() {
         return Err(Outcome::Reject(RejectReason::CommitteeIndex));
@@ -331,16 +402,8 @@ pub fn aggregate_stateful_checks(
     if !aggregators.contains(&aggregator_index) {
         return Err(Outcome::Reject(RejectReason::NotAggregator));
     }
-    // [Modified in PQ] [REJECT] The aggregate stark is valid. A prover sidecar
-    // that did not answer (restarting, say) judged nothing, so the aggregate
-    // is IGNOREd rather than its sender penalized for it.
     let statements = get_attestation_statements(&state, aggregate, &committees)
         .map_err(|_| Outcome::Reject(RejectReason::AggregateProof))?;
-    match try_verify_aggregates(&statements, &aggregate_and_proof.proof) {
-        Ok(true) => {}
-        Ok(false) => return Err(Outcome::Reject(RejectReason::AggregateProof)),
-        Err(_) => return Err(Outcome::Ignore(IgnoreReason::ProverUnreachable)),
-    }
     let attesting_indices = get_attesting_indices(&state, aggregate, &committees)
         .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
 
@@ -353,7 +416,164 @@ pub fn aggregate_stateful_checks(
     )?;
     // The attested payload status is consistent with the block's payload.
     verify_attestation_payload_status(store, data)?;
-    Ok(attesting_indices)
+    Ok(StateChecked {
+        committee_index,
+        attesting_indices,
+        statements,
+    })
+}
+
+/// [Modified in PQ] [REJECT] The aggregate stark is valid. A prover sidecar
+/// that did not answer (restarting, say) judged nothing, so the aggregate is
+/// IGNOREd rather than its sender penalized for it.
+fn verify_aggregate_proof(
+    statements: &[AggregateStatement],
+    proof: &pq::AttestationProof,
+) -> Result<(), Outcome> {
+    match try_verify_aggregates(statements, proof) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Outcome::Reject(RejectReason::AggregateProof)),
+        Err(_) => Err(Outcome::Ignore(IgnoreReason::ProverUnreachable)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// beacon_aggregate_and_proof over Waggle
+// ---------------------------------------------------------------------------
+
+/// The header of an aggregate broadcast over Waggle (the "Fast leanVM Proof
+/// Broadcast" draft EIP) that passed every rule of `beacon_aggregate_and_proof`
+/// but the two the proof and the seen cache decide: its chunks can be checked
+/// and forwarded on its `proof_chunks_root` before the proof is whole.
+#[derive(Debug, Clone)]
+pub struct CheckedHeader {
+    pub signed_header: pq::SignedAggregateHeader,
+    /// The `hash_tree_root` of the `AggregateHeader`, the aggregate's id on
+    /// the wire with its slot and aggregator.
+    pub header_root: Root,
+    pub committee_index: CommitteeIndex,
+    /// The attesters, in committee order.
+    pub attesting_indices: Vec<ValidatorIndex>,
+    /// What the proof is to prove.
+    pub statements: Vec<AggregateStatement>,
+}
+
+impl CheckedHeader {
+    /// The header of an aggregate whose header and proof the caller already
+    /// checked ([`aggregate_header_checks`], then [`aggregate_proof_checks`]),
+    /// rebuilt from what those checks resolved. It carries no statements: it
+    /// is for disseminating the aggregate, and no proof is checked against it
+    /// again.
+    pub fn proven(
+        signed_header: pq::SignedAggregateHeader,
+        committee_index: CommitteeIndex,
+        attesting_indices: Vec<ValidatorIndex>,
+    ) -> Self {
+        Self {
+            header_root: signed_header.message.hash_tree_root(),
+            signed_header,
+            committee_index,
+            attesting_indices,
+            statements: Vec::new(),
+        }
+    }
+
+    pub fn aggregate(&self) -> &pq::Attestation {
+        &self.signed_header.message.aggregate
+    }
+
+    pub fn aggregator_index(&self) -> ValidatorIndex {
+        self.signed_header.message.aggregator_index
+    }
+
+    pub fn proof_chunks_root(&self) -> Root {
+        self.signed_header.message.proof_chunks_root
+    }
+
+    /// The keys [`SeenAggregates`] records the aggregate under.
+    pub fn seen_key(&self) -> AggregateKey {
+        key_of(
+            self.aggregate(),
+            self.committee_index,
+            self.aggregator_index(),
+        )
+    }
+
+    /// The aggregate's bits, expanded.
+    pub fn aggregation_bits(&self) -> Vec<bool> {
+        expand_bits(self.aggregate())
+    }
+
+    /// The seen cache's two rules, which the header was not checked for:
+    /// [IGNORE] not a covered superset, and [IGNORE] the first for its epoch
+    /// and aggregator.
+    pub fn seen_check(&self, seen: &SeenAggregates) -> Result<(), Outcome> {
+        seen.verdict_parts(&self.seen_key(), &self.aggregation_bits())
+    }
+}
+
+/// The rules a node applies to an aggregate's header when it arrives with the
+/// first chunk of its proof: every rule of `beacon_aggregate_and_proof` but
+/// the seen cache's and the proof's, with the aggregator's signature over the
+/// `AggregateHeader`. Those two are [`aggregate_proof_checks`]' and the seen
+/// cache's, once every chunk is held.
+pub fn aggregate_header_checks(
+    store: &Store,
+    signed_header: &pq::SignedAggregateHeader,
+    now_ms: u64,
+) -> Result<CheckedHeader, Outcome> {
+    let header = &signed_header.message;
+    attestation_message_rules(None, store, &header.aggregate, now_ms)?;
+    let header_root = header.hash_tree_root();
+    let signed = SignedMessage {
+        aggregator_index: header.aggregator_index,
+        aggregate: &header.aggregate,
+        message_root: header_root,
+        signature: &signed_header.signature,
+    };
+    let checked = aggregate_state_rules(store, &signed)?;
+    Ok(CheckedHeader {
+        signed_header: signed_header.clone(),
+        header_root,
+        committee_index: checked.committee_index,
+        attesting_indices: checked.attesting_indices,
+        statements: checked.statements,
+    })
+}
+
+/// The proof's rules for an aggregate whose header passed
+/// [`aggregate_header_checks`], once the proof is reassembled from its chunks:
+/// it is the proof the header commits to, and it proves the attesters'
+/// signatures.
+///
+/// Reassembly accepts only the canonical split, so chunks that all verified
+/// against the header's root are this proof's; the root is compared anyway,
+/// for a proof that did not come from chunks.
+pub fn aggregate_proof_checks(header: &CheckedHeader, proof: &pq::AttestationProof) -> Outcome {
+    if compute_proof_chunks_root(proof).ok() != Some(header.proof_chunks_root()) {
+        return Outcome::Reject(RejectReason::AggregateProof);
+    }
+    match verify_aggregate_proof(&header.statements, proof) {
+        Ok(()) => Outcome::Accept,
+        Err(outcome) => outcome,
+    }
+}
+
+/// The validators in the aggregation committee of some committee of `slot`,
+/// by the head state: the only ones whose aggregate of `slot` can be valid.
+/// `None` when the head is not a PQ state or its window does not reach `slot`.
+pub fn aggregators_at_slot(store: &Store, slot: Slot) -> Option<Vec<ValidatorIndex>> {
+    let state = pq_head_state(store).ok()?;
+    let committees = store.committee_cache();
+    let epoch_committees = committees.committees(&state, compute_epoch_at_slot(slot));
+    let mut aggregators = Vec::new();
+    for committee_index in 0..epoch_committees.committees_per_slot() {
+        let committee = get_aggregation_committee(&state, slot, committee_index).ok()?;
+        aggregators.extend(committee.iter().copied());
+    }
+    aggregators.sort_unstable();
+    aggregators.dedup();
+    Some(aggregators)
 }
 
 // ---------------------------------------------------------------------------

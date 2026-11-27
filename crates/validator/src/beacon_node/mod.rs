@@ -788,6 +788,14 @@ pub trait BeaconNodeApi: Send + Sync {
         aggregates: &[ethlambda_types::beacon::containers::pq::SignedAggregateAndProof],
     ) -> Result<()>;
 
+    /// Publish PQ aggregates for the node to broadcast over Waggle: each
+    /// signed header with the proof it commits to, posted to the same
+    /// `aggregate_and_proofs` endpoint (Lighthouse's PQ branch's shape).
+    async fn publish_pq_waggle_aggregates(
+        &self,
+        aggregates: &[ethlambda_types::beacon::containers::pq::SignedPqAggregate],
+    ) -> Result<()>;
+
     /// Tells the node where to pay each validator's execution-layer block
     /// rewards, so it has somewhere to send them when it builds a payload.
     ///

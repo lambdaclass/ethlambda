@@ -3757,6 +3757,7 @@ pub(crate) mod tests {
             aggregator_subnets: HashMap::new(),
             aggregator_subnets_pq: HashMap::new(),
             parked_votes: Default::default(),
+            waggle: Default::default(),
             peer_scoring: None,
         }
     }

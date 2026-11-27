@@ -618,6 +618,15 @@ pub(crate) mod test_utils {
             Ok(())
         }
 
+        fn publish_pq_waggle_aggregate(
+            &self,
+            _aggregate: ethlambda_types::beacon::containers::pq::SignedPqAggregate,
+            _committee_index: u64,
+            _attesting_indices: Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+
         fn publish_beacon_attestation(
             &self,
             subnet_id: u64,
