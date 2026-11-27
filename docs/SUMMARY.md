@@ -34,4 +34,5 @@
 
 - [Benchmarking](./benchmarking.md)
 - [Era Replay](./era_replay.md)
+- [Fuzzing](./fuzzing.md)
 - [Spec Deviations](./spec_deviations.md)

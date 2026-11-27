@@ -1,0 +1,7 @@
+target/
+# Crash and timeout inputs libFuzzer writes; a kept one becomes a regression
+# test in the owning crate, not a file here.
+artifacts/
+# Grown by every run; seed inputs would go in `seeds/`, not here.
+corpus/
+coverage/
