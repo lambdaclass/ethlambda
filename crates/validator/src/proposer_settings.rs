@@ -318,7 +318,10 @@ impl ProposerSettings {
     ///
     /// Lighthouse's order, so a `default` line in the file shadows a
     /// validator's own graffiti too. `None` when none is set: the request then
-    /// carries no graffiti, and the beacon node applies its own default.
+    /// carries no graffiti, and the beacon node applies its own default. The
+    /// binary never sets both a file and `--graffiti` (its CLI refuses the
+    /// pair, as Lighthouse's does), so with a file the last source reached is
+    /// the validator's own graffiti.
     ///
     /// The file is read afresh on every call, off the runtime (see
     /// [`GraffitiFile::read`]). One that cannot be read or no longer parses
@@ -373,8 +376,8 @@ impl ProposerSettings {
             } else {
                 warn!(
                     %err,
-                    "Graffiti file skipped; the validator's own graffiti applies, else \
-                     --graffiti, else none"
+                    "Graffiti file skipped; the validator's own graffiti applies, if it \
+                     has one"
                 );
             }
         })
