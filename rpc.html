@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f7066c6a.js";
+            window.path_to_searchindex_js = "searchindex-ee1da32d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-26bf4b2e.js"></script>
@@ -854,7 +854,7 @@ state has made pointless are pruned.</p>
 <p><strong><code>pool/proposer_slashings</code>, <code>pool/attester_slashings</code>, <code>pool/voluntary_exits</code>
 and <code>pool/bls_to_execution_changes</code></strong>: <code>GET</code> lists the pool. <code>POST</code> runs the
 specification’s <code>validate_*_gossip</code> rule for the topic against the head’s
-post-state as it is (consensus-specs v1.7.0-beta.1; no <code>process_*</code> and no
+post-state as it is (consensus-specs v1.7.0-beta.5; no <code>process_*</code> and no
 state advance, and an attester slashing’s range and slashability checks run
 before its BLS checks), pools the operation and gossips it on the topic. A
 rejected operation is a <code>400</code>. <code>bls_to_execution_changes</code> takes an array: on

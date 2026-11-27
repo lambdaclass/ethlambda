@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f7066c6a.js";
+            window.path_to_searchindex_js = "searchindex-ee1da32d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-26bf4b2e.js"></script>
@@ -443,6 +443,7 @@ different checkpoints.</p>
 <tr><td><code>time</code></td><td><code>u64</code></td><td>both</td><td>The store clock, as a <strong>UNIX timestamp in milliseconds</strong></td></tr>
 <tr><td><code>config</code></td><td><code>Config</code></td><td>both</td><td>The node’s runtime configuration, except the keys below that have rows of their own</td></tr>
 <tr><td><code>config_gas_limit_schedule</code></td><td><code>List[GasLimitScheduleEntry, 32]</code></td><td>both</td><td><code>GAS_LIMIT_SCHEDULE</code> (gloas, EIP-8261); absent in a directory written before it</td></tr>
+<tr><td><code>config_min_transaction_gas</code></td><td><code>u64</code></td><td>both</td><td><code>MIN_TRANSACTION_GAS</code> (gloas, consensus-specs v1.7.0-beta.5); absent in a directory written before it</td></tr>
 <tr><td><code>head</code></td><td><code>H256</code></td><td>both</td><td>Current fork choice head</td></tr>
 <tr><td><code>anchor_slot</code></td><td><code>u64</code></td><td>both</td><td>The slot this directory’s chain begins at</td></tr>
 <tr><td><code>states_pruned_below</code></td><td><code>u64</code></td><td>both</td><td>Exclusive upper bound of the <code>States</code>/<code>StateDiffs</code> slots already range-deleted; absent means 0</td></tr>
@@ -491,10 +492,11 @@ seconds, and a second-resolution row could not name them.</p>
 </table>
 </div>
 <p>Nothing stores a derived reading, so none of them can fall out of step with
-the row or with each other. The beacon specification denominates its own
-<code>Store.time</code> in seconds, so <code>on_tick</code> and <code>on_tick_per_slot</code> convert on the
-way in and the fixture harness divides on the way out; that conversion lives
-at those edges rather than in a second row.</p>
+the row or with each other. The beacon specification keeps <code>Store.time_ms</code> in
+milliseconds too (consensus-specs #5667), which <code>on_tick_ms</code> and
+<code>on_tick_per_slot_ms</code> take as is; the seconds-taking <code>on_tick</code> the fixture
+harness ticks with multiplies on the way in, and the harness divides on the way
+out for the fixtures’ <code>time</code> check, a whole-second reading.</p>
 <p>Lean’s <code>on_tick</code> writes the row only at interval boundaries, since the
 boundary is what it has actually processed: it walks forward one interval at a
 time running that interval’s duty, and the leftover milliseconds up to the

@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f7066c6a.js";
+            window.path_to_searchindex_js = "searchindex-ee1da32d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-26bf4b2e.js"></script>
@@ -427,8 +427,8 @@ does not follow gets a separate, explicit warning at startup, since the chain
 follower would stop tracking the chain there regardless of what parsed
 cleanly; none exists today. The keys this
 build runs on compile-time constants for (the custody and subnet counts, the
-<code>MAX_REQUEST_*</code> limits, <code>MAX_PAYLOAD_SIZE</code>, the snappy message domains and
-<code>MAXIMUM_GOSSIP_CLOCK_DISPARITY</code>) must equal those
+<code>MAX_REQUEST_*</code> limits, <code>MAX_PAYLOAD_SIZE</code>, the snappy message domains,
+<code>MAXIMUM_GOSSIP_CLOCK_DISPARITY</code> and <code>MIN_TRANSACTION_GAS</code>) must equal those
 constants, or startup fails naming each key that differs: the node cannot
 follow a network that sets them otherwise, and <code>/eth/v1/config/spec</code> would
 report values it does not use. For a directory, both checks run before its
@@ -1140,7 +1140,8 @@ costs that key an epoch of duties without it.</p>
 <code>/eth/v1/config/spec</code>, not divided out of a compiled-in constant. The
 specification states them as <code>SLOT_DURATION_MS</code> plus basis points of it,
 <code>ATTESTATION_DUE_BPS</code> and <code>AGGREGATE_DUE_BPS</code>, which on mainnet’s 12-second slot
-work out at 3999 ms and 8000 ms. Gloas moves both earlier
+work out at 4000 ms and 8000 ms, rounded to the nearest millisecond since
+consensus-specs #5756. Gloas moves both earlier
 (<code>ATTESTATION_DUE_BPS_GLOAS</code>, <code>AGGREGATE_DUE_BPS_GLOAS</code>) and adds
 <code>PAYLOAD_ATTESTATION_DUE_BPS</code> (and <code>PAYLOAD_DUE_BPS</code>, which the node uses), so
 the clock picks the pair by the fork of each slot’s own epoch. The sync

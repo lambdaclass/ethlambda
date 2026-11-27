@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f7066c6a.js";
+            window.path_to_searchindex_js = "searchindex-ee1da32d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-26bf4b2e.js"></script>
@@ -648,9 +648,11 @@ and are reseeded empty on resume; see <a href="./data_storage.html">data_storage
 a <code>SignedExecutionPayloadEnvelope</code>. The payload is applied by the <em>next</em>
 block: <code>process_parent_execution_payload</code> compares that block’s bid against the
 parent’s committed one to tell whether the parent was full or empty, and for a
-full parent <code>apply_parent_execution_payload</code> runs the execution-layer requests
-carried in <code>parent_execution_requests</code> and settles the builder’s payment. An
-empty parent must carry no requests.</p>
+full parent <code>apply_parent_execution_payload</code> settles the builder’s payment and
+then runs the execution-layer requests carried in <code>parent_execution_requests</code>,
+in that order since consensus-specs #5695, so that a builder exit request is
+refused while its payment is still pending. An empty parent must carry no
+requests.</p>
 <p><code>verify_execution_payload_envelope</code> is the checking half that used to sit in
 <code>process_execution_payload</code>, and it mutates nothing: fork choice calls it on a
 stored state when an envelope arrives, and only the next block changes state.
@@ -759,11 +761,15 @@ debug assertion bounds it).</p>
 <h2 id="fast-confirmation-rule"><a class="header" href="#fast-confirmation-rule">Fast Confirmation Rule</a></h2>
 <p><code>beacon::fast_confirmation</code> implements the Fast Confirmation Rule (FCR) of
 consensus-specs’ <code>phase0</code>, <code>bellatrix</code> and <code>gloas</code> <code>fast-confirmation.md</code>, at
-<strong>consensus-specs <code>master</code>, commit <code>f993cf2</code></strong> rather than the pinned
-<code>v1.7.0-beta.2</code>. The release ships no FCR fixtures, and <code>master</code> has fixes it
-lacks (the gloas empty-slot support discount, precise committee weight, the
-restart-resilient confirmed root, the <code>support_discount &lt;= maximum_support</code>
-assertion). A later bump should diff those three files against that commit.</p>
+the pinned release. Its <code>fast_confirmation</code> fixtures (minimal only, altair
+through gloas) are collected by <code>tests/beacon_spec/fast_confirmation.rs</code>, which
+would replay them with the fork-choice runner and, at each <code>checks</code> step
+naming a <code>confirmed_root</code>, run <code>on_fast_confirmation</code> and compare every FCR
+variable and <code>safe_execution_block_hash</code>. Every v1.7.0-beta.5 vector is
+generated with BLS ignored (<code>bls_setting: 2</code>), with stub signatures that are
+not curve points, and signature checks are never switched off, so each is
+reported as ignored instead. Until a release ships signed vectors, the rule is
+checked by its unit tests only.</p>
 <ul>
 <li>
 <p><strong>Shape.</strong> One Rust function per specification function, named as the
@@ -980,24 +986,27 @@ that is not ignored passes on both presets:</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Preset</th><th>Fixture cases passed</th><th>Ignored</th><th>Lib tests</th></tr>
+<tr><th>Preset</th><th>Fixture cases passed</th><th>Ignored</th></tr>
 </thead>
 <tbody>
-<tr><td>mainnet</td><td>7175</td><td>1285</td><td>433 passed, 1 ignored</td></tr>
-<tr><td>minimal</td><td>49261</td><td>5403</td><td>434 passed, 1 ignored</td></tr>
+<tr><td>mainnet</td><td>7556</td><td>986</td></tr>
+<tr><td>minimal</td><td>49650</td><td>6410</td></tr>
 </tbody>
 </table>
 </div>
-<p>The lib counts are with <code>beacon-spec-tests</code> on, and include lean’s own unit
-tests, since the two chains share one lib target. The one ignored lib test is
-a timing measurement, not a fixture.</p>
+<p>These are the counts at <code>v1.7.0-beta.5</code>, each the spec binary’s own run
+(<code>make test-beacon-mainnet</code> also runs the lib tests, which are not counted
+here).</p>
 <p>Minimal runs more cases because the release ships more fixtures for it, and it
-runs two runners mainnet does not: <code>genesis</code>’s <code>initialization</code> and <code>validity</code>.
-The release ships no mainnet <code>genesis</code> fixtures, so that whole runner is added
-to minimal runs only (<code>tests/beacon_spec/genesis.rs</code>).</p>
+runs two runners mainnet does not. <code>genesis</code>’s <code>initialization</code> and <code>validity</code>:
+the release ships no mainnet <code>genesis</code> fixtures, so that whole runner is added
+to minimal runs only (<code>tests/beacon_spec/genesis.rs</code>). And <code>fast_confirmation</code>,
+1294 cases from altair through gloas, which the release likewise ships for
+minimal alone, all of them ignored (see below).</p>
 <p>The gossip validation vectors this crate’s <code>gossip.rs</code> runner covers come from
-the same tree as every other suite. The node validates four topics under fulu’s
-rules; every other case is ignored by name rather than left unmatched.</p>
+the same tree as every other suite. The node validates the topics in
+<code>HANDLERS</code>, each under the forks <code>validated_forks</code> names; every other case is
+ignored by name rather than left unmatched.</p>
 <p>Nothing is ignored for being unimplemented in the state transition or fork
 choice: <code>HIGHEST_IMPLEMENTED_FORK</code> is gloas, and every gloas case that is not
 ignored runs. The ignored cases are deliberate exclusions:</p>
@@ -1011,6 +1020,10 @@ of the aggregate and attestation topics (block and data column validate fulu
 and gloas), and the vectors in <code>SKIPPED</code>, which assume a bad-block cache.</li>
 <li>The <code>heze</code> fixture tree, one ignored entry. See “Accounting for every fork
 directory” below.</li>
+<li>Cases generated with BLS ignored (<code>bls_setting: 2</code>), whose stub signatures
+are not curve points: every <code>fast_confirmation</code> case at v1.7.0-beta.5.
+Signature checks are never switched off to run them, since a switch like
+that could easily skip checks in a production build.</li>
 </ul>
 <h2 id="accounting-for-every-fork-directory"><a class="header" href="#accounting-for-every-fork-directory">Accounting for every fork directory</a></h2>
 <p><code>collect</code> identifies a fork by parsing the directory name into a <code>ForkName</code>, and
