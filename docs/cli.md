@@ -1193,9 +1193,12 @@ it to a temporary path and rename it over the old one, so a proposal never
 reads it half-written.
 
 A file that cannot be read or does not parse, a graffiti over 32 bytes among
-them, refuses startup, as an over-long `--graffiti` does. So does a file over
-16 MiB, and one not read within 5 seconds, so a stalled mount or a FIFO in the
-file's place refuses startup rather than hang it. One read within 5 seconds
+them, refuses startup, as an over-long `--graffiti` does. So does a path that
+is not a regular file (a FIFO, a directory, a device), a file over 16 MiB, and
+one not read within 5 seconds, so a stalled mount refuses startup rather than
+hang it. A FIFO is refused at once, not after the 5 seconds: the file is
+opened without waiting for a writer (`O_NONBLOCK`), and what was opened is
+checked to be a regular file before it is read. One read within 5 seconds
 but in more than 250 ms starts with a warning, since a proposal gives up on a
 read that slow (see below); a cold cache can make one read that slow and the
 next ones fast, so it is not refused. Once the client is running,
@@ -1216,10 +1219,13 @@ that finds the read running longer than that skips the file at once. So a
 stalled file holds one thread, never one slashing protection runs on, and
 costs a proposal at most 250 ms; and a caller that joins a read takes the
 file as it was at most 250 ms before it asked. The price of one read at a
-time: a read that never returns, as one of a FIFO nothing writes to or of a
-hung network mount does, turns the file off until it returns or the client
-restarts. Every proposal meanwhile skips the file with a warning, even once
-the file is put right, since the stuck read is still the running one.
+time: a read that never returns, as one of a hung network mount does, turns
+the file off until it returns or the client restarts. Every proposal
+meanwhile skips the file with a warning, even once the file is put right,
+since the stuck read is still the running one. A FIFO put in the file's place
+cannot cause this, since it is refused at once like a directory, and the next
+proposal reads the file again; only a filesystem that never answers an
+`open`, `fstat` or `read` can.
 
 One thing differs from Lighthouse besides the reload: the keymanager API's
 graffiti routes stay open while the file is set: a `POST graffiti` is written to `validator_definitions.yml` and

@@ -32,20 +32,34 @@
 //! among them, refuses startup ([`GraffitiFile::open`]), as an over-long
 //! `--graffiti` does. Once running, the same failure costs only the file: the
 //! proposal logs a warning and takes its graffiti from the next source. So
-//! does a file over [`MAX_FILE_BYTES`], and a read that has not finished
-//! within [`READ_TIMEOUT`], so a stalled mount cannot cost the proposal its
-//! slot. See [`ProposerSettings::next_graffiti`] for the order.
+//! does a path that is not a regular file, a file over [`MAX_FILE_BYTES`], and
+//! a read that has not finished within [`READ_TIMEOUT`], so a stalled mount
+//! cannot cost the proposal its slot. See [`ProposerSettings::next_graffiti`]
+//! for the order.
+//!
+//! # A FIFO in the file's place
+//!
+//! A plain open of a FIFO for reading blocks until something opens it for
+//! writing, so a FIFO nothing writes to, put at the path, would be a read
+//! that never returns. The file is therefore opened with `O_NONBLOCK` (on
+//! unix), which returns from that open at once, and what was opened is
+//! checked to be a regular file before it is read; anything else (a FIFO, a
+//! directory, a device) is refused as [`GraffitiFileError::NotARegularFile`],
+//! at startup and at a proposal alike. The check is of the open handle, not
+//! of the path, so nothing can be put at the path between the check and the
+//! read, and `O_NONBLOCK` changes nothing for a regular file's reads.
 //!
 //! # A file that stalls
 //!
 //! Each read runs on a thread of its own, not on tokio's blocking pool, and
 //! only one runs at a time: a caller that comes while one runs waits for that
 //! read's answer rather than starting another, since both would read the same
-//! file. A read of a stalled mount, or of a FIFO put in the file's place,
-//! never returns, and keeps its thread until the file answers. On the
-//! blocking pool, every proposal and `GET graffiti` would strand one more of
-//! the threads slashing protection runs on, until none were left for it, and
-//! the runtime would wait for the stuck ones forever when the client stops.
+//! file. A read of a stalled mount (an `open`, `fstat` or `read` the
+//! filesystem never answers) never returns, and keeps its thread until the
+//! mount answers. On the blocking pool, every proposal and `GET graffiti`
+//! would strand one more of the threads slashing protection runs on, until
+//! none were left for it, and the runtime would wait for the stuck ones
+//! forever when the client stops.
 //! Here a stalled file holds one thread, and the process exits past it.
 //!
 //! [`READ_TIMEOUT`] counts from the start of a read, not from each caller's
@@ -59,12 +73,14 @@
 //! [`OPEN_TIMEOUT`] and refuses startup past it.
 //!
 //! The price of one read at a time: a read that never returns, as one of a
-//! FIFO nothing writes to or of a hung network mount does, turns the file off
-//! until it returns or the client restarts. Every caller meanwhile joins it
-//! and is given up on, so every proposal skips the file with a warning, even
-//! once the file is put right, since the stuck read is still the running one.
-//! Starting a second read beside a stuck one would end that, at the cost of a
-//! thread per stuck read; one read at a time is the choice made here.
+//! hung network mount does, turns the file off until it returns or the client
+//! restarts. Every caller meanwhile joins it and is given up on, so every
+//! proposal skips the file with a warning, even once the file is put right,
+//! since the stuck read is still the running one. A FIFO cannot cause this,
+//! since it is refused without being waited on (above); only a filesystem
+//! that never answers can. Starting a second read beside a stuck one would
+//! end that, at the cost of a thread per stuck read; one read at a time is the
+//! choice made here.
 //!
 //! [`ProposerSettings::next_graffiti`]: crate::proposer_settings::ProposerSettings::next_graffiti
 
@@ -93,14 +109,15 @@ pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// How long a read of the file may run, from its start, before its callers
 /// are given up on: a proposal waits at most this long for the file, less
 /// when it joins a read already running. A local read takes microseconds; a
-/// stalled network mount, or a FIFO swapped in for the file, would otherwise
-/// hold the block request until the slot is lost, for the sake of a graffiti.
+/// stalled network mount would otherwise hold the block request until the
+/// slot is lost, for the sake of a graffiti.
 pub const READ_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// How long startup waits for its read of the file ([`GraffitiFile::open`]).
 /// Seconds rather than [`READ_TIMEOUT`], so a mount's slow first access or a
 /// busy machine does not refuse a file that reads; bounded, so a stalled
-/// mount or a FIFO refuses startup naming the file rather than hanging it.
+/// mount refuses startup naming the file rather than hanging it. (A FIFO is
+/// refused at once, without this wait: see the module doc.)
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The read timeout of a test that reads a file whole and compares what it
@@ -125,6 +142,10 @@ pub enum GraffitiFileError {
         path: String,
         error: Arc<std::io::Error>,
     },
+    /// A FIFO, a directory or a device at the path: anything a read could
+    /// block on, or that holds no text, refused before it is read.
+    #[error("graffiti file {path} is not a regular file")]
+    NotARegularFile { path: String },
     #[error("graffiti file {path} is over {MAX_FILE_BYTES} bytes")]
     TooLarge { path: String },
     #[error("graffiti file {path} was not read within {after:?}")]
@@ -309,15 +330,24 @@ impl GraffitiFile {
         self
     }
 
-    /// Read and parse the file on the calling thread, refusing one over
-    /// [`MAX_FILE_BYTES`].
+    /// Read and parse the file on the calling thread, refusing one that is
+    /// not a regular file or is over [`MAX_FILE_BYTES`].
+    ///
+    /// The open does not wait for a FIFO's writer (`open_without_blocking`),
+    /// and what it opened is checked to be a regular file before a byte is
+    /// read, so a FIFO is refused at once rather than read forever. The check
+    /// is of the open handle, not of the path, so nothing can be put at the
+    /// path between the check and the read.
     pub fn read_now(&self) -> Result<GraffitiTable, GraffitiFileError> {
         let path = || self.path.display().to_string();
         let read = |error| GraffitiFileError::Read {
             path: path(),
             error: Arc::new(error),
         };
-        let file = std::fs::File::open(&self.path).map_err(read)?;
+        let file = open_without_blocking(&self.path).map_err(read)?;
+        if !file.metadata().map_err(read)?.is_file() {
+            return Err(GraffitiFileError::NotARegularFile { path: path() });
+        }
         let mut bytes = Vec::new();
         // One byte past the limit, to tell a file at it from one over it.
         file.take(MAX_FILE_BYTES + 1)
@@ -425,6 +455,25 @@ impl GraffitiFile {
             error: Arc::new(std::io::Error::other("the read ended without an answer")),
         }
     }
+}
+
+/// `path` opened for reading with `O_NONBLOCK`, which returns at once from
+/// the open of a FIFO that a plain open would block in until something opened
+/// it for writing. It changes nothing for a regular file, whose reads never
+/// block on it, and [`GraffitiFile::read_now`] refuses anything else before
+/// reading. Symlinks are followed, so a link to a regular file reads.
+#[cfg(unix)]
+fn open_without_blocking(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_without_blocking(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 #[cfg(test)]
@@ -752,6 +801,90 @@ mod tests {
         assert!(
             file.running.lock().expect("not poisoned").is_none(),
             "the read is done, so none is running"
+        );
+    }
+
+    /// A FIFO at `path`, with nothing writing to it.
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("no NUL");
+        // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
+        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    }
+
+    /// A FIFO nothing writes to is refused at startup as not a regular file,
+    /// rather than opened and waited on until `OPEN_TIMEOUT` (which would
+    /// answer `TimedOut`).
+    #[cfg(unix)]
+    #[test]
+    fn open_refuses_a_fifo_at_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("graffiti.fifo");
+        make_fifo(&path);
+        let err = GraffitiFile::open(&path).expect_err("a FIFO");
+        assert!(
+            matches!(err, GraffitiFileError::NotARegularFile { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("graffiti.fifo"), "got {err}");
+    }
+
+    /// A FIFO put in the file's place once running, opened plainly, would be
+    /// a read that never returned, which every later caller would join, so
+    /// the file would stay off even once a regular file was back. The read
+    /// refuses the FIFO at once instead and leaves no read running, so the
+    /// next caller reads the regular file put back in its place.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_swapped_in_is_refused_and_the_file_put_back_reads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("graffiti.txt");
+        std::fs::write(&path, format!("{PK1}: mine\n")).expect("writes");
+        let file = GraffitiFile::open(&path)
+            .expect("opens")
+            .with_read_timeout(PATIENT_READ_TIMEOUT);
+
+        std::fs::remove_file(&path).expect("removes");
+        make_fifo(&path);
+        let err = file.read().await.expect_err("a FIFO");
+        assert!(
+            matches!(err, GraffitiFileError::NotARegularFile { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            file.running.lock().expect("not poisoned").is_none(),
+            "the read answered, so none is running"
+        );
+
+        std::fs::remove_file(&path).expect("removes the FIFO");
+        std::fs::write(&path, format!("{PK1}: back\n")).expect("writes");
+        let table = file.read().await.expect("a regular file reads");
+        assert_eq!(table.graffiti(&key(PK1)), graffiti("back"));
+    }
+
+    /// A directory opens for reading on unix, so it is the type check that
+    /// refuses it, at startup and once running.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let err = GraffitiFile::open(dir.path()).expect_err("a directory");
+        assert!(
+            matches!(err, GraffitiFileError::NotARegularFile { .. }),
+            "got {err:?}"
+        );
+
+        let path = dir.path().join("graffiti.txt");
+        std::fs::write(&path, format!("{PK1}: mine\n")).expect("writes");
+        let file = GraffitiFile::open(&path).expect("opens");
+        std::fs::remove_file(&path).expect("removes");
+        std::fs::create_dir(&path).expect("a directory in its place");
+        let err = file.read_now().expect_err("a directory");
+        assert!(
+            matches!(err, GraffitiFileError::NotARegularFile { .. }),
+            "got {err:?}"
         );
     }
 }
