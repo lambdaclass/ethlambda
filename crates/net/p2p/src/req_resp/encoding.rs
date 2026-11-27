@@ -64,9 +64,9 @@ async fn read_varint<T>(io: &mut T) -> io::Result<u32>
 where
     T: AsyncRead + Unpin + Send,
 {
-    let mut buf = [0_u8; 5];
+    let mut buf = [0_u8; MAX_VARINT_LEN];
 
-    for i in 0..5 {
+    for i in 0..MAX_VARINT_LEN {
         io.read_exact(&mut buf[i..=i]).await?;
 
         if buf[i] & 0x80 == 0 {
@@ -74,10 +74,7 @@ where
         }
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "message size is bigger than 28 bits",
-    ))
+    Err(invalid("message size prefix is longer than 5 bytes"))
 }
 
 async fn read_snappy_frame<T>(
@@ -310,32 +307,37 @@ pub fn encode_varint(mut value: u32, dst: &mut [u8; 5]) -> &[u8] {
     &dst[..]
 }
 
-/// Decode a varint from a byte buffer, returning the value and remaining bytes.
-pub fn decode_varint(buf: &[u8]) -> io::Result<(u32, &[u8])> {
-    let mut result = 0_u32;
-    let mut read_size = 0;
+/// The longest varint a `u32` needs: five 7-bit groups.
+const MAX_VARINT_LEN: usize = 5;
 
-    for (i, byte) in buf.iter().enumerate() {
-        let value = (byte & 0x7F) as u32;
-        result |= value << (7 * i);
+/// Decode a varint from a byte buffer, returning the value and remaining bytes.
+///
+/// A varint that does not end within [`MAX_VARINT_LEN`] bytes, or whose value
+/// does not fit a `u32`, is refused. Its fifth byte carries bits 28..35, and
+/// keeping only the low 32 would read a length the peer never declared: `80 80
+/// 80 80 10` is 2^32, which a `u32` accumulator read as 0, under every size
+/// limit.
+pub fn decode_varint(buf: &[u8]) -> io::Result<(u32, &[u8])> {
+    let mut result = 0_u64;
+
+    for (i, byte) in buf.iter().take(MAX_VARINT_LEN).enumerate() {
+        result |= u64::from(byte & 0x7F) << (7 * i);
         if byte & 0x80 == 0 {
-            read_size = i + 1;
-            break;
+            let value =
+                u32::try_from(result).map_err(|_| invalid("message size does not fit 32 bits"))?;
+            return Ok((value, &buf[i + 1..]));
         }
     }
-    if read_size == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "message size is bigger than 28 bits",
-        ));
-    }
-    Ok((result, &buf[read_size..]))
+
+    Err(invalid(
+        "message size prefix is unterminated or longer than 5 bytes",
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{decode_payload, decode_varint, write_payload};
-    use futures::io::Cursor;
+    use futures::{executor::block_on, io::Cursor};
 
     #[test]
     fn test_decode_varint() {
@@ -346,6 +348,39 @@ mod tests {
 
         let expected: &[u8] = &[];
         assert_eq!(rest, expected);
+    }
+
+    /// The fifth byte of a length prefix carries bits 28..35, and the three
+    /// above bit 31 were shifted out of a `u32` accumulator. `80 80 80 80 10`
+    /// declares 2^32 bytes, far over `MAX_PAYLOAD_SIZE`, and was read as a
+    /// length of zero, so the size check passed and the stream was answered as
+    /// an empty payload.
+    #[test]
+    fn a_length_prefix_wider_than_u32_is_refused() {
+        let wire = [0x80, 0x80, 0x80, 0x80, 0x10];
+        assert!(decode_varint(&wire).is_err());
+
+        let decoded = block_on(decode_payload(&mut Cursor::new(wire.to_vec())));
+        assert!(
+            decoded.is_err(),
+            "a prefix declaring 2^32 bytes was accepted as {} bytes",
+            decoded.unwrap().uncompressed.len()
+        );
+    }
+
+    #[test]
+    fn the_widest_length_prefix_that_fits_u32_is_read() {
+        let (value, rest) = decode_varint(&[0xff, 0xff, 0xff, 0xff, 0x0f, 0xaa]).unwrap();
+        assert_eq!(value, u32::MAX);
+        assert_eq!(rest, &[0xaa]);
+    }
+
+    #[test]
+    fn a_length_prefix_longer_than_five_bytes_is_refused() {
+        // Non-minimal, and its value (zero) fits, but no `u32` needs six bytes.
+        assert!(decode_varint(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00]).is_err());
+        // Unterminated.
+        assert!(decode_varint(&[0x80, 0x80]).is_err());
     }
 
     #[tokio::test]

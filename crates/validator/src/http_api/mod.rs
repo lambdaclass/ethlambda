@@ -94,6 +94,7 @@ pub struct KeymanagerContext {
 }
 
 /// The file the generated token is written to, inside the validators directory.
+/// Neither read nor written when `--keymanager-token-file` names another file.
 pub const API_TOKEN_FILE: &str = "api-token.txt";
 
 /// The shortest token this will accept from an existing file.
@@ -106,7 +107,72 @@ pub const API_TOKEN_FILE: &str = "api-token.txt";
 /// [`load_or_create_token`] for why zero was not safe.
 const MIN_TOKEN_LEN: usize = 16;
 
-/// Read the API token, generating one if the file does not exist.
+/// The keymanager API's bearer token: read from `token_file` when the operator
+/// named one (`--keymanager-token-file`), otherwise from [`API_TOKEN_FILE`] in
+/// `validators_dir`, generated there if absent.
+pub fn load_token(validators_dir: &Path, token_file: Option<&Path>) -> crate::Result<String> {
+    match token_file {
+        Some(path) => load_token_file(path),
+        None => load_or_create_token(validators_dir),
+    }
+}
+
+/// Read the API token from a file the operator supplies, with the checks
+/// [`load_or_create_token`] applies to its own file.
+///
+/// Read only: nothing here writes or creates `path`. The file is the
+/// operator's, typically one token shared with tooling that calls several
+/// clients' keymanager APIs, so a missing or unusable file is an error rather
+/// than a cue to generate a token that tooling would not hold.
+fn load_token_file(path: &Path) -> crate::Result<String> {
+    let contents = std::fs::read_to_string(path).map_err(|source| Error::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let remedy =
+        format!("write a token of at least {MIN_TOKEN_LEN} visible ASCII characters to it");
+    let token = checked_token(path, &contents, &remedy)?;
+    info!(path = %path.display(), "Read the keymanager API token");
+    Ok(token)
+}
+
+/// `contents` trimmed, or an error if that is not a token a request can
+/// carry, or is shorter than [`MIN_TOKEN_LEN`]. `remedy` ends the error,
+/// telling the operator what to do about it.
+fn checked_token(path: &Path, contents: &str, remedy: &str) -> crate::Result<String> {
+    let token = contents.trim();
+    // A request carries the token in its `Authorization` header, which
+    // `require_bearer` reads through `HeaderValue::to_str`: visible ASCII,
+    // spaces and tabs, nothing else. A token with anything else (a non-ASCII
+    // character, a line break) would start the client with a keymanager API
+    // no request can authenticate to. Exactly that set, so a token that
+    // worked before this check still does. Checked first, so the length
+    // below counts characters as well as bytes.
+    let carried = |c: &char| c.is_ascii_graphic() || *c == ' ' || *c == '\t';
+    if let Some(unusable) = token.chars().find(|c| !carried(c)) {
+        return Err(Error::Keystore {
+            path: path.display().to_string(),
+            reason: format!(
+                "the API token file holds {unusable:?}, which an Authorization header cannot \
+                 carry (only visible ASCII characters, spaces and tabs); {remedy}"
+            ),
+        });
+    }
+    if token.len() < MIN_TOKEN_LEN {
+        return Err(Error::Keystore {
+            path: path.display().to_string(),
+            reason: format!(
+                "the API token file holds {} characters, which is below the {MIN_TOKEN_LEN} \
+                 required; {remedy}",
+                token.len()
+            ),
+        });
+    }
+    Ok(token.to_string())
+}
+
+/// Read the API token from [`API_TOKEN_FILE`] in `validators_dir`, generating
+/// one if the file does not exist.
 ///
 /// # An empty file is refused, not accepted
 ///
@@ -118,9 +184,12 @@ const MIN_TOKEN_LEN: usize = 16;
 /// trailing space strips to `Some("")`, and empty matched empty.
 ///
 /// It was reachable without anyone doing anything unusual:
-/// [`secure_fs::write_private`] opens with `truncate(true)` and then writes,
+/// [`secure_fs::write_private`] opened with `truncate(true)` and then wrote,
 /// so a first boot that failed between those two steps left a zero-byte file
-/// that every later boot accepted.
+/// that every later boot accepted. On unix it now replaces the file by
+/// rename, so a first boot cut partway leaves no token file and the next one
+/// generates a token. The refusal stays for a file written any other way: by
+/// hand, or off unix, where the write still truncates in place.
 ///
 /// Refusing is the right failure here rather than regenerating: a token file
 /// that exists but is unusable means something went wrong that an operator
@@ -129,20 +198,7 @@ const MIN_TOKEN_LEN: usize = 16;
 pub fn load_or_create_token(validators_dir: &Path) -> crate::Result<String> {
     let path = validators_dir.join(API_TOKEN_FILE);
     match std::fs::read_to_string(&path) {
-        Ok(token) => {
-            let token = token.trim().to_string();
-            if token.len() < MIN_TOKEN_LEN {
-                return Err(Error::Keystore {
-                    path: path.display().to_string(),
-                    reason: format!(
-                        "the API token file holds {} characters, which is below the {MIN_TOKEN_LEN} \
-                         required; delete it to have a new token generated",
-                        token.len()
-                    ),
-                });
-            }
-            Ok(token)
-        }
+        Ok(contents) => checked_token(&path, &contents, "delete it to have a new token generated"),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let token = uuid::Uuid::new_v4().simple().to_string();
             secure_fs::write_private(&path, &token).map_err(|source| Error::Io {
@@ -328,12 +384,31 @@ mod token_tests {
         assert_eq!(generated, reloaded);
     }
 
+    /// A first boot cut between creating the token's temporary file and
+    /// renaming it into place leaves that temporary behind and no token file.
+    /// The next boot generates a token rather than reading the leftover, and
+    /// clears it.
+    #[test]
+    fn a_token_write_cut_partway_leaves_a_token_to_generate_not_a_short_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let leftover = dir.path().join(format!("{API_TOKEN_FILE}.tmp"));
+        std::fs::write(&leftover, "").expect("writes the leftover");
+
+        let generated = load_or_create_token(dir.path()).expect("generates a token");
+
+        assert!(generated.len() >= MIN_TOKEN_LEN);
+        assert!(!leftover.exists(), "the leftover is cleared");
+        let reloaded = load_or_create_token(dir.path()).expect("reads it back");
+        assert_eq!(generated, reloaded);
+    }
+
     /// The authentication bypass this check exists for.
     ///
-    /// `secure_fs::write_private` truncates before it writes, so a first boot
-    /// that dies between those steps leaves a zero-byte file. Accepting it
-    /// produced an empty expected token, and `ct_eq` matches two empty slices,
-    /// so `Authorization: Bearer ` with a trailing space authenticated.
+    /// `secure_fs::write_private` used to truncate before it wrote, so a
+    /// first boot that died between those steps left a zero-byte file, as it
+    /// still can off unix. Accepting it produced an empty expected token, and
+    /// `ct_eq` matches two empty slices, so `Authorization: Bearer ` with a
+    /// trailing space authenticated.
     #[test]
     fn an_empty_token_file_is_refused_rather_than_accepted() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -374,6 +449,134 @@ mod token_tests {
         std::fs::write(dir.path().join(API_TOKEN_FILE), chosen).expect("writes it");
 
         assert_eq!(load_or_create_token(dir.path()).expect("accepted"), chosen);
+    }
+
+    /// A `--keymanager-token-file`'s contents as an operator might write them,
+    /// with whitespace around the token and a trailing newline.
+    const SUPPLIED: &str = "  a-token-an-operator-picked\n";
+
+    #[test]
+    fn a_supplied_token_file_is_read_trimmed_and_left_as_it_was() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("keymanager.txt");
+        std::fs::write(&path, SUPPLIED).expect("writes it");
+
+        let token = load_token_file(&path).expect("accepted");
+
+        assert_eq!(token, "a-token-an-operator-picked");
+        let after = std::fs::read_to_string(&path).expect("still there");
+        assert_eq!(after, SUPPLIED, "the file is read, never rewritten");
+    }
+
+    #[test]
+    fn a_short_supplied_token_file_is_refused_without_suggesting_its_deletion() {
+        // Deleting a supplied file only turns this error into a missing-file
+        // one, so the advice the generated file's error gives would be wrong.
+        for contents in ["", "   \n\t  \n", "abc"] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("keymanager.txt");
+            std::fs::write(&path, contents).expect("writes it");
+
+            let err = load_token_file(&path).expect_err("a short token must be refused");
+
+            let Error::Keystore { reason, .. } = err else {
+                panic!("expected the length refusal, got {err}");
+            };
+            assert!(reason.contains("below the"), "should say why: {reason}");
+            assert!(!reason.contains("delete"), "wrong remedy: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_supplied_token_no_request_could_carry_is_refused() {
+        // Long enough, but `require_bearer` reads the header only as visible
+        // ASCII, spaces and tabs, so each would start a keymanager API no
+        // request can authenticate to.
+        for contents in [
+            "token-for-all-clients-\u{fc}",
+            "a-token-an-operator\npicked",
+        ] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("keymanager.txt");
+            std::fs::write(&path, contents).expect("writes it");
+
+            let err = load_token_file(&path).expect_err("an unusable token must be refused");
+
+            let Error::Keystore { reason, .. } = err else {
+                panic!("expected the character refusal, got {err}");
+            };
+            assert!(reason.contains("cannot carry"), "should say why: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_supplied_token_with_spaces_inside_is_accepted() {
+        // An `Authorization` header carries spaces and tabs, and
+        // `require_bearer` keeps them after the `Bearer ` prefix, so such a
+        // token authenticates and must not be refused.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("keymanager.txt");
+        std::fs::write(&path, "a shared\tkeymanager token\n").expect("writes it");
+
+        let token = load_token_file(&path).expect("accepted");
+
+        assert_eq!(token, "a shared\tkeymanager token");
+    }
+
+    #[test]
+    fn a_missing_supplied_token_file_is_an_error_and_is_not_created() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("keymanager.txt");
+
+        let err = load_token_file(&path).expect_err("a missing file must not be generated");
+
+        assert!(
+            matches!(&err, Error::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound),
+            "got {err}"
+        );
+        assert!(!path.exists(), "the supplied path must never be written");
+    }
+
+    #[test]
+    fn with_a_token_file_the_validators_directory_gets_no_token_of_its_own() {
+        let validators_dir = tempfile::tempdir().expect("temp dir");
+        let supplied_dir = tempfile::tempdir().expect("temp dir");
+        let path = supplied_dir.path().join("keymanager.txt");
+        let generated = validators_dir.path().join(API_TOKEN_FILE);
+
+        // Missing: an error, not a fallback to the generated file.
+        load_token(validators_dir.path(), Some(&path)).expect_err("a missing file is an error");
+        assert!(!generated.exists());
+        assert!(!path.exists());
+
+        std::fs::write(&path, SUPPLIED).expect("writes it");
+        let token = load_token(validators_dir.path(), Some(&path)).expect("accepted");
+        assert_eq!(token, "a-token-an-operator-picked");
+        assert!(!generated.exists());
+    }
+
+    #[test]
+    fn a_supplied_token_file_wins_over_an_existing_generated_one() {
+        let validators_dir = tempfile::tempdir().expect("temp dir");
+        let generated = load_or_create_token(validators_dir.path()).expect("generates a token");
+        let supplied_dir = tempfile::tempdir().expect("temp dir");
+        let path = supplied_dir.path().join("keymanager.txt");
+        std::fs::write(&path, SUPPLIED).expect("writes it");
+
+        let token = load_token(validators_dir.path(), Some(&path)).expect("accepted");
+
+        assert_eq!(token, "a-token-an-operator-picked");
+        assert_ne!(token, generated);
+    }
+
+    #[test]
+    fn without_a_token_file_the_token_is_generated_as_before() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let token = load_token(dir.path(), None).expect("generates a token");
+
+        let written = std::fs::read_to_string(dir.path().join(API_TOKEN_FILE)).expect("written");
+        assert_eq!(token, written);
     }
 
     /// `ct_eq`'s behaviour on empty slices, pinned here because the

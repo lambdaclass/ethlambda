@@ -61,6 +61,7 @@ pub mod file;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ethlambda_types::beacon::containers::shared::AttestationData;
@@ -90,14 +91,27 @@ use crate::error::{Error, Result};
 pub struct SharedProtection {
     record: Arc<Mutex<SlashingProtection>>,
     unusable: CancellationToken,
+    /// The record's own, shared so it is read without the mutex.
+    outcomes: Arc<Outcomes>,
 }
 
 impl SharedProtection {
     pub fn new(protection: SlashingProtection) -> Self {
         Self {
+            outcomes: protection.outcomes.clone(),
             record: Arc::new(Mutex::new(protection)),
             unusable: CancellationToken::new(),
         }
+    }
+
+    /// Whether the record's last write succeeded and the last access through
+    /// [`blocking`] reached it within [`RECORD_WAIT`]: what `/health` reports
+    /// as `slashing_protection.last_write_ok`. A failed write keeps it false
+    /// until a later write succeeds, whatever is read in between.
+    ///
+    /// Never waits on the record's lock, which a stuck write may be holding.
+    pub fn last_write_ok(&self) -> bool {
+        self.outcomes.last_write_ok()
     }
 
     /// Lock the record on the calling thread, waiting out any other holder.
@@ -117,6 +131,24 @@ impl SharedProtection {
 /// 12-second slot is what a slow one gets.
 const RECORD_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 const RECORD_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// How the record's last write and last wait for it went, for
+/// [`SharedProtection::last_write_ok`]. Two flags, not one: an access that
+/// reaches the record clears the wait's, and only a write that succeeds
+/// clears the write's, so a read in between never hides a failed write.
+#[derive(Debug, Default)]
+struct Outcomes {
+    /// The last write of the file failed, [`Error::Unflushed`] included.
+    write_failed: AtomicBool,
+    /// The last access through [`blocking`] gave up after [`RECORD_WAIT`].
+    wait_timed_out: AtomicBool,
+}
+
+impl Outcomes {
+    fn last_write_ok(&self) -> bool {
+        !self.write_failed.load(Ordering::Relaxed) && !self.wait_timed_out.load(Ordering::Relaxed)
+    }
+}
 
 /// Run `operation` on the record on tokio's blocking pool, and wait for it.
 ///
@@ -148,7 +180,11 @@ pub async fn blocking<T: Send + 'static>(
     protection: &SharedProtection,
     operation: impl FnOnce(&mut SlashingProtection) -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    let SharedProtection { record, unusable } = protection.clone();
+    let SharedProtection {
+        record,
+        unusable,
+        outcomes,
+    } = protection.clone();
     tokio::task::spawn_blocking(move || {
         // Declared before the guard, so on a panic in `operation` it drops
         // after the guard has poisoned the lock: nobody is told the record is
@@ -169,6 +205,7 @@ pub async fn blocking<T: Send + 'static>(
                 }
                 Err(std::sync::TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
+                        outcomes.wait_timed_out.store(true, Ordering::Relaxed);
                         return Err(Error::SlashingProtectionUnusable {
                             reason: format!(
                                 "the record has been held by other accesses for {} s: a write \
@@ -181,6 +218,7 @@ pub async fn blocking<T: Send + 'static>(
                 }
             }
         };
+        outcomes.wait_timed_out.store(false, Ordering::Relaxed);
         operation(&mut protection)
     })
     .await
@@ -441,6 +479,8 @@ pub struct SlashingProtection {
     records: HashMap<BlsPubkey, Record>,
     /// `None` only for [`Self::in_memory`].
     storage: Option<Storage>,
+    /// Written by [`Self::commit`], read through [`SharedProtection`].
+    outcomes: Arc<Outcomes>,
 }
 
 impl SlashingProtection {
@@ -549,6 +589,7 @@ impl SlashingProtection {
             genesis_validators_root,
             records,
             storage: Some(Storage { path, _lock: lock }),
+            outcomes: Arc::default(),
         })
     }
 
@@ -580,6 +621,7 @@ impl SlashingProtection {
             genesis_validators_root,
             records,
             storage: Some(Storage { path, _lock: lock }),
+            outcomes: Arc::default(),
         })
     }
 
@@ -597,6 +639,7 @@ impl SlashingProtection {
             genesis_validators_root: Root::ZERO,
             records: HashMap::new(),
             storage: None,
+            outcomes: Arc::default(),
         })
     }
 
@@ -867,7 +910,10 @@ impl SlashingProtection {
                 .filter(|(pubkey, _)| !changes.contains_key(*pubkey))
                 .chain(changes.iter());
             let _timing = crate::metrics::time_slashing_protection_write();
-            if let Err(err) = file::write(&storage.path, self.genesis_validators_root, next) {
+            let written = file::write(&storage.path, self.genesis_validators_root, next);
+            let failed = &self.outcomes.write_failed;
+            failed.store(written.is_err(), Ordering::Relaxed);
+            if let Err(err) = written {
                 crate::metrics::inc_slashing_protection_write_failures();
                 if matches!(err, Error::Unflushed { .. }) {
                     self.records.extend(changes);
@@ -944,6 +990,7 @@ mod tests {
             genesis_validators_root: Root::ZERO,
             records: HashMap::new(),
             storage: None,
+            outcomes: Arc::default(),
         }
     }
 
@@ -1707,5 +1754,86 @@ mod tests {
         tokio::time::timeout(RAISED, protection.unusable())
             .await
             .expect("the task itself raises the signal");
+    }
+
+    /// A failed write turns `last_write_ok` off, an access that writes
+    /// nothing leaves it off, and the next write that succeeds turns it back
+    /// on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_write_is_reported_until_a_later_write_succeeds() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if running_as_root() {
+            eprintln!("skipped: root bypasses directory permissions");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let protection = SharedProtection::new(open(dir.path(), &[1], true).expect("init"));
+        assert!(protection.last_write_ok(), "nothing has failed yet");
+
+        let read_only = std::fs::Permissions::from_mode(0o500);
+        std::fs::set_permissions(dir.path(), read_only).expect("chmod");
+        let failed = blocking(&protection, |record| {
+            record.check_and_record_block(&pubkey(1), 10)
+        })
+        .await;
+        let writable = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(dir.path(), writable).expect("chmod back");
+        assert!(
+            failed.is_err(),
+            "the write must fail in a read-only directory"
+        );
+        assert!(!protection.last_write_ok());
+
+        let read = blocking(&protection, |record| Ok(record.check_block(&pubkey(1), 10)));
+        assert!(read.await.expect("reached").is_ok(), "nothing was recorded");
+        assert!(
+            !protection.last_write_ok(),
+            "an access that writes nothing does not clear a failed write"
+        );
+
+        blocking(&protection, |record| {
+            record.check_and_record_block(&pubkey(1), 10)
+        })
+        .await
+        .expect("written")
+        .expect("slot 10 is still signable");
+        assert!(protection.last_write_ok());
+    }
+
+    /// An access that gives up on a record held past [`RECORD_WAIT`] turns
+    /// `last_write_ok` off, and the next access that reaches it turns it back
+    /// on. Waits out the real `RECORD_WAIT`, since the wait is on a blocking
+    /// thread's clock. The record is held until the refused access returns,
+    /// however late its task starts.
+    #[tokio::test]
+    async fn a_record_held_past_the_wait_is_reported_until_an_access_reaches_it() {
+        let protection = SlashingProtection::in_memory();
+        let (locked, held) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let protection = protection.clone();
+            std::thread::spawn(move || {
+                let _guard = protection.lock().expect("not poisoned");
+                locked.send(()).expect("the test is waiting");
+                released.recv().expect("released");
+            })
+        };
+        held.recv().expect("the holder took the record");
+
+        let refused = blocking(&protection, |_| Ok(())).await;
+        assert!(
+            matches!(refused, Err(Error::SlashingProtectionUnusable { .. })),
+            "got {refused:?}"
+        );
+        assert!(!protection.last_write_ok());
+
+        release.send(()).expect("the holder is waiting");
+        holder.join().expect("the holder ends");
+        blocking(&protection, |_| Ok(()))
+            .await
+            .expect("the record is free again");
+        assert!(protection.last_write_ok());
     }
 }

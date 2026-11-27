@@ -919,6 +919,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let rpc_events = events.clone();
     let rpc_builder_market = builder_market.clone();
     let rpc_fee_recipients = fee_recipients.clone();
+    // The payload builds the chain actor starts ahead of their slots, which
+    // block production collects.
+    let prepared_payloads = ethlambda_blockchain::PreparedPayloads::default();
+    let rpc_prepared_payloads = prepared_payloads.clone();
     let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
     let rpc_custody_columns = match &setup.chain {
         ChainActor::Beacon {
@@ -963,6 +967,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     builder_market: rpc_builder_market,
                     sync_committee_pool: sync_committee_pool.clone(),
                     fee_recipients: rpc_fee_recipients,
+                    prepared_payloads: rpc_prepared_payloads,
                     custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
                     events: rpc_events,
@@ -1017,6 +1022,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     fee_recipients,
                     builder_market,
                     always_prepare: always_prepare_payload,
+                    prepared_payloads,
                 },
             )
         }
@@ -2423,12 +2429,17 @@ async fn fetch_initial_beacon_state(
                 .expect("repair_head leaves the head naming a real block");
             let gap = current_slot.saturating_sub(head_slot);
 
+            // Both resuming returns cache the head's state first, so gossip
+            // validation can check a parentless block's signature from the
+            // first message on; see `Store::cache_head_state`.
             if gap <= MAX_RESUMABLE_DB_STATE_AGE {
                 info!(head_slot, current_slot, gap, "Resuming from existing DB");
+                store.cache_head_state()?;
                 return Ok(store);
             }
             if checkpoint_urls.is_empty() {
                 warn!(head_slot, current_slot, gap, "DB is stale; resuming anyway");
+                store.cache_head_state()?;
                 return Ok(store);
             }
             warn!(head_slot, current_slot, gap, "DB is stale; checkpoint sync");
