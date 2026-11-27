@@ -12,6 +12,12 @@
 //! a signal sent during startup, but it would also hold a ctrl-c sent during a
 //! long checkpoint sync until startup finished, since nothing in startup gives
 //! up on a signal.
+//!
+//! The validator client listens from the top of `validator::run` instead, and
+//! a signal during its startup ends it at once, from a task of its own
+//! (`validator::listen_for_stop`). It can: until startup is done nothing is
+//! signed and the keymanager has taken no request, so there is nothing to
+//! drain.
 
 #[cfg(unix)]
 use tokio::signal::unix::{Signal, SignalKind, signal};
