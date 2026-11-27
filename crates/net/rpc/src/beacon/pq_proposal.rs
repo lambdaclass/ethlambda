@@ -305,9 +305,12 @@ async fn attestations_for_block(
 ) -> (Vec<pq::Attestation>, Vec<u8>) {
     let slot = state.slot();
     if let Some(prepared) = prepared {
-        // Half the merge budget at most, so a packing that does not come
-        // through still leaves production the time to pack and merge itself.
-        let budget = merge_budget(config, slot).unwrap_or_default() / 2;
+        // The whole merge budget: a packing under way for this slot and head
+        // computes what production would, and holds the one merge permit
+        // production would need, so production could not do better by
+        // giving up on it early. One that ends partial or stale still leaves
+        // production whatever time is left, with the permit free.
+        let budget = merge_budget(config, slot).unwrap_or_default();
         if let Some(packed) = prepared.take(store, slot, head_root, budget).await {
             info!(
                 %slot,

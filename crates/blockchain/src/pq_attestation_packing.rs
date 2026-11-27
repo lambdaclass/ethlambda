@@ -18,8 +18,9 @@
 //! (`crate::payload_attributes`), it starts packing `S`'s attestations too
 //! ([`PreparedPqAttestations::start`]). Block production takes the result
 //! when it is for the head it builds on and the pool still holds what it was
-//! packed from, waiting for a packing still running for at most half its
-//! merge budget ([`PreparedPqAttestations::take`]).
+//! packed from, waiting for a packing still running up to its merge budget
+//! ([`PreparedPqAttestations::take`]). A packing production does not use is
+//! abandoned.
 //!
 //! Anything else packs at production, as before: another head (the parent
 //! arrived after the preparation started, or a reorg), aggregates that
@@ -51,7 +52,7 @@ use ethlambda_types::beacon::primitives::Slot;
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use ethlambda_types::primitives::H256;
 use tokio::sync::{Semaphore, SemaphorePermit, watch};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::payload_attributes::advance_for_proposal;
 
@@ -187,7 +188,12 @@ pub async fn pack_attestations(
     };
     let permit = match merge_permit(permit_wait, remaining).await {
         Ok(permit) => permit,
-        Err(reason) => return fall_back(reason),
+        // Nobody reads it: no fallback to pack, nothing to warn about.
+        Err(NoPermit::Abandoned) => {
+            debug!(%slot, "A PQ attestation packing was abandoned before its merge");
+            return PackedAttestations::new(Vec::new(), Vec::new(), false, candidates);
+        }
+        Err(NoPermit::Refused(reason)) => return fall_back(reason),
     };
     // The wait for the permit came out of the budget.
     let Some(remaining) = merge_budget(config, slot) else {
@@ -239,26 +245,35 @@ pub async fn pack_attestations(
     }
 }
 
+/// Why [`merge_permit`] gave no permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoPermit {
+    /// The packing was replaced or given up on: nobody reads its result.
+    Abandoned,
+    /// The merge cannot run now; the block packs one committee's attestation.
+    Refused(&'static str),
+}
+
 /// The merge permit, as `permit_wait` says to get it, or why not.
 async fn merge_permit(
     permit_wait: PermitWait<'_>,
     budget: Duration,
-) -> Result<SemaphorePermit<'static>, &'static str> {
+) -> Result<SemaphorePermit<'static>, NoPermit> {
     match permit_wait {
         PermitWait::TryOnce => MERGE_PERMIT
             .try_acquire()
-            .map_err(|_| "a merge is still running"),
+            .map_err(|_| NoPermit::Refused("a merge is still running")),
         PermitWait::Wait { abandoned } => {
             if abandoned.load(Ordering::Acquire) {
-                return Err("the packing was replaced before its merge");
+                return Err(NoPermit::Abandoned);
             }
             let permit = tokio::time::timeout(budget, MERGE_PERMIT.acquire())
                 .await
-                .map_err(|_| "no merge permit within the budget")?
-                .map_err(|_| "the merge permit is closed")?;
-            // Replaced while it waited: leave the permit to the replacement.
+                .map_err(|_| NoPermit::Refused("no merge permit within the budget"))?
+                .map_err(|_| NoPermit::Refused("the merge permit is closed"))?;
+            // Abandoned while it waited: leave the permit to whoever needs it.
             if abandoned.load(Ordering::Acquire) {
-                return Err("the packing was replaced before its merge");
+                return Err(NoPermit::Abandoned);
             }
             Ok(permit)
         }
@@ -373,6 +388,10 @@ impl PreparedPqAttestations {
                 abandoned: &claim.abandoned,
             };
             let packed = pack_attestations(&store, &state, &config, wait).await;
+            if claim.abandoned.load(Ordering::Acquire) {
+                debug!(%slot, head_root = %ShortRoot(&head_root.0), "Abandoned the next PQ block's attestation packing");
+                return;
+            }
             info!(
                 %slot,
                 head_root = %ShortRoot(&head_root.0),
@@ -389,8 +408,12 @@ impl PreparedPqAttestations {
     /// `head_root`, waiting up to `budget` for a packing still under way.
     /// `None` when none was started for that slot and head, it did not pack
     /// everything it selected, the pool's candidates changed since, or it did
-    /// not end in time: block production packs them itself then. Taken once
-    /// either way, as [`crate::PreparedPayloads::take`] is.
+    /// not end in time: block production packs them itself then.
+    ///
+    /// Taken once either way, as [`crate::PreparedPayloads::take`] is. A
+    /// packing production does not use (for this slot on another head, for an
+    /// earlier slot, or one it gave up waiting for) is abandoned as it goes,
+    /// so it does not take the merge permit production may need next.
     pub async fn take(
         &self,
         store: &Store,
@@ -398,24 +421,30 @@ impl PreparedPqAttestations {
         head_root: H256,
         budget: Duration,
     ) -> Option<PackedAttestations> {
-        let mut receiver = {
+        let (mut receiver, abandoned) = {
             let mut held = self
                 .0
                 .lock()
                 .expect("prepared PQ attestations lock poisoned");
-            if !held
-                .as_ref()
-                .is_some_and(|prepared| prepared.slot == slot && prepared.head_root == head_root)
-            {
+            // One for a later slot is the next proposal's: left alone.
+            if held.as_ref()?.slot > slot {
                 return None;
             }
-            held.take()?.packed
+            let prepared = held.take()?;
+            if prepared.slot != slot || prepared.head_root != head_root {
+                prepared.abandoned.store(true, Ordering::Release);
+                return None;
+            }
+            (prepared.packed, prepared.abandoned)
         };
-        let ready = tokio::time::timeout(budget, receiver.wait_for(Option::is_some))
-            .await
-            .ok()?
-            .ok()?
-            .clone()?;
+        let ready = match tokio::time::timeout(budget, receiver.wait_for(Option::is_some)).await {
+            Ok(Ok(ready)) => ready.clone()?,
+            // Gave up waiting, or it never started.
+            _ => {
+                abandoned.store(true, Ordering::Release);
+                return None;
+            }
+        };
         // The last holder but this one, once the receiver goes: the sender
         // dropped after sending.
         drop(receiver);
@@ -499,7 +528,8 @@ mod tests {
     }
 
     /// A preparation holding `packed` (still under way when `None`) for
-    /// `slot` on `head_root`, and the sender a packing would answer through.
+    /// `slot` on `head_root`, the sender a packing would answer through, and
+    /// the packing's abandoned flag.
     fn held(
         slot: Slot,
         head_root: H256,
@@ -507,15 +537,17 @@ mod tests {
     ) -> (
         PreparedPqAttestations,
         watch::Sender<Option<Arc<PackedAttestations>>>,
+        Arc<AtomicBool>,
     ) {
         let (sender, receiver) = watch::channel(packed.map(Arc::new));
+        let abandoned = Arc::new(AtomicBool::new(false));
         let prepared = PreparedPqAttestations(Arc::new(Mutex::new(Some(Prepared {
             slot,
             head_root,
             packed: receiver,
-            abandoned: Arc::new(AtomicBool::new(false)),
+            abandoned: abandoned.clone(),
         }))));
-        (prepared, sender)
+        (prepared, sender, abandoned)
     }
 
     fn empty_pool_store() -> Store {
@@ -542,16 +574,10 @@ mod tests {
         let root = H256::repeat_byte(1);
         let store = empty_pool_store();
         let budget = Duration::from_millis(50);
-        let (prepared, _sender) = held(10, root, Some(packing(true)));
-        assert!(prepared.take(&store, 11, root, budget).await.is_none());
-        assert!(
-            prepared
-                .take(&store, 10, H256::repeat_byte(2), budget)
-                .await
-                .is_none()
-        );
+        let (prepared, _sender, abandoned) = held(10, root, Some(packing(true)));
         let taken = prepared.take(&store, 10, root, budget).await;
         assert_eq!(taken.map(|packed| packed.proof), Some(vec![1, 2, 3]));
+        assert!(!abandoned.load(Ordering::Acquire));
         assert!(
             prepared.take(&store, 10, root, budget).await.is_none(),
             "taken once"
@@ -564,12 +590,41 @@ mod tests {
         );
     }
 
+    /// A packing production does not use is dropped and abandoned, so it
+    /// does not take the merge permit production may need: one for this slot
+    /// on another head, one for an earlier slot, and one it gave up waiting
+    /// for. The next proposal's is left alone.
+    #[tokio::test]
+    async fn a_packing_production_does_not_use_is_abandoned() {
+        let (root, other) = (H256::repeat_byte(1), H256::repeat_byte(2));
+        let store = empty_pool_store();
+        let budget = Duration::from_millis(20);
+
+        let (prepared, _sender, abandoned) = held(10, root, None);
+        assert!(prepared.take(&store, 10, other, budget).await.is_none());
+        assert!(abandoned.load(Ordering::Acquire), "another head");
+        assert!(!prepared.holds(10, root));
+
+        let (prepared, _sender, abandoned) = held(10, root, None);
+        assert!(prepared.take(&store, 11, root, budget).await.is_none());
+        assert!(abandoned.load(Ordering::Acquire), "an earlier slot");
+
+        let (prepared, _sender, abandoned) = held(10, root, None);
+        assert!(prepared.take(&store, 10, root, budget).await.is_none());
+        assert!(abandoned.load(Ordering::Acquire), "gave up waiting");
+
+        let (prepared, _sender, abandoned) = held(11, root, None);
+        assert!(prepared.take(&store, 10, root, budget).await.is_none());
+        assert!(!abandoned.load(Ordering::Acquire), "the next proposal's");
+        assert!(prepared.holds(11, root));
+    }
+
     /// A packing that fell back to one committee's attestation is left to
     /// production, which may yet merge everything.
     #[tokio::test]
     async fn a_partial_packing_is_not_taken() {
         let root = H256::repeat_byte(1);
-        let (prepared, _sender) = held(10, root, Some(packing(false)));
+        let (prepared, _sender, _) = held(10, root, Some(packing(false)));
         let taken = prepared
             .take(&empty_pool_store(), 10, root, Duration::from_millis(50))
             .await;
@@ -583,7 +638,7 @@ mod tests {
         let root = H256::repeat_byte(1);
         let mut stale = packing(true);
         stale.candidates = vec![aggregate()];
-        let (prepared, _sender) = held(10, root, Some(stale));
+        let (prepared, _sender, _) = held(10, root, Some(stale));
         let taken = prepared
             .take(&empty_pool_store(), 10, root, Duration::from_millis(50))
             .await;
@@ -595,16 +650,7 @@ mod tests {
     async fn a_packing_under_way_is_waited_for_up_to_the_budget() {
         let root = H256::repeat_byte(1);
         let store = empty_pool_store();
-        let (prepared, _sender) = held(10, root, None);
-        assert!(
-            prepared
-                .take(&store, 10, root, Duration::from_millis(20))
-                .await
-                .is_none(),
-            "nothing yet, and the budget runs out"
-        );
-
-        let (prepared, sender) = held(10, root, None);
+        let (prepared, sender, abandoned) = held(10, root, None);
         let waiting = {
             let (prepared, store) = (prepared.clone(), store.clone());
             tokio::spawn(async move {
@@ -616,6 +662,7 @@ mod tests {
         sender.send(Some(Arc::new(packing(true)))).unwrap();
         let taken = waiting.await.unwrap();
         assert_eq!(taken.map(|packed| packed.proof), Some(vec![1, 2, 3]));
+        assert!(!abandoned.load(Ordering::Acquire));
     }
 
     /// A packing that never started (its sender gone without a value) gives
@@ -623,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn a_packing_that_never_started_gives_nothing_at_once() {
         let root = H256::repeat_byte(1);
-        let (prepared, sender) = held(10, root, None);
+        let (prepared, sender, _) = held(10, root, None);
         drop(sender);
         let started = Instant::now();
         let taken = prepared
@@ -664,7 +711,8 @@ mod tests {
         let wait = PermitWait::Wait {
             abandoned: &abandoned,
         };
-        assert!(merge_permit(wait, Duration::from_secs(1)).await.is_err());
+        let refused = merge_permit(wait, Duration::from_secs(1)).await.err();
+        assert_eq!(refused, Some(NoPermit::Abandoned));
         assert_eq!(MERGE_PERMIT.available_permits(), 1);
     }
 }
