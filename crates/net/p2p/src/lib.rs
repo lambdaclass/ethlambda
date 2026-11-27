@@ -44,8 +44,8 @@ use ethlambda_network_api::{
     ConnectedPeer, FetchRequest, GossipEventSink, InitBlockChain, MetaDataController,
     P2PToBlockChainRef, PeerDirection, PeerTableController, SidecarOrigin,
     block_chain_to_p2p::{
-        CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
-        PublishBlock,
+        BlockStateReady, CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation,
+        PublishAttestation, PublishBlock,
     },
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
@@ -284,6 +284,24 @@ const COLUMN_CHECK_PERMITS: usize = 16;
 /// `lean_beacon_gossip_validation_seconds{kind="beacon_aggregate_and_proof"}`
 /// has data from a follower.
 const ATTESTATION_VALIDATION_PERMITS: usize = 128;
+
+/// How many batches of parked votes may be checked again at once (see
+/// `beacon::parked_votes`).
+///
+/// A pool of its own, a quarter of [`ATTESTATION_VALIDATION_PERMITS`]: a
+/// block's votes are released together, and on the attestation pool a big
+/// release would take the permits of the votes arriving meanwhile, which
+/// would be ignored as overloaded. A batch waits for a permit here rather
+/// than failing without one.
+const RECHECK_PERMITS: usize = 32;
+
+/// Gossipsub's heartbeat. With [`GOSSIPSUB_HISTORY_LENGTH`] it bounds how long
+/// gossipsub holds a message awaiting its verdict, which parked votes must
+/// stay inside (see `beacon::parked_votes`).
+pub(crate) const GOSSIPSUB_HEARTBEAT: Duration = Duration::from_millis(700);
+
+/// How many heartbeats of message history gossipsub keeps.
+pub(crate) const GOSSIPSUB_HISTORY_LENGTH: usize = 6;
 
 /// How many `execution_payload_bid` and `proposer_preferences` stateful checks
 /// may run at once. A pool of its own, so a burst of bids (each costs a BLS
@@ -1258,9 +1276,9 @@ pub(crate) fn gossipsub_config(
         .mesh_n_high(12)
         // d_lazy
         .gossip_lazy(6)
-        .heartbeat_interval(Duration::from_millis(700))
+        .heartbeat_interval(GOSSIPSUB_HEARTBEAT)
         .fanout_ttl(Duration::from_secs(60))
-        .history_length(6)
+        .history_length(GOSSIPSUB_HISTORY_LENGTH)
         .history_gossip(3)
         .prune_backoff(PRUNE_BACKOFF)
         .unsubscribe_backoff(PRUNE_BACKOFF)
@@ -1704,6 +1722,7 @@ impl P2P {
             attestation_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 ATTESTATION_VALIDATION_PERMITS,
             )),
+            recheck_permits: Arc::new(tokio::sync::Semaphore::new(RECHECK_PERMITS)),
             payload_attestation_pool,
             builder_market,
             builder_validation_permits: Arc::new(tokio::sync::Semaphore::new(
@@ -1712,6 +1731,7 @@ impl P2P {
             sync_committee_pool,
             gossip_events,
             aggregator_subnets: HashMap::new(),
+            parked_votes: Default::default(),
             peer_scoring,
         };
         let scores_peers = server.peer_scoring.is_some();
@@ -1924,6 +1944,9 @@ pub struct P2PServer {
     /// [`Self::gossip_validation_permits`]; see
     /// [`ATTESTATION_VALIDATION_PERMITS`].
     pub(crate) attestation_validation_permits: Arc<tokio::sync::Semaphore>,
+    /// Permits for batches of parked votes checked again once their block's
+    /// post-state is ready. See [`RECHECK_PERMITS`].
+    pub(crate) recheck_permits: Arc<tokio::sync::Semaphore>,
     /// Permits for sync committee message and contribution stateful gossip
     /// checks in flight on blocking threads. Separate from the other two
     /// pools; see [`SYNC_VALIDATION_PERMITS`].
@@ -1957,6 +1980,10 @@ pub struct P2PServer {
     /// advertised in `attnets`, and left once the slot has passed. The
     /// backbone subnets are separate and never left.
     pub(crate) aggregator_subnets: HashMap<u64, u64>,
+
+    /// Subnet attestations and aggregates whose verdict waits for the block
+    /// they vote for to have a post-state. See [`beacon::parked_votes`].
+    pub(crate) parked_votes: beacon::parked_votes::ParkedVotes,
 
     /// Gossipsub scoring's inputs and gate. `None` on lean, which runs
     /// without peer scoring. See [`beacon::scoring`].
@@ -2090,6 +2117,10 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn discover_peers(&self) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn leave_expired_aggregator_subnets(&self) -> Result<(), ActorError>;
+    /// Report the first verdict of the parked votes past their deadline; see
+    /// [`beacon::parked_votes`]. Scheduled only while votes are parked.
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn sweep_parked_votes(&self) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_beacon_range_batch(&self) -> Result<(), ActorError>;
     /// Apply the fork schedule at the wall-clock epoch. Sent once at startup and
@@ -2228,6 +2259,17 @@ impl P2PServer {
         gossipsub::prune_operation_pool(self);
         beacon::sync_committee::leave_expired_sync_committee_subnets(self);
         beacon::sync_committee::prune_sync_committee_pool(self);
+    }
+
+    #[send_handler]
+    async fn handle_sweep_parked_votes(
+        &mut self,
+        _msg: p2p_protocol::SweepParkedVotes,
+        ctx: &Context<Self>,
+    ) {
+        if beacon::verdict::sweep_parked_votes(self) {
+            beacon::verdict::schedule_parked_vote_sweep(ctx);
+        }
     }
 
     #[send_handler]
@@ -2469,6 +2511,12 @@ impl Handler<CheckDataColumnSidecars> for P2PServer {
                 beacon::engine_columns::publish_and_forward(self, msg.sidecars)
             }
         }
+    }
+}
+
+impl Handler<BlockStateReady> for P2PServer {
+    async fn handle(&mut self, msg: BlockStateReady, ctx: &Context<Self>) {
+        beacon::verdict::release_parked_votes(self, ctx, msg.block_root);
     }
 }
 
@@ -4239,6 +4287,9 @@ pub(crate) mod test_support {
             attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
+            recheck_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::RECHECK_PERMITS,
+            )),
             seen_sync_messages:
                 ethlambda_state_transition::beacon::gossip::sync_committee::SeenSyncCommitteeMessages::new(
                     crate::SEEN_SYNC_MESSAGES_CAPACITY,
@@ -4259,6 +4310,7 @@ pub(crate) mod test_support {
             sync_committee_pool: Default::default(),
             gossip_events: None,
             aggregator_subnets: HashMap::new(),
+            parked_votes: Default::default(),
             peer_scoring: None,
         }
     }
