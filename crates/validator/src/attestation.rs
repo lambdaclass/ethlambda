@@ -15,6 +15,7 @@ use crate::beacon_node::dto::{
 use crate::beacon_node::{BeaconNodeApi, validate_attestation_data};
 use crate::error::Result;
 use crate::keys::ValidatorStore;
+use crate::performance::{Batch, Duty, Performance};
 use crate::signing::{SigningContext, sign_all};
 use crate::slashing_protection::SharedProtection;
 
@@ -55,6 +56,8 @@ pub struct AttestationService<B> {
     /// What every validator has signed, shared with the proposal service and
     /// the keymanager. See [`crate::slashing_protection`].
     protection: SharedProtection,
+    /// Where each validator's outcome is counted. `None` counts nothing.
+    performance: Option<Arc<Performance>>,
 }
 
 impl<B: BeaconNodeApi> AttestationService<B> {
@@ -67,7 +70,14 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             beacon_node,
             context,
             protection,
+            performance: None,
         }
+    }
+
+    /// Count each duty's outcome per validator in `performance`.
+    pub fn with_performance(mut self, performance: Arc<Performance>) -> Self {
+        self.performance = Some(performance);
+        self
     }
 
     /// Sign and publish every duty held for `slot`.
@@ -111,8 +121,13 @@ impl<B: BeaconNodeApi> AttestationService<B> {
                 data: None,
             });
         }
+        // Counted from before the data is fetched: a fetch that fails, or one
+        // the duty loop drops at the end of the slot (a hung node), counts
+        // every duty failed.
+        let outcomes = self.batch(slot, duties);
         let data = self.attestation_data(slot).await?;
-        self.attest_with(slot, duties, store, data).await
+        self.attest_counted(slot, duties, store, data, outcomes)
+            .await
     }
 
     /// The beacon node's attestation data for `slot`, checked as [`Self::attest`]
@@ -143,6 +158,33 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         duties: &[AttesterDutyDto],
         store: &RwLock<ValidatorStore>,
         data: AttestationData,
+    ) -> Result<Attested> {
+        let outcomes = self.batch(slot, duties);
+        self.attest_counted(slot, duties, store, data, outcomes)
+            .await
+    }
+
+    /// Where `duties`' outcomes at `slot` are counted.
+    fn batch(&self, slot: Slot, duties: &[AttesterDutyDto]) -> Batch {
+        Batch::new(
+            self.performance.as_ref(),
+            Duty::Attestation,
+            slot,
+            duties.iter().map(|duty| duty.validator_index),
+        )
+    }
+
+    /// [`Self::attest_with`], counting into `outcomes`, which the caller
+    /// created for `duties` before it fetched `data`. Each duty counts once,
+    /// published or failed, however this call ends: an early `?` or the duty
+    /// loop's deadline counts it failed.
+    async fn attest_counted(
+        &self,
+        slot: Slot,
+        duties: &[AttesterDutyDto],
+        store: &RwLock<ValidatorStore>,
+        data: AttestationData,
+        mut outcomes: Batch,
     ) -> Result<Attested> {
         // The fork of the slot, by this client's own schedule, decides which
         // `index` the answer may carry: from gloas it is the payload signal.
@@ -203,6 +245,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             .filter(|(duty, pubkey)| {
                 let held = held.contains(pubkey);
                 if !held {
+                    outcomes.skip(duty.validator_index);
                     tracing::debug!(
                         %slot,
                         validator = duty.validator_index,
@@ -326,6 +369,8 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             .beacon_node
             .submit_attestations(&attestations, fork_name)
             .await?;
+        let sent: Vec<_> = attestations.iter().map(|a| a.attester_index).collect();
+        outcomes.submitted(&sent, published);
         if published < submitted {
             warn!(
                 %slot,
@@ -580,6 +625,7 @@ mod tests {
             beacon_node: node_again.clone(),
             context: context(),
             protection: service.protection,
+            performance: None,
         };
         let second = service
             .attest(101, &[duty(&pubkey_hex, 1337, 101, 3)], &store)
