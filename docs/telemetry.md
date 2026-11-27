@@ -80,6 +80,7 @@ validator client enters as `gossip`, with `received` at the hand-off and no
 | `received` | The block came off the wire (gossip) or was handed to the chain actor (req/resp) |
 | `da_available` | The data-availability check passed for a block that needed columns. A block with nothing to wait for (no blobs, or gloas, whose data gates the envelope instead) writes `da_check_end` instead |
 | `el_sent`, `el_verdict` | `engine_newPayload` sent and answered; only when an execution client answered |
+| `stf_spec_start`, `stf_spec_end` | Beacon: the state transition computed while `engine_newPayload` was in flight (below); only when one was computed |
 | `stf_done` | The state transition finished |
 | `attestable` | The new head including the block is computed, as in Silver. Beacon recomputes the head once per arriving block, after the whole import cascade, so every block that cascade imported and the new head includes gets the same time (a block imported onto a losing branch never became attestable and writes none), and only when that head computation succeeded (a failed one moves nothing, so writes no `attestable`); lean updates its head per block |
 | `failed` | The import failed; `stf_done` and lean's `attestable` are then written as `stf_end` and `fc_head_end` |
@@ -88,13 +89,19 @@ validator client enters as `gossip`, with `received` at the hand-off and no
 
 With an execution client, ethlambda computes the block's state transition
 while `engine_newPayload` is in flight, and keeps it only for a verdict that
-agrees with it. `el_sent` to `stf_done` still covers both, but `stf_start` no
-longer separates them. When the overlapped transition is kept, it ran inside
-`el_sent`..`el_verdict`, and `stf_start`..`stf_done` is only the rest of
-`on_block` after the verdict. When it is discarded (an `Invalid` verdict),
-`stf_start`..`stf_done` runs the transition again. The overlapped transition
-writes no row of its own: the import's log line and
-`lean_block_import_phase_seconds{phase="stf"}` count it.
+agrees with it. That transition is `stf_spec_start`..`stf_spec_end`, inside
+`el_sent`..`el_verdict`. When it is kept, `stf_start`..`stf_done` is only the
+rest of `on_block` after the verdict (a few milliseconds on most blocks, more
+on an epoch's first block), so the
+block's state-transition time is the two spans added together (less
+`writer_wait`), as the import's log line and
+`lean_block_import_phase_seconds{phase="stf"}` count it. When it is discarded
+(an `Invalid` verdict), `stf_start`..`stf_done` runs the transition again, and
+the two spans are both transitions the import paid for. A block with no
+speculation writes no `stf_spec_*` rows, and its `stf_start`..`stf_done` is the
+whole transition: no request was sent (no execution client, or a block with no
+payload to ask about: pre-merge or gloas), or `speculate_transition` declined
+the block.
 
 `source` and `verdict` are ethlambda's own values on every row, not Silver's
 (`Gossip`, `Rpc`, `Syncing`, ...); a query shared with Silver's rows must
@@ -105,7 +112,7 @@ match both.
 | Group | Stages |
 |---|---|
 | Per block, in order | `received`, `decode_end`, `queue_end`, `defer_start`, `defer_end`, `admit_start`, `admit_end`, `guards_start`, `guards_end`, `preamble_start`, `preamble_end`, `parent_wait_start`, `parent_wait_end`, `cascade_wait_start`, `cascade_wait_end`, `da_check_start`, `da_available` (or `da_check_end`), `columns_wait_start`, `columns_wait_end`, `verify_struct_start`, `verify_struct_end`, `verify_crypto_start`, `verify_crypto_end`, `stf_start`, `stf_done`, `writer_wait_start`, `writer_wait_end`, `db_write_start`, `db_write_end`, `fc_head_start`, `attestable` (lean), `block_atts_start`, `block_atts_end` |
-| Per block, with an execution client | `el_sent`, `el_verdict` |
+| Per block, with an execution client | `el_sent`, `el_verdict`, and (beacon) `stf_spec_start`, `stf_spec_end`, which fall between `el_sent` and `stf_start` |
 | Per block, on failure | `stf_end` and `fc_head_end` in place of `stf_done` and `attestable`, plus `failed` |
 | Per arrival | `cascade_start`, `cascade_end`, `prune_start`, `prune_end`, `get_head_start`, `get_head_end`, `fcu_start`, `fcu_end`, and (beacon) `attestable` |
 | Per column | `column_recv`, `column_validated` |

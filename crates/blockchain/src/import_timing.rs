@@ -626,6 +626,14 @@ impl BlockImportReport {
             ("verify_struct_end", t.verify_structural_end),
             ("verify_crypto_start", t.verify_crypto_start),
             ("verify_crypto_end", t.verify_crypto_end),
+            // Beacon's transition computed while `engine_newPayload` was in
+            // flight. It runs before `stf_start` and the import may use it in
+            // place of its own transition, so without these rows
+            // `stf_start`..`stf_done` reads as the whole transition while
+            // missing most of it. Written whether or not it was used, as the
+            // log line's `stf` row counts it.
+            ("stf_spec_start", t.stf_speculative_start),
+            ("stf_spec_end", t.stf_speculative_end),
             ("stf_start", t.stf_start),
             (stf_end, t.stf_end),
             ("writer_wait_start", t.writer_wait_start),
@@ -1557,6 +1565,62 @@ mod tests {
         };
         assert_eq!(at_of("el_sent"), at(base, 4));
         assert_eq!(at_of("el_verdict"), at(base, 20));
+    }
+
+    /// The transition computed while the request was in flight gets rows of
+    /// its own, ahead of `stf_start`: a used one leaves `stf_start`..`stf_done`
+    /// only the rest of the import, so without them a reader of the rows loses
+    /// the transition itself.
+    #[test]
+    fn an_overlapped_transition_writes_its_own_rows() {
+        let base = Instant::now();
+        let report = report(ImportTimings {
+            stf_speculative_start: at(base, 5),
+            stf_speculative_end: at(base, 35),
+            speculation: Some(SpeculationOutcome::Used),
+            ..beacon_gossip(base)
+        });
+
+        let stages = stages(&report);
+        let position = |name| stages.iter().position(|stage| *stage == name);
+        let (Some(spec_start), Some(spec_end), Some(stf_start)) = (
+            position("stf_spec_start"),
+            position("stf_spec_end"),
+            position("stf_start"),
+        ) else {
+            panic!("missing a transition row: {stages:?}");
+        };
+        assert!(spec_start < spec_end && spec_end < stf_start, "{stages:?}");
+
+        let events = report.telemetry_events();
+        let at_of = |stage| {
+            events
+                .iter()
+                .find(|event| event.stage == stage)
+                .map(|event| event.at)
+        };
+        assert_eq!(at_of("stf_spec_start"), at(base, 5));
+        assert_eq!(at_of("stf_spec_end"), at(base, 35));
+    }
+
+    /// A speculation the import discarded is written too, as the log line's
+    /// `stf` row counts it: an `INVALID` verdict fails the block after a
+    /// second transition, and both are state-transition work it paid for.
+    #[test]
+    fn a_discarded_speculation_is_written_with_the_failed_import() {
+        let base = Instant::now();
+        let mut failed = report(ImportTimings {
+            stf_speculative_start: at(base, 5),
+            stf_speculative_end: at(base, 35),
+            speculation: Some(SpeculationOutcome::DiscardedInvalidated),
+            ..beacon_gossip(base)
+        });
+        failed.outcome = "failed";
+
+        let stages = stages(&failed);
+        for name in ["stf_spec_start", "stf_spec_end", "stf_start", "stf_end"] {
+            assert!(stages.contains(&name), "missing {name}: {stages:?}");
+        }
     }
 
     #[test]
