@@ -21,6 +21,7 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ethlambda_network_api::AdvertisedRecord;
 use ethrex_p2p::types::{INITIAL_ENR_SEQ, Node, NodeRecord, NodeRecordPairs};
@@ -231,10 +232,30 @@ pub(crate) fn dialable_port(port: u16) -> Option<u16> {
     Some(port).filter(|port| *port != 0)
 }
 
-/// Build and sign this node's ENR.
+/// Build and sign this node's ENR, at [`starting_seq`].
 pub(crate) fn build_local_enr(params: &LocalEnrParams) -> Result<NodeRecord, DiscoveryError> {
-    NodeRecord::from_pairs(INITIAL_ENR_SEQ, &params.signer, params.local_pairs())
+    NodeRecord::from_pairs(starting_seq(), &params.signer, params.local_pairs())
         .map_err(DiscoveryError::BuildEnr)
+}
+
+/// The `seq` this node's record starts at: the current time in milliseconds.
+///
+/// A peer fetches a record again only once its `seq` grows, and a running node
+/// bumps it (IP voting, and each fork-digest boundary moving `eth2`). Starting
+/// every boot from [`INITIAL_ENR_SEQ`] would serve a record behind the copy
+/// peers cached from the previous run, and they would keep that one, stale
+/// `eth2` and address included. Nothing is persisted across restarts, so the
+/// clock is the floor: the previous run would have had to edit its record more
+/// than once per millisecond of uptime to pass it. geth starts its record the
+/// same way. A clock stepped back past the previous run's last edit is the one
+/// case this does not cover.
+fn starting_seq() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or_default()
+        .max(INITIAL_ENR_SEQ)
 }
 
 /// The address a record advertises, preferring IPv4 when it carries both.
@@ -346,6 +367,26 @@ mod tests {
             custody_group_count: None,
         })
         .expect("ENR builds")
+    }
+
+    /// A restart must not serve a `seq` below what the previous run reached:
+    /// peers would keep their cached copy, stale `eth2` included. A record
+    /// that started at a fixed `seq` went back there on every boot.
+    #[test]
+    fn the_record_starts_at_the_clock_not_at_a_fixed_seq() {
+        fn now_ms() -> u64 {
+            let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+            u64::try_from(elapsed.as_millis()).unwrap()
+        }
+        let before = now_ms();
+        let record = build();
+        let after = now_ms();
+        assert!(
+            (before..=after).contains(&record.seq),
+            "seq {} outside [{before}, {after}]",
+            record.seq
+        );
+        assert!(record.verify_signature());
     }
 
     #[test]

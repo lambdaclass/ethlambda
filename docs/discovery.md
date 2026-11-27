@@ -85,21 +85,44 @@ discv5 queries. If IP voting later changes our external address, ethrex edits an
 re-signs that record rather than rebuilding one, so the consensus entries survive
 the bump; only the sequence number and `ip` move.
 
-`/eth/v1/node/identity` reports the record discovery serves *now*, not the one
-logged at startup. ethrex writes every record it re-signs into a shared mirror
-(`SharedLocalNode`) it was started with, and the endpoint reads through that
-(`discovery::LocalEnr`), so what the Beacon API reports and what peers get over
-discv5 are the same bytes even after IP voting. The endpoint's multiaddrs are
-built from that same read, the way a peer reading the record would dial it, so
-they follow IP voting too.
+The record lives in one slot shared with ethrex (`SharedLocalNode`, an
+`ArcSwap`), and that slot is the only copy: discovery reads it for every PING,
+PONG, NODES and handshake it sends, and every edit swaps a whole new record in by
+compare-and-swap. Nothing takes a lock.
 
-The other direction is not possible yet: nothing on this side can change the
-record discovery serves. ethrex's discovery protocol has no message that edits
-the local record. Its only consumer-driven edit is the EIP-2124 `eth` entry
-(an execution-chain fork id), not the `eth2` entry a fork-digest boundary moves,
-and writing into the mirror does nothing, since discovery serves its own copy and
-overwrites the mirror on its next edit. See the next section for what that costs
-at a boundary.
+| Who | Reads or edits | How |
+| --- | --- | --- |
+| discv5 IP voting | the `ip` (or `ip6`) entry | ethrex, internally |
+| A fork-digest boundary | the `eth2` entry | `discovery::LocalEnrWriter::publish_fork_id`, from `beacon::transition::apply` |
+| `/eth/v1/node/identity` | reads the whole record | `discovery::LocalEnr` |
+
+`/eth/v1/node/identity` therefore reports the record discovery serves *now*, not
+the one logged at startup, so what the Beacon API reports and what peers get over
+discv5 are the same bytes after IP voting and after a boundary alike. The
+endpoint's multiaddrs are built from that same read, the way a peer reading the
+record would dial it, so they follow IP voting too.
+
+An edit is re-signed with `seq` bumped once, and discovery advertises the new
+`seq` in its next PING or PONG, which is what sends peers back for the record. If
+IP voting swaps a record in between an edit's read and its swap, the edit is
+re-applied on top of that record rather than overwriting it, so both survive.
+`publish_fork_id` is offered the schedule's `ENRForkID` on every call of
+`apply`, boundary or not, and edits only when the served entry differs: a
+needless `seq` bump would send every peer back for an identical record.
+
+The writer holds the node key the record is signed with, so it stays inside the
+p2p crate; the RPC server gets only the read side.
+
+The record starts each boot at `seq` = the current time in milliseconds, not at
+a constant. A peer identifies a record by (node id, seq) and takes a replacement
+only at a strictly higher `seq`, so a restart that began again from a constant
+would serve a record behind the one peers cached from the previous run (which
+IP voting and every boundary bumped), and they would keep the cached copy, stale
+`eth2`, address and all. The same goes for an upgrade that changes which entries
+the record carries. Nothing is persisted, so the clock is the floor: the
+previous run would have had to edit its record more than once per millisecond of
+uptime to pass it. A clock stepped back past the previous run's last edit is the
+one case it does not cover.
 
 ## Which peers get dialed
 
@@ -112,10 +135,9 @@ A discovered peer is admitted only if:
 The digest compared against is the caller's, not a constant: lean passes its
 hardcoded dummy and `beacon` passes the digest it derived at startup and moves
 it at each fork-digest boundary, so one admission policy serves both chains. The
-record this node serves is not refreshed at a boundary (ethrex's
-`DiscoveryServer` offers no way to edit it at runtime; see [The ENR](#the-enr)),
-so its `eth2` entry keeps the startup digest until a restart; see
-[beacon_wire.md](./beacon_wire.md#the-fork-digest).
+record this node serves moves with it: the same call republishes its `eth2`
+entry (see [The ENR](#the-enr)), so a peer running these rules keeps admitting
+the node after a boundary.
 
 A differing `next_fork_version` or `next_fork_epoch` is *not* grounds for
 rejection: the spec permits connecting to a peer that is incompatible with an
@@ -355,24 +377,6 @@ another network's infrastructure is a configuration mistake, and the unbounded
 redial is what keeps a devnet's own bootnode reachable across its restarts.
 Splitting the flag into initial peers, dialed once, and bootnodes, seeded into
 discv5, is the real fix and is left to a follow-up.
-
-### An upgrade's new ENR entries are invisible to peers that stayed up
-
-The record is signed at ethrex's `INITIAL_ENR_SEQ`, a constant. A peer
-identifies a record by (node id, seq) and accepts a replacement only at a
-strictly higher seq, and ethrex's WHOAREYOU responder does not even send the
-record when the requester's `enr_seq` already matches. So when an ethlambda
-release changes which entries it publishes, as adding `tcp` did, a peer holding
-the previous record under the same seq keeps it: the new entries reach only
-peers that meet this node for the first time.
-
-A fixed local floor above `INITIAL_ENR_SEQ` does not close this. ethrex re-signs
-the record at `seq + 1` whenever discv5's IP voting moves the advertised
-address, so a node behind NAT may already be serving a seq above any constant
-the code could pick, which is exactly the case the floor was meant to cover.
-Closing it needs a seq that grows without bound across restarts: a persisted
-counter bumped on every content change, or one derived from the wall clock at
-startup, which is what several beacon clients do.
 
 ### One lean devnet is not separated from another
 
