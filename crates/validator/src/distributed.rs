@@ -516,7 +516,7 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
         // A swap that moved a fork while the request was out may have moved
         // these proofs' domain. They were combined from partials signed
         // under `generation`, so none is kept once it has moved (see
-        // `remember_combined_selection_proof`): the round the duty loop
+        // `remember_combined_selection_proofs`): the round the duty loop
         // starts for the swap asks for them again under the new schedule.
         if self.context.schedule_generation() != generation {
             debug!(
@@ -525,21 +525,17 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
             );
             return Ok(0);
         }
-        let mut combined = 0;
-        for answer in answers {
-            // The implementation refused any answer naming an entry not
-            // asked, so every key is found.
-            let Some(pubkey) = pubkeys.get(&answer.key()) else {
-                continue;
-            };
-            let kept = self.context.remember_combined_selection_proof(
-                generation,
-                *pubkey,
-                answer.slot,
-                answer.selection_proof,
-            );
-            combined += usize::from(kept);
-        }
+        // The implementation refused any answer naming an entry not asked,
+        // so every key is found.
+        let answered = answers.into_iter().filter_map(|answer| {
+            let pubkey = pubkeys.get(&answer.key())?;
+            Some((*pubkey, answer.slot, answer.selection_proof))
+        });
+        // The whole answer at once, so the memory is locked and pruned once
+        // for it, not once per proof.
+        let combined = self
+            .context
+            .remember_combined_selection_proofs(generation, answered);
         if combined < asked.len() && !lookahead {
             warn!(
                 asked = asked.len(),
@@ -1481,12 +1477,9 @@ mod tests {
         let context = local_context();
         // Ignored with the mode off.
         let generation = context.schedule_generation();
-        assert!(!context.remember_combined_selection_proof(
-            generation,
-            pubkey,
-            own_selects,
-            attester_proof(false)
-        ));
+        let ignored = [(pubkey, own_selects, attester_proof(false))];
+        let kept = context.remember_combined_selection_proofs(generation, ignored);
+        assert_eq!(kept, 0);
         let root = Root::repeat_byte(4);
         let node = Arc::new(MockBeaconNode::new().with_aggregate(data(own_selects)));
         let duties = vec![duty(&pubkey, 1, own_selects)];

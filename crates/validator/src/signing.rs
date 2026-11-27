@@ -841,7 +841,7 @@ impl SigningContext {
     ///
     /// With distributed mode off, this client's own, signed or remembered
     /// ([`Self::sign_selection_proof`]). With it on, the combined proof the
-    /// middleware returned ([`Self::remember_combined_selection_proof`]), or
+    /// middleware returned ([`Self::remember_combined_selection_proofs`]), or
     /// `None` while there is none: the share's own proof hashes to a
     /// different value than the validator's, so deciding on it would be
     /// wrong, and no proof means no aggregation.
@@ -871,42 +871,55 @@ impl SigningContext {
         self.distributed && self.selection_proofs().contains_key(&(*pubkey, slot))
     }
 
-    /// Remember `proof`, the combined selection proof a distributed
-    /// validator middleware returned for `pubkey` at `slot`, in place of
-    /// whatever was held, and answer whether it was kept. Ignored with
-    /// distributed mode off, where the memory holds this client's own proofs
-    /// and nothing else may replace them.
+    /// Remember the combined selection proofs a distributed validator
+    /// middleware returned, each for its `pubkey` at its `slot`, in place of
+    /// whatever was held, and answer how many were kept: all of them or
+    /// none. Ignored with distributed mode off, where the memory holds this
+    /// client's own proofs and nothing else may replace them.
     ///
     /// `generation` is [`Self::schedule_generation`] as read before the
-    /// partial proofs it was combined from were signed. Once a swap has moved
-    /// it since, the proof is dropped: it may be over the old schedule's
-    /// domain, which [`Self::replace_config`] already forgot the proofs of,
-    /// so it must neither come back nor replace one a later exchange got
-    /// under the new schedule. Checked with the memory's lock held, the lock
-    /// the swap moves the generation under, so no swap can land between the
-    /// check and the insert.
+    /// partial proofs they were combined from were signed. Once a swap has
+    /// moved it since, the proofs are dropped: they may be over the old
+    /// schedule's domain, which [`Self::replace_config`] already forgot the
+    /// proofs of, so they must neither come back nor replace those a later
+    /// exchange got under the new schedule. Checked with the memory's lock
+    /// held, the lock the swap moves the generation under, so no swap can
+    /// land between the check and the inserts.
     ///
-    /// Not verified: it is a signature under the validator's key, which
+    /// One answer's proofs go in together, so the lock is taken and the
+    /// memory pruned once for all of them. Pruning for each proof walked the
+    /// whole memory every time, which made an exchange's cost grow with the
+    /// square of the duties it covers, on a runtime worker and under the lock
+    /// every selection is read through.
+    ///
+    /// Not verified: each is a signature under the validator's key, which
     /// this client never learns (it holds a share, and the middleware
     /// presents the share's pubkey as the validator's). A wrong one costs an
     /// aggregate every node refuses, nothing slashable.
-    pub fn remember_combined_selection_proof(
+    pub fn remember_combined_selection_proofs(
         &self,
         generation: u64,
-        pubkey: BlsPubkey,
-        slot: Slot,
-        proof: BlsSignature,
-    ) -> bool {
+        combined: impl IntoIterator<Item = (BlsPubkey, Slot, BlsSignature)>,
+    ) -> usize {
         if !self.distributed {
-            return false;
+            return 0;
         }
+        let combined: Vec<_> = combined.into_iter().collect();
+        let Some(newest) = combined.iter().map(|(_, slot, _)| *slot).max() else {
+            return 0;
+        };
         let mut proofs = self.selection_proofs();
         if self.schedule_generation.load(Ordering::Acquire) != generation {
-            return false;
+            return 0;
         }
-        proofs.retain(|(_, held), _| held + selection_proof_retention_slots() >= slot);
-        proofs.insert((pubkey, slot), proof);
-        true
+        proofs.retain(|(_, held), _| held + selection_proof_retention_slots() >= newest);
+        let kept = combined.len();
+        proofs.extend(
+            combined
+                .into_iter()
+                .map(|(pubkey, slot, proof)| ((pubkey, slot), proof)),
+        );
+        kept
     }
 
     /// The remembered selection proofs. A poisoned map is still a map of
@@ -1156,7 +1169,7 @@ impl SigningContext {
     /// Remember `proof`, the combined sync committee selection proof a
     /// distributed validator middleware returned. Ignored with distributed
     /// mode off, and not verified, as
-    /// [`Self::remember_combined_selection_proof`] says. Unlike that one it
+    /// [`Self::remember_combined_selection_proofs`] says. Unlike that one it
     /// takes no schedule generation: a sync exchange is for the slot being
     /// served, and a swap moves only forks still ahead, so never its domain.
     pub fn remember_combined_sync_selection_proof(
@@ -1395,16 +1408,51 @@ mod tests {
         let after = context.schedule_generation();
         assert_ne!(before, after);
         let newer = BlsSignature([3; 96]);
-        assert!(context.remember_combined_selection_proof(after, pubkey, slot, newer));
+        let kept = context.remember_combined_selection_proofs(after, [(pubkey, slot, newer)]);
+        assert_eq!(kept, 1);
 
         let stale = BlsSignature([2; 96]);
-        assert!(!context.remember_combined_selection_proof(before, pubkey, slot, stale));
+        let kept = context.remember_combined_selection_proofs(before, [(pubkey, slot, stale)]);
+        assert_eq!(kept, 0);
         assert_eq!(
             context.selection_proofs().get(&(pubkey, slot)),
             Some(&newer),
             "the proof under the new schedule stays"
         );
         assert!(context.holds_combined_selection_proof(&pubkey, slot));
+    }
+
+    /// One answer's combined proofs are remembered together: what the newest
+    /// of them leaves outside the retention window is forgotten once, and
+    /// every proof of the answer is kept.
+    #[test]
+    fn an_answers_combined_proofs_are_remembered_and_pruned_as_one() {
+        let context = context().with_distributed();
+        let generation = context.schedule_generation();
+        let (pubkey, proof) = (BlsPubkey([1; 48]), BlsSignature([2; 96]));
+        let kept = context.remember_combined_selection_proofs(generation, [(pubkey, 0, proof)]);
+        assert_eq!(kept, 1);
+
+        // An epoch's answer, far enough on that slot 0's proof is not wanted.
+        let slots = preset::slots_per_epoch();
+        let first = selection_proof_retention_slots() + 1;
+        let answer = (first..first + slots).map(|slot| (pubkey, slot, proof));
+        let kept = context.remember_combined_selection_proofs(generation, answer);
+        assert_eq!(kept as u64, slots);
+
+        assert!(!context.holds_combined_selection_proof(&pubkey, 0));
+        assert!(
+            (first..first + slots)
+                .all(|slot| context.holds_combined_selection_proof(&pubkey, slot)),
+            "none of the answer's own proofs is pruned by it"
+        );
+
+        // An empty answer prunes nothing: it has no newest slot to prune by.
+        assert_eq!(
+            context.remember_combined_selection_proofs(generation, []),
+            0
+        );
+        assert_eq!(context.selection_proofs().len() as u64, slots);
     }
 
     fn attestation_data(target_epoch: Epoch) -> AttestationData {
