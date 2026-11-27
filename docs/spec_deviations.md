@@ -910,15 +910,6 @@ contributions only.
   never the block.
 - Messages from earlier slots over the same root are not packed.
 
-## The validator client signs a sync committee message at the deadline only
-
-`validator.md` ("Prepare sync committee message") has a member sign as soon as
-it sees the block for the slot, or at the sync-message deadline, whichever
-comes first. The validator client signs once, at the deadline
-(`SYNC_MESSAGE_DUE_BPS`, or its gloas variant), over the head root it then
-reads, and refuses to when that root is optimistic
-(`specs/bellatrix/optimistic-sync.md`).
-
 ## The validator client withholds payload timeliness votes over an optimistic head
 
 - **Specification:** `specs/bellatrix/optimistic-sync.md` says an optimistic
@@ -972,14 +963,15 @@ signature, whichever way the node answered. Three departures:
   up to 5 s on the relay and the client up to 8 s on the node, against well
   under a second for a full block. The publish runs on its own task so the
   proposal budget cannot cut it off: past the budget the proposal returns
-  "still publishing" and the task reports the outcome itself. The process
-  handles no signals, though: a SIGINT in that window ends the task with the
-  request.
+  "still publishing" and the task reports the outcome itself. A SIGINT or
+  SIGTERM in that window waits for the task, up to 8 s after the signal; a
+  publish still going then, or a SIGKILL, ends it with the request.
 - **Registrations stop at gloas.** The client sends no `register_validator` from
   the gloas fork epoch on: the builder market works through proposer
   preferences there (see the next section), and `produceBlockV4` sends the
-  configured boost factor and `--builder-min-bid` (default `0`), and no
-  builders.
+  configured boost factor (default `100`) and `--builder-min-bid` (default
+  `0`), with or without `--builder-proposals`, and no builders
+  (`--self-build-only`: `0` and `2^64 - 1`).
   Validators with no fee recipient are not registered either (the field is
   required), and only validators the beacon node resolved, pending or active,
   are signed for: the flashbots relay refuses a whole batch over an exited or
