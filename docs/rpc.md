@@ -330,6 +330,9 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v1/beacon/execution_payload_bids` | *(status only)* | Validate, pool and gossip a builder's `SignedExecutionPayloadBid` (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/validator/proposer_preferences` | *(status only)* | Validate, cache and gossip `SignedProposerPreferences` (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/states/{state_id}/builders` | JSON | The gloas builder registry, filtered by id and status |
+| `GET` | `/eth/v1/beacon/states/{state_id}/ptc` | JSON / SSZ | The payload timeliness committee of `?slot` (default: the state's slot), from the state's `ptc_window`; a slot before gloas or outside the window is a `400` |
+| `GET` | `/eth/v1/beacon/states/{state_id}/builder_pending_payments` | JSON / SSZ | The gloas state's `builder_pending_payments`, versioned |
+| `GET` | `/eth/v1/beacon/states/{state_id}/builder_pending_withdrawals` | JSON / SSZ | The gloas state's `builder_pending_withdrawals`, versioned |
 | `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Record each validator's fee recipient for block production (see below) |
 | `POST` | `/eth/v1/validator/register_validator` | *(status only)* | Forwards builder registrations of active or pending validators to `--builder`, and sets their fee recipients |
 | `GET` | `/eth/v1/events` | SSE | Live stream of chain events (see below) |
