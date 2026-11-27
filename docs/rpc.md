@@ -1002,8 +1002,9 @@ not run on. Domain types and withdrawal prefixes are `0x`-prefixed hex;
 entries with quoted values, ascending by epoch, as `BLOB_SCHEDULE` is and as
 lighthouse reports it, and `[]` on a network that schedules nothing (lighthouse
 leaves the key out while gloas is unscheduled). Validator clients, this one's
-included, take their default gas limit from it. The data directory does not
-store it: it is read from the network's `config.yaml` at every start.
+included, take their default gas limit from it. The data directory stores it,
+in a row of its own; a directory written before that row existed takes the
+network `config.yaml`'s on its next start.
 
 The configuration keys come from the `Config` the data directory was
 initialized with. Some of them (the custody and subnet counts, the

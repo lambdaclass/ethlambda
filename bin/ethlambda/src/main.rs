@@ -2156,9 +2156,10 @@ fn first_config_difference(
         min_epochs_for_block_requests: _,
 
         // Advisory, a validator client's default gas limit: the specification
-        // says it adds no validity rule. It is also not stored, so `persisted`
-        // always holds an empty one; the caller's `replace_config` installs
-        // the file's.
+        // says it adds no validity rule, so the file's always wins, through
+        // the caller's `replace_config`. In a directory that predates its
+        // row, `persisted` already holds the file's
+        // (`Store::fill_missing_config_keys`).
         gas_limit_schedule: _,
     } = persisted;
 
@@ -2352,7 +2353,16 @@ async fn fetch_initial_beacon_state(
                 .max(state.slot());
             let processed_through = compute_epoch_at_slot(processed_slot);
 
-            let persisted = store.config();
+            // A config key this directory predates has no stored value to
+            // compare, so it is added from the config file rather than
+            // refused; `replace_config` below writes it.
+            let (persisted, added) = store.fill_missing_config_keys(&config);
+            for key in &added {
+                info!(
+                    key,
+                    "Config key this data directory predates; adding the config file's"
+                );
+            }
             if let Some(difference) =
                 first_config_difference(&persisted, &config, processed_through)
             {
@@ -2386,13 +2396,9 @@ async fn fetch_initial_beacon_state(
             // Whatever differs now is a value this directory does not
             // contradict, so the config file wins: the node runs on the
             // persisted config, and keeping the stored one would leave it on
-            // the old fork schedule. `replace_config` needs the only handle
-            // to the cached config, hence the `drop`. It is also what puts
-            // the file's `GAS_LIMIT_SCHEDULE` back, which the stored row does
-            // not carry: a non-empty one always differs from the stored one.
-            let config_changed = *persisted != config;
-            drop(persisted);
-            if config_changed {
+            // the old fork schedule. A key added above has no row yet, which
+            // `replace_config` writes too.
+            if persisted != config || !added.is_empty() {
                 store.replace_config(config.clone());
             }
 
@@ -3557,12 +3563,27 @@ validators:
         );
     }
 
-    /// `GAS_LIMIT_SCHEDULE` is not in the stored config row, so it has to
-    /// come back from the config file on every start: the fresh store keeps
-    /// the one it was bootstrapped with, and a resume installs the file's.
+    /// `GAS_LIMIT_SCHEDULE` is stored in a `Metadata` row of its own:
+    /// - a fresh directory writes it, so a reopened one carries the schedule
+    ///   with no config file involved;
+    /// - a directory that predates the row (written by an older build;
+    ///   simulated here by deleting the row) still resumes, with the key added
+    ///   from the config file and written, and the `config` row unchanged;
+    /// - a changed schedule in the file is followed and stored.
     #[tokio::test]
-    async fn the_gas_limit_schedule_survives_a_resume_without_being_stored() {
+    async fn the_gas_limit_schedule_is_stored_and_added_to_a_directory_that_predates_it() {
+        use ethlambda_storage::Table;
         use ethlambda_types::beacon::config::GasLimitScheduleEntry;
+
+        // The schedule's row, as `ethlambda_storage`'s `CONFIG_ROWS` names it.
+        const SCHEDULE_ROW: &[u8] = b"config_gas_limit_schedule";
+        let row = |backend: &Arc<dyn StorageBackend>, key: &[u8]| {
+            backend
+                .begin_read()
+                .unwrap()
+                .get(Table::Metadata, key)
+                .unwrap()
+        };
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::copy(
@@ -3577,35 +3598,90 @@ validators:
 
         // The devnet's file carries an empty schedule; give the loaded config
         // one, as a file that schedules a gas limit would.
-        let entry = GasLimitScheduleEntry {
+        let first = GasLimitScheduleEntry {
             epoch: 100,
             gas_limit: 200_000_000,
         };
-        let load = || {
+        let load = |entries: Vec<GasLimitScheduleEntry>| {
             let mut loaded = network::dir::NetworkDir::load(dir.path()).unwrap();
-            loaded.config.gas_limit_schedule = vec![entry].into();
+            loaded.config.gas_limit_schedule = entries.into();
             network::NetworkSource::Loaded(Box::new(loaded))
         };
 
-        let Ok(fresh) = fetch_initial_beacon_state(&[], backend.clone(), &load()).await else {
+        let Ok(fresh) = fetch_initial_beacon_state(&[], backend.clone(), &load(vec![first])).await
+        else {
             panic!("first run anchors");
         };
-        assert_eq!(fresh.config().gas_limit_schedule.entries(), [entry]);
+        assert_eq!(fresh.config().gas_limit_schedule.entries(), [first]);
         drop(fresh);
 
         let stored = Store::from_db_state(backend.clone())
             .expect("reopen")
             .expect("populated directory");
-        assert!(
-            stored.config().gas_limit_schedule.is_empty(),
-            "the stored row carries no schedule"
+        assert_eq!(
+            stored.config().gas_limit_schedule.entries(),
+            [first],
+            "the schedule is read back from its row"
         );
         drop(stored);
 
-        let Ok(resumed) = fetch_initial_beacon_state(&[], backend, &load()).await else {
-            panic!("an unchanged config resumes");
+        // A directory written before the row existed.
+        assert!(
+            row(&backend, SCHEDULE_ROW).is_some(),
+            "the fresh run wrote it"
+        );
+        let config_row = row(&backend, b"config").expect("config row");
+        let mut batch = backend.begin_write().unwrap();
+        batch
+            .delete_batch(Table::Metadata, vec![SCHEDULE_ROW.to_vec()])
+            .unwrap();
+        batch.commit().unwrap();
+        let predating = Store::from_db_state(backend.clone())
+            .expect("a directory without the row loads")
+            .expect("populated directory");
+        assert!(predating.config().gas_limit_schedule.is_empty());
+        drop(predating);
+
+        let Ok(resumed) =
+            fetch_initial_beacon_state(&[], backend.clone(), &load(vec![first])).await
+        else {
+            panic!("a directory that predates the key resumes");
         };
-        assert_eq!(resumed.config().gas_limit_schedule.entries(), [entry]);
+        assert_eq!(resumed.config().gas_limit_schedule.entries(), [first]);
+        drop(resumed);
+        assert!(
+            row(&backend, SCHEDULE_ROW).is_some(),
+            "the resume writes the key it added"
+        );
+        assert_eq!(
+            row(&backend, b"config").expect("config row"),
+            config_row,
+            "the config row is left as it was"
+        );
+
+        // The file schedules another entry.
+        let second = GasLimitScheduleEntry {
+            epoch: 200,
+            gas_limit: 300_000_000,
+        };
+        let Ok(followed) =
+            fetch_initial_beacon_state(&[], backend.clone(), &load(vec![first, second])).await
+        else {
+            panic!("a changed schedule resumes");
+        };
+        assert_eq!(
+            followed.config().gas_limit_schedule.entries(),
+            [first, second]
+        );
+        drop(followed);
+        let reopened = Store::from_db_state(backend)
+            .expect("reopen")
+            .expect("populated directory");
+        assert_eq!(
+            reopened.config().gas_limit_schedule.entries(),
+            [first, second],
+            "the changed schedule is stored"
+        );
     }
 
     /// `churn_limit_quotient` is one of the state-transition fields the

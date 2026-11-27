@@ -31,10 +31,9 @@
 //! the name threaded to it separately from startup.
 //!
 //! `GAS_LIMIT_SCHEDULE` (gloas, EIP-8261) is a field for the same reason, but
-//! one the stored encoding leaves out: see [`GasLimitSchedule`]. It is
-//! advisory, a validator client's default gas limit, so nothing a node checks
-//! depends on it, and the config file it comes from is parsed again at every
-//! start.
+//! one stored in a `Metadata` row of its own rather than in this struct's
+//! encoding: see [`GasLimitSchedule`]. It is advisory, a validator client's
+//! default gas limit, so nothing a node checks depends on it.
 //!
 //! Networking values and the deposit contract identity used to be left out too,
 //! on the grounds that the state transition never reads them. They are here now
@@ -89,10 +88,20 @@ pub struct BlobScheduleEntry {
 /// version.
 pub const MAX_BLOB_SCHEDULE_ENTRIES: usize = 32;
 
+/// How many gas-limit-schedule entries a [`GasLimitSchedule`] can carry.
+///
+/// A storage bound, not a consensus one, like [`MAX_BLOB_SCHEDULE_ENTRIES`]:
+/// the schedule's own row is a bounded SSZ list. A beacon node refuses a
+/// config file naming more ([`GasLimitSchedule::check`]); a validator client,
+/// which stores nothing, takes any length.
+pub const MAX_GAS_LIMIT_SCHEDULE_ENTRIES: usize = 32;
+
 /// One entry in gloas's gas limit schedule (EIP-8261): from `epoch` onward,
 /// until a later entry takes over, `gas_limit` is the network's default and
 /// recommended maximum gas limit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub struct GasLimitScheduleEntry {
     /// The first epoch this entry applies to.
@@ -115,25 +124,31 @@ pub struct GasLimitScheduleEntry {
 /// specification recommends that order, and `/eth/v1/config/spec` reports it
 /// in it.
 ///
-/// # Not stored
+/// A beacon node holds at most [`MAX_GAS_LIMIT_SCHEDULE_ENTRIES`] entries,
+/// since [`Self::check`] refuses more, so its schedule always fits the stored
+/// row. Deserializing takes any length: a validator client reading a node's
+/// schedule stores nothing.
 ///
-/// [`Config`] is persisted SSZ-encoded under `Metadata["config"]`, and a new
-/// field there would change that row's encoding, which is a `DB_VERSION` bump
-/// with no migration. This type's SSZ impls therefore write and read nothing:
-/// a fixed-size field of zero bytes, so the stored row is byte for byte what it
-/// was before the field existed, and a `Config` decoded from it has an empty
-/// schedule. The schedule comes from the config file instead, which is parsed
-/// again at every start. A fresh store keeps the `Config` it was bootstrapped
-/// with in memory, schedule included. A resume hands the file's `Config` to
-/// `Store::replace_config` whenever it differs from the decoded one, and the
-/// derived `PartialEq` on [`Config`] compares this field too, so a non-empty
-/// schedule always counts as a difference and is put back.
+/// # Stored in a row of its own
+///
+/// [`Config`] is persisted SSZ-encoded under `Metadata["config"]`, a positional
+/// container: a new field there would leave every row written before it
+/// undecodable, which is a `DB_VERSION` bump with no migration. So this field
+/// takes zero bytes in that encoding (this type's `SszEncode`/`SszDecode` write
+/// and read nothing, keeping the row byte for byte what it was), and the
+/// storage crate keeps the schedule in a `Metadata` row of its own instead,
+/// encoded by [`Self::to_row_ssz`]. A directory written before that row existed
+/// simply has none: a beacon resume reports the key as missing and adds the
+/// config file's, rather than failing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(
     from = "Vec<GasLimitScheduleEntry>",
     into = "Vec<GasLimitScheduleEntry>"
 )]
 pub struct GasLimitSchedule(Vec<GasLimitScheduleEntry>);
+
+/// The schedule's stored row: an SSZ list, ascending by epoch.
+type GasLimitScheduleRow = SszList<GasLimitScheduleEntry, MAX_GAS_LIMIT_SCHEDULE_ENTRIES>;
 
 impl GasLimitSchedule {
     /// The entries, ascending by epoch.
@@ -157,9 +172,16 @@ impl GasLimitSchedule {
             .map(|entry| entry.gas_limit)
     }
 
-    /// Whether this schedule keeps the specification's two rules: no two
-    /// entries share an epoch, and none is before `gloas_fork_epoch`.
+    /// Whether a beacon node can run on this schedule: it holds at most
+    /// [`MAX_GAS_LIMIT_SCHEDULE_ENTRIES`] entries, which is what its stored
+    /// row can hold, and it keeps the specification's two rules (no two
+    /// entries share an epoch, and none is before `gloas_fork_epoch`).
     pub fn check(&self, gloas_fork_epoch: Epoch) -> Result<(), GasLimitScheduleError> {
+        if self.0.len() > MAX_GAS_LIMIT_SCHEDULE_ENTRIES {
+            return Err(GasLimitScheduleError::TooManyEntries {
+                entries: self.0.len(),
+            });
+        }
         if let Some(entry) = self.0.iter().find(|entry| entry.epoch < gloas_fork_epoch) {
             return Err(GasLimitScheduleError::BeforeGloas {
                 epoch: entry.epoch,
@@ -176,6 +198,31 @@ impl GasLimitSchedule {
             });
         }
         Ok(())
+    }
+
+    /// The schedule as its own `Metadata` row stores it: an SSZ
+    /// `List[GasLimitScheduleEntry, MAX_GAS_LIMIT_SCHEDULE_ENTRIES]`.
+    ///
+    /// # Panics
+    ///
+    /// If the schedule holds more than [`MAX_GAS_LIMIT_SCHEDULE_ENTRIES`]
+    /// entries. A beacon node's config file is refused before that
+    /// ([`Self::check`]), so only a schedule built in code can.
+    pub fn to_row_ssz(&self) -> Vec<u8> {
+        let row = GasLimitScheduleRow::try_from(self.0.clone()).unwrap_or_else(|_| {
+            panic!(
+                "a gas limit schedule of {} entries is over the {MAX_GAS_LIMIT_SCHEDULE_ENTRIES} \
+                 its row can hold",
+                self.0.len()
+            )
+        });
+        libssz::SszEncode::to_ssz(&row)
+    }
+
+    /// Decode the schedule's own `Metadata` row ([`Self::to_row_ssz`]).
+    pub fn from_row_ssz(bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
+        let row = <GasLimitScheduleRow as libssz::SszDecode>::from_ssz_bytes(bytes)?;
+        Ok(Self::from(row.to_vec()))
     }
 }
 
@@ -194,9 +241,14 @@ impl From<GasLimitSchedule> for Vec<GasLimitScheduleEntry> {
     }
 }
 
-/// A `GAS_LIMIT_SCHEDULE` that breaks one of the specification's rules for it.
+/// A `GAS_LIMIT_SCHEDULE` a beacon node refuses: one too long for it to store,
+/// or one that breaks the specification's rules.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GasLimitScheduleError {
+    #[error(
+        "{entries} entries, more than the {MAX_GAS_LIMIT_SCHEDULE_ENTRIES} this node can store"
+    )]
+    TooManyEntries { entries: usize },
     #[error(
         "an entry at epoch {epoch} is before GLOAS_FORK_EPOCH ({gloas_fork_epoch}), \
          which the schedule must not start before"
@@ -209,7 +261,8 @@ pub enum GasLimitScheduleError {
     DuplicateEpoch { epoch: Epoch },
 }
 
-/// Zero bytes: see "Not stored" on [`GasLimitSchedule`].
+/// Zero bytes inside [`Config`]'s encoding: see "Stored in a row of its own"
+/// on [`GasLimitSchedule`]. The row itself is [`GasLimitSchedule::to_row_ssz`].
 impl libssz::SszEncode for GasLimitSchedule {
     fn is_fixed_size() -> bool {
         true
@@ -226,8 +279,9 @@ impl libssz::SszEncode for GasLimitSchedule {
     fn ssz_append(&self, _buf: &mut Vec<u8>) {}
 }
 
-/// Zero bytes, decoded as the empty schedule: see "Not stored" on
-/// [`GasLimitSchedule`].
+/// Zero bytes inside [`Config`]'s encoding, decoded as the empty schedule,
+/// which the storage crate then fills from the schedule's own row: see
+/// "Stored in a row of its own" on [`GasLimitSchedule`].
 impl libssz::SszDecode for GasLimitSchedule {
     fn is_fixed_size() -> bool {
         true
@@ -788,14 +842,14 @@ pub struct Config {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_epochs_for_block_requests: u64,
 
-    // -- Not stored ----------------------------------------------------------
+    // -- Stored in rows of their own ----------------------------------------
+    // Every key added after `DB_VERSION` 7 goes here: it takes zero bytes in
+    // `Metadata["config"]`, and the storage crate keeps it in a `Metadata` row
+    // of its own, so a directory that predates the key loads, and a resume
+    // adds the config file's value instead of failing.
     /// Gloas (EIP-8261): the gas limit schedule, a validator client's default
     /// gas limit per epoch. Empty when the file omits it, as mainnet's does.
-    ///
-    /// Last, and alone in its group, because it is the one field the stored
-    /// encoding leaves out: it takes no bytes in `Metadata["config"]`, so a
-    /// `Config` read back from the database has an empty schedule until a
-    /// resume puts the config file's in its place. See [`GasLimitSchedule`].
+    /// See [`GasLimitSchedule`].
     pub gas_limit_schedule: GasLimitSchedule,
 }
 
@@ -1915,12 +1969,12 @@ mod tests {
         assert_eq!(GasLimitSchedule::default().check(Epoch::MAX), Ok(()));
     }
 
-    /// The schedule must leave the stored encoding alone: `Metadata["config"]`
-    /// rows written before the field existed decode unchanged, and no
-    /// `DB_VERSION` bump is needed. Decoding gives an empty schedule, which a
-    /// resume replaces with the config file's.
+    /// The schedule must leave `Metadata["config"]`'s encoding alone: rows
+    /// written before the field existed decode unchanged, and no `DB_VERSION`
+    /// bump is needed. Decoding that row gives an empty schedule; the storage
+    /// crate fills it from the schedule's own row.
     #[test]
-    fn the_gas_limit_schedule_is_not_part_of_the_stored_encoding() {
+    fn the_config_row_leaves_the_gas_limit_schedule_to_its_own_row() {
         let mut scheduled = Config::mainnet();
         scheduled.gas_limit_schedule = vec![gas_limit_entry(100, 200_000_000)].into();
 
@@ -1937,6 +1991,53 @@ mod tests {
 
         assert_eq!(GasLimitSchedule::default().to_ssz(), Vec::<u8>::new());
         assert!(GasLimitSchedule::from_ssz_bytes(&[0]).is_err());
+    }
+
+    #[test]
+    fn the_gas_limit_schedule_row_round_trips() {
+        let schedule = GasLimitSchedule::from(vec![
+            gas_limit_entry(1_566, 200_000_000),
+            gas_limit_entry(1_536, 60_000_000),
+        ]);
+        let decoded = GasLimitSchedule::from_row_ssz(&schedule.to_row_ssz()).expect("valid row");
+        assert_eq!(decoded, schedule);
+        assert_eq!(decoded.gas_limit_at(1_566), Some(200_000_000));
+
+        let empty = GasLimitSchedule::default();
+        assert_eq!(
+            GasLimitSchedule::from_row_ssz(&empty.to_row_ssz()),
+            Ok(empty)
+        );
+        // One byte is not a whole 16-byte entry.
+        assert!(GasLimitSchedule::from_row_ssz(&[0]).is_err());
+    }
+
+    /// The stored row holds at most `MAX_GAS_LIMIT_SCHEDULE_ENTRIES`, so
+    /// `check` (a beacon node's config file) refuses a longer schedule rather
+    /// than the write failing. Deserializing alone does not: a validator
+    /// client reads a node's schedule and stores nothing.
+    #[test]
+    fn a_gas_limit_schedule_longer_than_its_row_is_refused_by_check_only() {
+        let schedule = |count: usize| {
+            let entries = (0..count as u64).map(|epoch| gas_limit_entry(epoch, 60_000_000));
+            GasLimitSchedule::from(entries.collect::<Vec<_>>())
+        };
+        assert_eq!(schedule(MAX_GAS_LIMIT_SCHEDULE_ENTRIES).check(0), Ok(()));
+        assert_eq!(
+            schedule(MAX_GAS_LIMIT_SCHEDULE_ENTRIES + 1).check(0),
+            Err(GasLimitScheduleError::TooManyEntries {
+                entries: MAX_GAS_LIMIT_SCHEDULE_ENTRIES + 1
+            })
+        );
+
+        let entry = |epoch| format!("  - EPOCH: {epoch}\n    GAS_LIMIT: 60000000\n");
+        let over: String = (0..=MAX_GAS_LIMIT_SCHEDULE_ENTRIES).map(entry).collect();
+        let parsed: Config = serde_yaml_ng::from_str(&format!("GAS_LIMIT_SCHEDULE:\n{over}"))
+            .expect("deserializing takes any length");
+        assert_eq!(
+            parsed.gas_limit_schedule.entries().len(),
+            MAX_GAS_LIMIT_SCHEDULE_ENTRIES + 1
+        );
     }
 
     #[test]

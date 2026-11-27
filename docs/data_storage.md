@@ -284,7 +284,8 @@ different checkpoints.
 | `chain`                        | raw byte     | both   | Which consensus protocol this directory holds (`Chain`)       |
 | `preset`                       | raw byte     | both   | Which SSZ preset the writing build used (`Preset`)            |
 | `time`                         | `u64`        | both   | The store clock, as a **UNIX timestamp in milliseconds**      |
-| `config`                       | `Config`     | both   | The node's runtime configuration                              |
+| `config`                       | `Config`     | both   | The node's runtime configuration, except the keys below that have rows of their own |
+| `config_gas_limit_schedule`    | `List[GasLimitScheduleEntry, 32]` | both | `GAS_LIMIT_SCHEDULE` (gloas, EIP-8261); absent in a directory written before it |
 | `head`                         | `H256`       | both   | Current fork choice head                                      |
 | `anchor_slot`                  | `u64`        | both   | The slot this directory's chain begins at                     |
 | `states_pruned_below`          | `u64`        | both   | Exclusive upper bound of the `States`/`StateDiffs` slots already range-deleted; absent means 0 |
@@ -297,6 +298,14 @@ different checkpoints.
 Rows marked for one chain are never written on the other, so reaching one
 through the wrong chain's accessor panics naming the key rather than reading a
 zero. That is deliberate: a data directory holds one chain for its whole life.
+
+`config` is a positional SSZ container, so a field added to it would leave
+every row written before it undecodable. A `Config` key added since
+`DB_VERSION` 7 therefore takes zero bytes there and gets a `config_*` row of its
+own (`CONFIG_ROWS` in `store.rs`). An older directory just lacks the row: a
+beacon resume reports the key as missing, adds the config file's value and
+writes the row, instead of failing. An older build never reads the row. Every
+`config*` row is written in one batch, at bootstrap and by `replace_config`.
 
 #### One clock, three readings
 
