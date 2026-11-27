@@ -744,9 +744,11 @@ existing once per chain.
   scattered), and an inner node a page of child pointers spanning several
   binary levels, so a lookup crosses a handful of nodes and a rebuilt leaf or
   node copies one page. A hashed inner node keeps its binary levels, so its
-  rebuilt successor rehashes only the changed children's paths. Hashing can
-  run on Prysm's `hashtree` kernels (ssz-tree's `hashtree` feature, off by
-  default; no workspace crate turns it on). Balances and
+  rebuilt successor rehashes only the changed children's paths. A bottom inner
+  node and its leaves hash level by level, one SHA-256 call per level across
+  all of them (`Tree::hash`); above them, changed subtrees hash in parallel.
+  Optionally on Prysm's `hashtree` kernels (ssz-tree's `hashtree` feature,
+  off by default; no workspace crate turns it on). Balances and
   participation buffer writes in a `SparseMap` (hash table, sorted on apply);
   a pass that rewrites most of a list goes through the cursor instead. Writes are
   buffered until `BeaconState::apply_pending_mutations`, which the state
