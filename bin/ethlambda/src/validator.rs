@@ -45,13 +45,16 @@ pub(crate) struct ValidatorOptions {
     /// Optional, with no default. Without it the client runs on the chain of
     /// the first beacon node that answers. With it, a node whose preset,
     /// genesis, slot duration or genesis fork version differs from the
-    /// network's is never used, and startup fails when every node that
-    /// answered is on another network.
+    /// network's is never used. Startup fails once every configured node has
+    /// answered and none is on the network, and waits while one has not
+    /// answered. A directory is resolved whole, as for `beacon`: its
+    /// `genesis.ssz` is decoded and its bootnodes file read.
     ///
     /// The fork schedule still comes from the beacon nodes. One that differs
     /// from this network's config is warned about once an epoch, never
     /// refused, so a fork the network schedules or moves needs the beacon
-    /// nodes upgraded, not this client.
+    /// nodes upgraded for the client to follow it. The network's schedule
+    /// only picks the reference among nodes that disagree.
     #[arg(long)]
     pub(crate) network: Option<String>,
 
@@ -706,6 +709,53 @@ mod tests {
             network.chain.config.genesis_fork_version,
             [0x10, 0, 0x09, 0x10]
         );
+    }
+
+    /// A network directory resolves to its own genesis state and config, and
+    /// is named by its `CONFIG_NAME`.
+    #[test]
+    fn a_network_directory_resolves_to_its_genesis_and_config() {
+        let dir = crate::network::dir::tests::complete_dir();
+        let mut options = options("");
+        options.network = Some(dir.path().display().to_string());
+        let network = options
+            .network()
+            .expect("the directory resolves")
+            .expect("a network was named");
+
+        let state = crate::beacon::mainnet_genesis_state().expect("fixture state");
+        assert_eq!(network.name, "ethlambda-devnet");
+        assert_eq!(network.chain.genesis.genesis_time, state.genesis_time());
+        assert_eq!(
+            network.chain.genesis.genesis_validators_root,
+            state.genesis_validators_root()
+        );
+        assert_eq!(network.chain.config.preset_base.as_str(), "mainnet");
+    }
+
+    /// A directory whose `config.yaml` has no `CONFIG_NAME` is named by the
+    /// flag's value, so logs and errors still say which network it is.
+    #[test]
+    fn a_network_directory_without_a_config_name_is_named_by_its_path() {
+        let dir = crate::network::dir::tests::complete_dir();
+        let config = dir.path().join("config.yaml");
+        let text = std::fs::read_to_string(&config).expect("fixture config");
+        let unnamed: String = text
+            .lines()
+            .filter(|line| !line.starts_with("CONFIG_NAME:"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(unnamed.len(), text.len(), "the fixture names itself");
+        std::fs::write(&config, unnamed).expect("rewrite config");
+
+        let value = dir.path().display().to_string();
+        let mut options = options("");
+        options.network = Some(value.clone());
+        let network = options
+            .network()
+            .expect("the directory resolves")
+            .expect("a network was named");
+        assert_eq!(network.name, value);
     }
 
     #[test]

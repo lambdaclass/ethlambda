@@ -390,9 +390,13 @@ not used, and a node on another network counts as a final answer: when every
 node answered, each on another network, on a preset this client cannot run on,
 or with a spec it cannot read, startup fails naming why each is off; otherwise it
 waits for one on the network. The fork schedule is not held to the network's,
-since the beacon nodes or this binary may predate a change to it: the client
-still follows the nodes' schedule (below), and warns once an epoch, naming both
-values, when it differs from the network's config. Without `--network` the first
+since the beacon nodes or the network's config (this binary's, for a built-in
+network; the directory's `config.yaml` otherwise) may predate a change to it:
+the client still follows the nodes' schedule (below), and warns once an epoch,
+naming both values, when it differs from the network's config. The network's
+schedule only breaks a tie: among the nodes on the network, the first whose
+schedule is the network's is the reference, and the first on the network when
+none is. Without `--network` the first
 node to answer sets the chain, whatever it is.
 
 A response without the slot
@@ -458,7 +462,7 @@ slot's end, so a node serving a wrong one cannot park a duty past its slot.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Every node on this client's chain is asked `/eth/v1/node/syncing` once a slot and ranked by the answer, list order breaking ties. The first that answers serves the request, so the order is a preference, not load balancing. A node on another chain, or not checked yet, is skipped: see [the chain check](#several-beacon-nodes-the-chain-check), [The per-slot sync check](#the-per-slot-sync-check) and [Ranking and broadcast](#ranking-and-broadcast) |
-| `--network` | none | The network every beacon node must be on: a built-in name (`mainnet`, `sepolia`, `hoodi`, `plataberget`) or a directory of published network files, resolved as `beacon --network` resolves it. A node on another network (preset, genesis, slot duration or genesis fork version) is not used, and startup fails if every node that answered is on one. The fork schedule still comes from the beacon nodes and is only warned about when it differs from the network's, so a rescheduled fork needs the beacon nodes upgraded, not this client. Without it the client runs on the first answering node's chain. See [the chain check](#several-beacon-nodes-the-chain-check) |
+| `--network` | none | The network every beacon node must be on: a built-in name (`mainnet`, `sepolia`, `hoodi`, `plataberget`) or a directory of published network files, resolved as `beacon --network` resolves it (a directory's `genesis.ssz` is decoded and its bootnodes file read, at startup). A node on another network (preset, genesis, slot duration or genesis fork version) is not used. Startup fails once every configured node has answered and none is on it, and waits while one has not answered. The fork schedule still comes from the beacon nodes and is only warned about when it differs from the network's, so a rescheduled fork needs the beacon nodes upgraded for the client to follow it; the network's schedule only picks the reference among nodes that disagree. Without it the client runs on the first answering node's chain. See [the chain check](#several-beacon-nodes-the-chain-check) |
 | `--broadcast` | none | Signed messages to send to every beacon node on this client's chain at once instead of the first that accepts them, comma-separated: `attestations` (attestations, aggregates, payload attestations), `blocks` (blocks and envelopes, never a blinded block), `sync-committee` (messages and contributions). `subscriptions` and `none` are accepted, as Lighthouse takes them, and change nothing, since subscriptions, fee recipients, builder registrations and proposer preferences always go to every node. See [Ranking and broadcast](#ranking-and-broadcast) |
 | `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml`, which also lists the keys a remote signer holds (see [Remote signing](#remote-signing-web3signer)). Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`, password in `--secrets-dir/<0xpubkey>`) are discovered and the file is written |
 | `--secrets-dir` | required | Directory holding one password file per keystore, named after the validator's public key |

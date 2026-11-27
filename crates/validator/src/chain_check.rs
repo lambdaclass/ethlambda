@@ -242,8 +242,9 @@ pub fn warn_if_schedule_differs(network: &ExpectedNetwork, follows: &Config, epo
         network = %network.name,
         differences = %differences.join("; "),
         "The fork schedule the beacon nodes serve differs from --network's config; the client \
-         follows the beacon nodes. One of them is out of date: upgrade the beacon nodes or \
-         this client, whichever predates the network's schedule"
+         follows the beacon nodes. One side is out of date: the beacon nodes, or --network's \
+         config (this binary's for a built-in network, the directory's config.yaml \
+         otherwise), whichever predates the network's schedule"
     );
 }
 
@@ -1179,6 +1180,36 @@ mod tests {
             chain.genesis.genesis_validators_root,
             Root::repeat_byte(0xbb)
         );
+    }
+
+    /// Two nodes on the named network that disagree on a fork: the second,
+    /// whose schedule is the network's, is the reference, though the first is
+    /// listed ahead of it. With neither on the network's schedule, list order
+    /// decides, as without a network.
+    #[tokio::test]
+    async fn a_node_on_the_named_network_and_its_schedule_is_the_preferred_reference() {
+        let network = named_network();
+        let gloas_at = network.chain.config.fork_epoch(ForkName::Gloas);
+        let stale = Config::mainnet().with_fork_epoch(ForkName::Gloas, NOW + 10);
+        assert_ne!(stale.fork_epoch(ForkName::Gloas), gloas_at);
+
+        let fallback = FallbackBeaconNode::new(vec![node().with_spec(stale.clone()), node()]);
+        let chain = fallback
+            .establish_on(Some(&network), |_| Ok(NOW))
+            .await
+            .expect("both nodes are on the network");
+        assert_eq!(chain.config.fork_epoch(ForkName::Gloas), gloas_at);
+
+        let other = Config::mainnet().with_fork_epoch(ForkName::Gloas, NOW + 20);
+        let fallback = FallbackBeaconNode::new(vec![
+            node().with_spec(stale.clone()),
+            node().with_spec(other),
+        ]);
+        let chain = fallback
+            .establish_on(Some(&network), |_| Ok(NOW))
+            .await
+            .expect("both nodes are on the network");
+        assert_eq!(chain.config.fork_epoch(ForkName::Gloas), NOW + 10);
     }
 
     /// Every node answered, each on another network or preset: waiting would

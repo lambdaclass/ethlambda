@@ -185,7 +185,7 @@ fn read_required_bytes(path: &Path) -> Result<Vec<u8>, NetworkDirError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn fixture(name: &str) -> std::path::PathBuf {
@@ -196,7 +196,7 @@ mod tests {
 
     /// Build a complete directory in a temp dir: the devnet fixture plus a
     /// genesis state, which is too large to check in.
-    fn complete_dir() -> tempfile::TempDir {
+    pub(crate) fn complete_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::copy(
             fixture("devnet").join("config.yaml"),
