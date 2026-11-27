@@ -2,7 +2,9 @@ name: Kurtosis Assertoor
 
 # Starts a devnet with ethlambda beacon and validator clients next to
 # lighthouse, then runs assertoor's stability, block-proposal and sync checks
-# against every client pair. See tooling/kurtosis-assertoor/README.md.
+# against every client pair. Next to it, on its own runner, the Commit-Boost
+# check starts the same participants with a builder and waits for ethlambda to
+# build blocks through it. See tooling/kurtosis-assertoor/README.md.
 
 on:
   push:
@@ -17,13 +19,24 @@ on:
         description: "ethlambda image to test (default: ghcr.io/lambdaclass/ethlambda:unstable)"
         required: false
         type: string
+      battery:
+        description: "Which battery to run"
+        required: false
+        type: choice
+        options:
+          - assertoor
+          - commit-boost
+          - both
+        default: both
 
 permissions:
   contents: read
 
-# A newer push to main (or to the PR) makes this run's result stale.
+# A newer push to main (or to the PR) makes this run's result stale. The event
+# is part of the group so a dispatch on main (the Commit-Boost check) and a
+# push to main do not cancel each other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -35,6 +48,7 @@ env:
   ETHEREUM_PACKAGE_REPO: https://github.com/ethpandaops/ethereum-package.git
   ETHEREUM_PACKAGE_REF: 90d0f4e795cd4c3298753b428bb588ed7999d4da
   ENCLAVE: ethlambda-assertoor
+  COMMIT_BOOST_ENCLAVE: ethlambda-commit-boost
 
 jobs:
   image:
@@ -80,6 +94,11 @@ jobs:
   assertoor:
     name: Assertoor
     needs: image
+    # Every push to main, and every dispatch except one that asked for the
+    # commit-boost battery alone. Not on pull requests: it takes about half an
+    # hour. To test a change to this battery before it merges, dispatch the
+    # workflow on the branch with `battery: assertoor`.
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.battery != 'commit-boost')
     runs-on: ubuntu-latest
     timeout-minutes: 120
     outputs:
@@ -168,9 +187,104 @@ jobs:
         if: always()
         run: kurtosis enclave rm -f "$ENCLAVE" || true
 
+  # Every push and pull request, and every dispatch except one that asked for
+  # the assertoor battery alone: `commit-boost` and `both` both run this job.
+  commit-boost:
+    name: Commit-Boost
+    needs: image
+    if: github.event_name != 'workflow_dispatch' || inputs.battery != 'assertoor'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      failed: ${{ steps.collect.outputs.failed }}
+    steps:
+      - uses: actions/checkout@v6.1.0
+
+      - name: Free up disk space
+        uses: $/.github/actions/free-disk
+
+      - name: Install kurtosis
+        run: |
+          echo "deb [trusted=yes] https://sdk.kurtosis.com/kurtosis-cli-release-artifacts/ /" \
+            | sudo tee /etc/apt/sources.list.d/kurtosis.list
+          sudo apt-get update
+          sudo apt-get install -y "kurtosis-cli=$KURTOSIS_VERSION"
+          kurtosis analytics disable
+          kurtosis version
+
+      # The base battery's pin: it has ethlambda's builder flags
+      # (ethpandaops/ethereum-package#1515) and the builder's enode bootnodes
+      # (#1525).
+      - name: Fetch ethereum-package at the pinned commit
+        run: |
+          git init "$RUNNER_TEMP/ethereum-package"
+          cd "$RUNNER_TEMP/ethereum-package"
+          git fetch --depth 1 "$ETHEREUM_PACKAGE_REPO" "$ETHEREUM_PACKAGE_REF"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$ETHEREUM_PACKAGE_REF"
+
+      - name: Point the args at the image under test
+        env:
+          IMAGE: ${{ needs.image.outputs.image }}
+        run: |
+          cp tooling/kurtosis-assertoor/commit_boost_params.yaml "$RUNNER_TEMP/args.yaml"
+          yq -i '
+            (.participants[] | select(.cl_type == "ethlambda") | .cl_image) = strenv(IMAGE) |
+            (.participants[] | select(.vc_type == "ethlambda") | .vc_image) = strenv(IMAGE)
+          ' "$RUNNER_TEMP/args.yaml"
+          cat "$RUNNER_TEMP/args.yaml"
+
+      # pipefail, or the step takes tee's status: a Starlark error that rolled
+      # back a service would pass here and surface only in the next step.
+      - name: Start the devnet
+        run: |
+          set -o pipefail
+          kurtosis run "$RUNNER_TEMP/ethereum-package" \
+            --enclave "$COMMIT_BOOST_ENCLAVE" --args-file "$RUNNER_TEMP/args.yaml" \
+            | tee "$RUNNER_TEMP/kurtosis_output.txt"
+
+      - name: Wait for builder blocks
+        run: |
+          tooling/kurtosis-assertoor/scripts/check-builder-blocks.sh \
+            "$COMMIT_BOOST_ENCLAVE" 40 "$RUNNER_TEMP/builder-results"
+
+      # Runs after a failure too: the notify job names the unmet conditions.
+      - name: Collect unmet conditions
+        id: collect
+        if: always()
+        run: |
+          failed="$RUNNER_TEMP/builder-results/failed.txt"
+          {
+            echo "failed<<EOF"
+            if [ -s "$failed" ]; then tr -s ' ' < "$failed"; else echo "the check did not produce a result (the devnet did not start?)"; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Dump the enclave
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/dump"
+          cp "$RUNNER_TEMP/args.yaml" "$RUNNER_TEMP/dump/args.yaml"
+          cp "$RUNNER_TEMP/kurtosis_output.txt" "$RUNNER_TEMP/dump/" || true
+          cp -r "$RUNNER_TEMP/builder-results" "$RUNNER_TEMP/dump/" || true
+          cd "$RUNNER_TEMP/dump"
+          kurtosis enclave dump "$COMMIT_BOOST_ENCLAVE" || true
+
+      - name: Upload the dump and results
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: commit-boost-enclave-dump-${{ github.run_id }}
+          path: ${{ runner.temp }}/dump
+          if-no-files-found: warn
+
+      - name: Remove the enclave
+        if: always()
+        run: kurtosis enclave rm -f "$COMMIT_BOOST_ENCLAVE" || true
+
   notify:
     name: Post failure to Slack
-    needs: [image, assertoor]
+    needs: [image, assertoor, commit-boost]
     if: failure() && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
@@ -179,20 +293,33 @@ jobs:
       - name: Build Slack payload
         # Values go through the environment and the JSON is built with jq, as in
         # daily_ci.yml, so a failed-test name cannot break the payload.
+        # Each battery is reported by its own job result: a job that passed
+        # still has a `failed` output, which then says it produced no result.
         env:
           SHA: ${{ github.sha }}
-          FAILED: ${{ needs.assertoor.outputs.failed }}
           IMAGE_RESULT: ${{ needs.image.result }}
+          ASSERTOOR_RESULT: ${{ needs.assertoor.result }}
+          ASSERTOOR_FAILED: ${{ needs.assertoor.outputs.failed }}
+          COMMIT_BOOST_RESULT: ${{ needs.commit-boost.result }}
+          COMMIT_BOOST_FAILED: ${{ needs.commit-boost.outputs.failed }}
           COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          join() { paste -sd, - | sed 's/,/, /g'; }
+          lines=()
           if [ "$IMAGE_RESULT" != "success" ]; then
-            FAILED="no image: the sha-${SHA::7} tag never appeared"
+            lines+=("no image: the sha-${SHA::7} tag never appeared")
+          fi
+          if [ "$ASSERTOOR_RESULT" = "failure" ]; then
+            lines+=("Assertoor: $(join <<<"$ASSERTOOR_FAILED")")
+          fi
+          if [ "$COMMIT_BOOST_RESULT" = "failure" ]; then
+            lines+=("Commit-Boost: $(join <<<"$COMMIT_BOOST_FAILED")")
           fi
           # The backticks are literal Slack mrkdwn, not command substitution.
           # shellcheck disable=SC2016
-          text=$(printf '❌ *Kurtosis Assertoor* failed on <%s|`%s`>\nFailed: %s\n<%s|View run>' \
-            "$COMMIT_URL" "${SHA::7}" "$(echo "$FAILED" | paste -sd, - | sed 's/,/, /g')" "$RUN_URL")
+          text=$(printf '❌ *Kurtosis Assertoor* failed on <%s|`%s`>\n%s\n<%s|View run>' \
+            "$COMMIT_URL" "${SHA::7}" "$(printf '%s\n' "${lines[@]}")" "$RUN_URL")
           jq -n --arg text "$text" \
             '{blocks: [{type: "section", text: {type: "mrkdwn", text: $text}}]}' \
             > assertoor_slack.json
