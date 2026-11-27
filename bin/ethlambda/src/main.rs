@@ -933,6 +933,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // block production collects.
     let prepared_payloads = ethlambda_blockchain::PreparedPayloads::default();
     let rpc_prepared_payloads = prepared_payloads.clone();
+    // And the attestations of the next PQ block, packed alongside its build.
+    let prepared_pq_attestations = ethlambda_blockchain::PreparedPqAttestations::default();
+    let rpc_prepared_pq_attestations = prepared_pq_attestations.clone();
     let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
     let rpc_custody_columns = match &setup.chain {
         ChainActor::Beacon {
@@ -979,6 +982,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     sync_committee_pool: sync_committee_pool.clone(),
                     fee_recipients: rpc_fee_recipients,
                     prepared_payloads: rpc_prepared_payloads,
+                    prepared_pq_attestations: rpc_prepared_pq_attestations,
                     custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
                     events: rpc_events,
@@ -1034,6 +1038,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     builder_market,
                     always_prepare: always_prepare_payload,
                     prepared_payloads,
+                    prepared_pq_attestations,
                 },
             )
         }

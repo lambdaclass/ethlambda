@@ -60,6 +60,7 @@ use crate::store::StoreError;
 
 pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
 pub use payload_attributes::{FeeRecipients, PayloadPreparation, PreparedPayloads};
+pub use pq_attestation_packing::PreparedPqAttestations;
 
 pub mod aggregation;
 mod beacon_aggregates;
@@ -79,6 +80,7 @@ pub mod import_timing;
 pub mod key_manager;
 pub mod metrics;
 pub mod payload_attributes;
+pub mod pq_attestation_packing;
 pub mod reaggregate;
 pub mod spec_test_runner;
 pub mod store;
