@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-a7c3f033.js";
+            window.path_to_searchindex_js = "searchindex-f7066c6a.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-9d125e03.js"></script>
+        <script src="toc-26bf4b2e.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -314,6 +314,7 @@ from a normal build.</p>
 <tr><td><code>--custody-group-count</code></td><td><code>CUSTODY_REQUIREMENT</code> (4)</td><td>The fewest custody groups this node custodies, advertised as the ENR’s <code>cgc</code> and <code>MetaData</code>’s <code>custody_group_count</code>. Validator custody can raise it (see below)</td></tr>
 <tr><td><code>--execution-endpoint</code></td><td>none</td><td>Base URL of the execution client’s Engine API endpoint, e.g. <code>http://127.0.0.1:8551</code>. Must be given together with <code>--execution-jwt-secret</code></td></tr>
 <tr><td><code>--execution-jwt-secret</code></td><td>none</td><td>File holding the 32-byte hex JWT secret shared with the execution client</td></tr>
+<tr><td><code>--ethrex.*</code></td><td>see <a href="./ethrex.html#flags">Embedded ethrex</a></td><td>Only in a build with the <code>include-ethrex</code> feature: configure the ethrex that build runs in-process when <code>--execution-endpoint</code> is not given (data directory, network, sync mode, devp2p ports and bootnodes, the optional execution JSON-RPC and metrics servers), and are refused together with it</td></tr>
 <tr><td><code>--safe-slots-to-import-optimistically</code></td><td>the specification’s own value</td><td>How far behind the wall clock a block must be before it may be imported optimistically on age alone</td></tr>
 <tr><td><code>--always-prepare-payload</code></td><td>off</td><td>Publish the <code>payload_attributes</code> event for every slot, not only for proposers a validator client registered through <code>prepare_beacon_proposer</code>. For an external block builder reading this node’s event stream (ethereum-package’s buildoor). With <code>--execution-endpoint</code> it also has the execution client start a payload build for every slot, a third of a slot ahead, whether or not anything is subscribed to the event stream. For a proposer no validator client registered, that build pays the fee recipient of the proposer’s signed preferences on gloas, else <code>--fallback-fee-recipient</code>, else the zero address. Lighthouse’s flag of the same name</td></tr>
 <tr><td><code>--fallback-fee-recipient</code></td><td>none</td><td>Execution address (20 bytes of hex, <code>0x</code> optional) a locally built payload pays when no validator client named a fee recipient for the proposer through <code>prepare_beacon_proposer</code> or a builder registration (and, on gloas, no signed proposer preferences name one). Without it such a payload pays the zero address and its fees are lost. The zero address itself is accepted but reported at error at startup, since a proposal that falls back to it logs only at debug. It does not register the proposer: <code>payload_attributes</code> events still need <code>prepare_beacon_proposer</code> or <code>--always-prepare-payload</code>. Lighthouse’s beacon-node <code>--suggested-fee-recipient</code></td></tr>
@@ -364,9 +365,11 @@ recorded and logged as a warning, and the next start custodies and advertises
 it. The ENR’s <code>cgc</code> keeps its startup value until a restart, the same
 limitation as the fork digest’s <code>eth2</code> entry (ethrex’s <code>DiscoveryServer</code>
 cannot replace the record it serves).</p>
-<p>With neither execution flag, the follower contacts no execution client and
-imports blocks without validating their payloads, which is what it did before
-those flags existed. It then answers <code>attestation_data</code>,
+<p>With neither execution flag, what happens depends on the build. A build with
+the <code>include-ethrex</code> feature starts its embedded ethrex and validates payloads
+through it (see <a href="./ethrex.html">Embedded ethrex</a>). Any other build contacts no
+execution client and imports blocks without validating their payloads, which is
+what it did before those flags existed. It then answers <code>attestation_data</code>,
 <code>aggregate_attestation</code> and block production with <code>503</code>, so a validator
 client cannot use it. Supplying one without the other is refused at startup: an
 Engine API endpoint always requires authentication. See
@@ -1686,7 +1689,7 @@ for what the workload measures and why it exists.</p>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="beacon_engine.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="ethrex.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -1700,7 +1703,7 @@ for what the workload measures and why it exists.</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="beacon_engine.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="ethrex.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 

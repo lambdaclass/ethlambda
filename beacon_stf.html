@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-a7c3f033.js";
+            window.path_to_searchindex_js = "searchindex-f7066c6a.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-9d125e03.js"></script>
+        <script src="toc-26bf4b2e.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -248,9 +248,10 @@ complete, and that preset’s next run would fail on a missing directory rather
 than fetching what it needs. The wipe matters as much as the re-download, since
 the tarballs unpack side by side into one directory, and layering a new release
 over an old one would keep cases the new one deleted.</p>
-<p><code>make test</code> covers the whole workspace, in two halves, and still needs no
-fixture download. The halves are all that <code>test-node</code>’s <code>--exclude</code> flags do;
-nothing is dropped to keep the beacon suite out. Two gates keep it that way,
+<p><code>make test</code> covers the whole workspace, in two halves plus <code>test-ethrex</code>, and
+still needs no fixture download. Those parts are all that <code>test-node</code>’s
+<code>--exclude</code> flags do (the consensus half, and <code>ethlambda-ethrex</code>, which
+<code>test-ethrex</code> runs); nothing is dropped to keep the beacon suite out. Two gates keep it that way,
 both tied to the <code>beacon-spec-tests</code> feature that <code>make test-beacon</code> turns on:</p>
 <ul>
 <li>The <code>beacon_spec_tests</code> target declares <code>required-features = ["beacon-spec-tests"]</code>, so <code>cargo test</code> skips building it entirely.</li>

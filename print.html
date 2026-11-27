@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-a7c3f033.js";
+            window.path_to_searchindex_js = "searchindex-f7066c6a.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-9d125e03.js"></script>
+        <script src="toc-26bf4b2e.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1885,9 +1885,10 @@ complete, and that preset’s next run would fail on a missing directory rather
 than fetching what it needs. The wipe matters as much as the re-download, since
 the tarballs unpack side by side into one directory, and layering a new release
 over an old one would keep cases the new one deleted.</p>
-<p><code>make test</code> covers the whole workspace, in two halves, and still needs no
-fixture download. The halves are all that <code>test-node</code>’s <code>--exclude</code> flags do;
-nothing is dropped to keep the beacon suite out. Two gates keep it that way,
+<p><code>make test</code> covers the whole workspace, in two halves plus <code>test-ethrex</code>, and
+still needs no fixture download. Those parts are all that <code>test-node</code>’s
+<code>--exclude</code> flags do (the consensus half, and <code>ethlambda-ethrex</code>, which
+<code>test-ethrex</code> runs); nothing is dropped to keep the beacon suite out. Two gates keep it that way,
 both tied to the <code>beacon-spec-tests</code> feature that <code>make test-beacon</code> turns on:</p>
 <ul>
 <li>The <code>beacon_spec_tests</code> target declares <code>required-features = ["beacon-spec-tests"]</code>, so <code>cargo test</code> skips building it entirely.</li>
@@ -4452,10 +4453,16 @@ or tick.</p>
 authentication, so an endpoint without a secret is refused at startup, before
 anything binds or connects. Clap cannot express “both or neither” across two
 optional flags, so the pairing is checked once, in <code>From&lt;BeaconOptions&gt;</code>.</p>
-<p>Blob fetching has no flag of its own: it is on whenever <code>--execution-endpoint</code> is set.</p>
-<p>With <strong>neither</strong> flag, the follower contacts no execution client and every block
-gets <code>PayloadValidity::NotRequired</code>, which is exactly what it did before any of
-this existed.</p>
+<p>Blob fetching has no flag of its own: it is on whenever the node has an
+execution client.</p>
+<p>With <strong>neither</strong> flag, a build with the <code>include-ethrex</code> feature starts the
+ethrex it embeds and uses it as its execution client, configured by the
+<code>--ethrex.*</code> flags; every call above then goes to ethrex’s own handlers in
+process instead of over HTTP, with the same timeouts and the same retries
+after a timeout (see <a href="#embedded-ethrex">Embedded ethrex</a>). In any other build the
+follower contacts no execution client and every block gets
+<code>PayloadValidity::NotRequired</code>, which is exactly what it did before any of this
+existed.</p>
 <p>Authentication is HMAC-SHA256 over a JOSE header and a claim set whose only
 member is <code>iat</code>. Execution clients accept about a minute of skew either way; a
 fresh token is minted per request rather than cached, because minting is two
@@ -4505,6 +4512,146 @@ checkpoint sync, not specific to this change.</p>
 <h3 id="the-merge-transition-is-untouched"><a class="header" href="#the-merge-transition-is-untouched">The merge transition is untouched</a></h3>
 <p><code>validate_merge_block</code> and the terminal-PoW checks are bellatrix’s, are reached
 from one place, and were removed outright by capella. Nothing here changes them.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="embedded-ethrex"><a class="header" href="#embedded-ethrex">Embedded ethrex</a></h1>
+<p>A build with the <code>include-ethrex</code> feature can run
+<a href="https://github.com/lambdaclass/ethrex">ethrex</a> inside the beacon node’s own
+process and use it as its execution client. The Engine API then stops being a
+network protocol: every <code>newPayload</code>, <code>forkchoiceUpdated</code> and <code>getPayload</code> is a
+direct call into ethrex’s own handler, with no socket, no JWT and no JSON request
+body.</p>
+<pre><code class="language-bash">cargo build --release --features include-ethrex
+docker build --build-arg FEATURES=include-ethrex -t ethlambda:ethrex .
+</code></pre>
+<h2 id="choosing-the-execution-client"><a class="header" href="#choosing-the-execution-client">Choosing the execution client</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Build</th><th><code>--execution-endpoint</code> given</th><th>Execution client</th></tr>
+</thead>
+<tbody>
+<tr><td>default</td><td>no</td><td>none: blocks import without payload validation</td></tr>
+<tr><td>default</td><td>yes</td><td>the external client at that endpoint</td></tr>
+<tr><td><code>include-ethrex</code></td><td>no</td><td><strong>embedded ethrex</strong></td></tr>
+<tr><td><code>include-ethrex</code></td><td>yes</td><td>the external client at that endpoint; ethrex does not start</td></tr>
+</tbody>
+</table>
+</div>
+<p>A feature build cannot run without an execution client. Build without the
+feature for that mode.</p>
+<p>The lean chain (<code>ethlambda node</code>) is unaffected.</p>
+<h2 id="flags"><a class="header" href="#flags">Flags</a></h2>
+<p>The <code>--ethrex.*</code> flags are a deliberate subset of ethrex’s own. Everything they
+leave out keeps the value the <code>ethrex</code> binary would start with, read the way that
+binary reads it: its clap defaults, overridden by any <code>ETHREX_*</code> environment
+variable (<code>ETHREX_P2P_NAT_EXTIP</code>, <code>ETHREX_MEMPOOL_MAXSIZE</code>, …). A flag given
+here wins over both. An <code>--ethrex.*</code> flag together with <code>--execution-endpoint</code>
+is a usage error: the endpoint replaces the embedded client the flag would
+configure.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--ethrex.datadir</code></td><td><code>&lt;--data-dir&gt;/ethrex</code></td><td>ethrex appends the network name, as it does standalone. The beacon RocksDB ignores the foreign subdirectory</td></tr>
+<tr><td><code>--ethrex.network</code></td><td>derived from <code>--network</code></td><td><code>mainnet</code>, <code>hoodi</code>, <code>sepolia</code> and <code>plataberget</code> map by name; a network directory supplies its <code>genesis.json</code>. Anything else must name it explicitly</td></tr>
+<tr><td><code>--ethrex.syncmode</code></td><td><code>snap</code></td><td><code>snap</code> or <code>full</code></td></tr>
+<tr><td><code>--ethrex.p2p-port</code></td><td><code>30303</code></td><td>devp2p (RLPx), TCP</td></tr>
+<tr><td><code>--ethrex.discovery-port</code></td><td><code>30303</code></td><td>discv4 + discv5, UDP</td></tr>
+<tr><td><code>--ethrex.bootnodes</code></td><td>the network’s</td><td>comma-separated enode URLs, added to the network’s own</td></tr>
+<tr><td><code>--ethrex.target-peers</code></td><td>ethrex’s</td><td></td></tr>
+<tr><td><code>--ethrex.http-addr</code></td><td><code>127.0.0.1</code></td><td></td></tr>
+<tr><td><code>--ethrex.http-port</code></td><td>off</td><td>turns on the execution JSON-RPC server (<code>eth_*</code>, <code>net_*</code>, <code>web3_*</code>)</td></tr>
+<tr><td><code>--ethrex.metrics-port</code></td><td>off</td><td>turns on ethrex’s own Prometheus server. Both servers also export the process-wide default registry, so each repeats some of the other’s series (<code>lean_*</code> here, a few <code>ethrex_*</code> on <code>--metrics-port</code>); the prefixes keep them from colliding</td></tr>
+</tbody>
+</table>
+</div>
+<p>Every ethrex port is checked against the beacon node’s own (<code>--gossipsub-port</code>,
+<code>--api-port</code>, <code>--metrics-port</code>, <code>--discovery.port</code>) and against each other
+before anything binds. Two sockets on one port clash only when their addresses
+can overlap: the same address, a wildcard covering the other (<code>::</code> covers IPv4
+too), or devp2p’s address when <code>ETHREX_P2P_ADDR</code> leaves ethrex to pick it. So
+<code>--ethrex.http-port</code> may equal <code>--api-port</code> when <code>--ethrex.http-addr</code> and
+<code>--http-address</code> are different addresses, neither of them a wildcard.</p>
+<h2 id="how-a-call-works"><a class="header" href="#how-a-call-works">How a call works</a></h2>
+<pre><code>EngineClient::new_payload(&amp;deneb::ExecutionPayload, ..)
+  └─ Transport::InProcess
+       ├─ our payload → ethrex Block → ExecutionPayload::from_block, claimed block_hash kept
+       ├─ NewPayloadV4Request { payload, .. }.handle(ctx)      ← ethrex's own handler
+       └─ serde_json::Value → PayloadStatusV1                   ← the HTTP transport's decoder
+</code></pre>
+<ul>
+<li><strong>Typed requests.</strong> Each method builds the ethrex handler struct it names and
+calls <code>RpcHandler::handle</code>. ethrex keeps most <code>ExecutionPayload</code> fields
+private, so the payload goes through <code>from_block</code>, with the consensus layer’s
+claimed hash put back so ethrex checks that claim rather than a recomputation.</li>
+<li><strong>Malformed payloads.</strong> A payload no ethrex block can carry (a transaction
+that does not decode, a base fee past <code>u64</code>) is handed to the handler’s own
+JSON <code>parse</code> instead, so ethrex gives exactly the verdict it gives over the
+wire.</li>
+<li><strong>Answers and errors.</strong> A handler answers with the JSON value it would send,
+decoded by the same types the HTTP transport uses. An <code>RpcErr</code> becomes
+<code>EngineError::Rpc</code> with the wire’s code (<code>-38005</code>, <code>-38006</code>, …).</li>
+<li><strong>Same timeouts, and a timeout is asked again.</strong> A handler’s error is
+ethrex’s answer, so it is never retried, as an RPC error is not over HTTP. A
+timeout is not an answer, and is asked again on the HTTP transport’s ladder
+(three attempts at the method’s timeout, 8 s or 6 s for <code>newPayloadV5</code>,
+backing off from 500 ms), with the same one-attempt exceptions, <code>getPayload</code>
+and <code>getBlobsV2</code>. The chain actor awaits <code>newPayload</code> inline, so a payload
+that keeps timing out holds it for about 25 s, as an external client can.
+Giving up on an attempt does not stop ethrex’s execution of the block: it
+records the verdict on its own, and asking again joins the execution already
+running.</li>
+<li><strong>Off the caller’s thread.</strong> Each attempt runs on a thread of tokio’s blocking
+pool. ethrex replays a deep reorg’s side chain inside <code>forkchoiceUpdated</code> and
+waits for it synchronously; on the chain actor’s own thread that would hold
+the actor for the whole replay, with no timeout able to fire.</li>
+<li><strong>Refused once shutdown begins</strong>, with a transport error (as a stopped
+external client refuses the connection), and a call still running is
+cancelled. See <a href="#lifecycle">Lifecycle</a>.</li>
+</ul>
+<h2 id="lifecycle"><a class="header" href="#lifecycle">Lifecycle</a></h2>
+<p>Startup (<code>ethlambda_ethrex::start</code>) is ethrex’s <code>init_l1</code> with its RPC servers
+left out: <code>init_l1</code> builds the RPC context inside <code>bind_api</code> and never returns
+it, so the steps are repeated and the context is assembled from the same parts.
+<strong>When the ethrex pin moves, diff <code>init_l1</code>, <code>init_rpc_api</code>, <code>init_network</code>
+and the binary’s <code>server_shutdown</code> against <code>crates/execution/ethrex/src/lib.rs</code>.</strong>
+<code>init_network</code> is inlined so that a devp2p socket that cannot bind is a startup
+error rather than its <code>expect</code> panic. A startup step that fails once ethrex is
+running, in <code>start</code> or later in <code>run_node</code>, still stops it and flushes its
+store.</p>
+<p>Shutdown begins once the chain actor has joined and the Beacon API server has
+drained: cancel ethrex, flush the store, then write <code>node_config.json</code> (identity
+and known peers), as ethrex’s own <code>server_shutdown</code> does, alongside the final
+telemetry flush rather than after it. Once it begins, the in-process Engine API
+and the execution JSON-RPC server refuse every request and cancel any still
+running, so none reaches the store while it flushes; that refusal is the one
+addition to <code>server_shutdown</code>. Like it, shutdown waits for none of ethrex’s
+tasks: several never watch the cancel token, so a wait would always run out.
+ethrex’s block executor thread is not waited for either: a block it is still on
+is executed again on the next start, as every recent block is, since ethrex’s
+flush keeps only the state it has committed to disk and a restart re-executes
+the newest blocks. A flush that fails makes the node exit with an error. If the
+execution JSON-RPC server fails, it stops ethrex, as ethrex’s own does, and the
+beacon node shuts down the same way and exits with an error.</p>
+<h2 id="not-included"><a class="header" href="#not-included">Not included</a></h2>
+<ul>
+<li>ethrex’s WebSocket server. The JSON-RPC server answers ethrex’s default
+namespaces (<code>eth</code>, <code>net</code>, <code>web3</code>); <code>ETHREX_HTTP_API=eth,net,web3,debug</code> widens
+them, as it does for the standalone binary.</li>
+<li>ethrex’s RocksDB metrics collector, which is crate-private.</li>
+<li>ethrex’s Engine API metrics (per-method latency and outcome counts): the
+in-process transport calls each handler directly, past the wrapper that
+records them, so those series stay empty on <code>--ethrex.metrics-port</code>.</li>
+<li>Separate discovery metrics. The beacon node’s discv5 runs on ethrex’s
+discovery server too, and both update ethrex’s process-wide p2p metrics, so
+the discovered and discarded node counts include consensus-layer records.</li>
+<li>The permissive CORS layer ethrex’s JSON-RPC server has, so a page in a
+browser cannot call the execution JSON-RPC server.</li>
+<li>The authenticated Engine API port: nothing outside the process can drive the
+embedded node’s fork choice.</li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="command-line"><a class="header" href="#command-line">Command line</a></h1>
 <p><code>ethlambda</code> follows one of two chains, selected by a subcommand:</p>
@@ -4641,6 +4788,7 @@ from a normal build.</p>
 <tr><td><code>--custody-group-count</code></td><td><code>CUSTODY_REQUIREMENT</code> (4)</td><td>The fewest custody groups this node custodies, advertised as the ENR’s <code>cgc</code> and <code>MetaData</code>’s <code>custody_group_count</code>. Validator custody can raise it (see below)</td></tr>
 <tr><td><code>--execution-endpoint</code></td><td>none</td><td>Base URL of the execution client’s Engine API endpoint, e.g. <code>http://127.0.0.1:8551</code>. Must be given together with <code>--execution-jwt-secret</code></td></tr>
 <tr><td><code>--execution-jwt-secret</code></td><td>none</td><td>File holding the 32-byte hex JWT secret shared with the execution client</td></tr>
+<tr><td><code>--ethrex.*</code></td><td>see <a href="#flags">Embedded ethrex</a></td><td>Only in a build with the <code>include-ethrex</code> feature: configure the ethrex that build runs in-process when <code>--execution-endpoint</code> is not given (data directory, network, sync mode, devp2p ports and bootnodes, the optional execution JSON-RPC and metrics servers), and are refused together with it</td></tr>
 <tr><td><code>--safe-slots-to-import-optimistically</code></td><td>the specification’s own value</td><td>How far behind the wall clock a block must be before it may be imported optimistically on age alone</td></tr>
 <tr><td><code>--always-prepare-payload</code></td><td>off</td><td>Publish the <code>payload_attributes</code> event for every slot, not only for proposers a validator client registered through <code>prepare_beacon_proposer</code>. For an external block builder reading this node’s event stream (ethereum-package’s buildoor). With <code>--execution-endpoint</code> it also has the execution client start a payload build for every slot, a third of a slot ahead, whether or not anything is subscribed to the event stream. For a proposer no validator client registered, that build pays the fee recipient of the proposer’s signed preferences on gloas, else <code>--fallback-fee-recipient</code>, else the zero address. Lighthouse’s flag of the same name</td></tr>
 <tr><td><code>--fallback-fee-recipient</code></td><td>none</td><td>Execution address (20 bytes of hex, <code>0x</code> optional) a locally built payload pays when no validator client named a fee recipient for the proposer through <code>prepare_beacon_proposer</code> or a builder registration (and, on gloas, no signed proposer preferences name one). Without it such a payload pays the zero address and its fees are lost. The zero address itself is accepted but reported at error at startup, since a proposal that falls back to it logs only at debug. It does not register the proposer: <code>payload_attributes</code> events still need <code>prepare_beacon_proposer</code> or <code>--always-prepare-payload</code>. Lighthouse’s beacon-node <code>--suggested-fee-recipient</code></td></tr>
@@ -4691,9 +4839,11 @@ recorded and logged as a warning, and the next start custodies and advertises
 it. The ENR’s <code>cgc</code> keeps its startup value until a restart, the same
 limitation as the fork digest’s <code>eth2</code> entry (ethrex’s <code>DiscoveryServer</code>
 cannot replace the record it serves).</p>
-<p>With neither execution flag, the follower contacts no execution client and
-imports blocks without validating their payloads, which is what it did before
-those flags existed. It then answers <code>attestation_data</code>,
+<p>With neither execution flag, what happens depends on the build. A build with
+the <code>include-ethrex</code> feature starts its embedded ethrex and validates payloads
+through it (see <a href="#embedded-ethrex">Embedded ethrex</a>). Any other build contacts no
+execution client and imports blocks without validating their payloads, which is
+what it did before those flags existed. It then answers <code>attestation_data</code>,
 <code>aggregate_attestation</code> and block production with <code>503</code>, so a validator
 client cannot use it. Supplying one without the other is refused at startup: an
 Engine API endpoint always requires authentication. See
@@ -8475,7 +8625,7 @@ rather than count rows. Rows still pending when the node exits are lost.
 happened to the rows. The table is created on first use; that statement is best
 effort, so a user that may insert but not create still works against an existing
 table.</p>
-<h2 id="flags"><a class="header" href="#flags">Flags</a></h2>
+<h2 id="flags-1"><a class="header" href="#flags-1">Flags</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -9942,9 +10092,10 @@ an explicit <code>--discovery.port</code> each, the same way they already need a
 listen, not where peers should dial us. Without <code>--discovery.advertise-ip</code> the
 published ENR inherits that same <code>0.0.0.0</code>, which is not a dialable address:
 set the flag to <code>127.0.0.1</code> for a local devnet or to the host’s public address
-so the ENR is usable as soon as it is published. discv5’s PONG-based IP voting
-may still replace the advertised address later, once a peer’s response tells
-the node what its external address looks like.</p>
+so the ENR is usable as soon as it is published. An address set with the flag
+is kept. Without one, or with an unspecified one (<code>0.0.0.0</code>, <code>::</code>), discv5’s
+PONG-based IP voting may replace the advertised address later, once a peer’s
+response tells the node what its external address looks like.</p>
 <h2 id="the-enr-1"><a class="header" href="#the-enr-1">The ENR</a></h2>
 <p>The layout follows the discovery domain of the beacon-chain
 <a href="https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md">phase0 p2p interface spec</a>.</p>
@@ -10233,7 +10384,7 @@ provisioning one.</p>
 <p>Generating here removes the second pin. These keys come from the same
 <code>ethlambda-crypto</code> types the node loads them with, so the generator and the
 loader cannot disagree about the format.</p>
-<h2 id="flags-1"><a class="header" href="#flags-1">Flags</a></h2>
+<h2 id="flags-2"><a class="header" href="#flags-2">Flags</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>

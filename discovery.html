@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-a7c3f033.js";
+            window.path_to_searchindex_js = "searchindex-f7066c6a.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-9d125e03.js"></script>
+        <script src="toc-26bf4b2e.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -223,9 +223,10 @@ an explicit <code>--discovery.port</code> each, the same way they already need a
 listen, not where peers should dial us. Without <code>--discovery.advertise-ip</code> the
 published ENR inherits that same <code>0.0.0.0</code>, which is not a dialable address:
 set the flag to <code>127.0.0.1</code> for a local devnet or to the host’s public address
-so the ENR is usable as soon as it is published. discv5’s PONG-based IP voting
-may still replace the advertised address later, once a peer’s response tells
-the node what its external address looks like.</p>
+so the ENR is usable as soon as it is published. An address set with the flag
+is kept. Without one, or with an unspecified one (<code>0.0.0.0</code>, <code>::</code>), discv5’s
+PONG-based IP voting may replace the advertised address later, once a peer’s
+response tells the node what its external address looks like.</p>
 <h2 id="the-enr"><a class="header" href="#the-enr">The ENR</a></h2>
 <p>The layout follows the discovery domain of the beacon-chain
 <a href="https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md">phase0 p2p interface spec</a>.</p>

@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-a7c3f033.js";
+            window.path_to_searchindex_js = "searchindex-f7066c6a.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-9d125e03.js"></script>
+        <script src="toc-26bf4b2e.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -678,10 +678,16 @@ or tick.</p>
 authentication, so an endpoint without a secret is refused at startup, before
 anything binds or connects. Clap cannot express “both or neither” across two
 optional flags, so the pairing is checked once, in <code>From&lt;BeaconOptions&gt;</code>.</p>
-<p>Blob fetching has no flag of its own: it is on whenever <code>--execution-endpoint</code> is set.</p>
-<p>With <strong>neither</strong> flag, the follower contacts no execution client and every block
-gets <code>PayloadValidity::NotRequired</code>, which is exactly what it did before any of
-this existed.</p>
+<p>Blob fetching has no flag of its own: it is on whenever the node has an
+execution client.</p>
+<p>With <strong>neither</strong> flag, a build with the <code>include-ethrex</code> feature starts the
+ethrex it embeds and uses it as its execution client, configured by the
+<code>--ethrex.*</code> flags; every call above then goes to ethrex’s own handlers in
+process instead of over HTTP, with the same timeouts and the same retries
+after a timeout (see <a href="./ethrex.html">Embedded ethrex</a>). In any other build the
+follower contacts no execution client and every block gets
+<code>PayloadValidity::NotRequired</code>, which is exactly what it did before any of this
+existed.</p>
 <p>Authentication is HMAC-SHA256 over a JOSE header and a claim set whose only
 member is <code>iat</code>. Execution clients accept about a minute of skew either way; a
 fresh token is minted per request rather than cached, because minting is two
@@ -740,7 +746,7 @@ from one place, and were removed outright by capella. Nothing here changes them.
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="cli.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="ethrex.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -754,7 +760,7 @@ from one place, and were removed outright by capella. Nothing here changes them.
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="cli.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="ethrex.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
