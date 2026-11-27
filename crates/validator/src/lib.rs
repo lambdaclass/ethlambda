@@ -1768,29 +1768,19 @@ fn prepare_vrf_trees<B: BeaconNodeApi + 'static>(
             let stored = count - pending.len();
             let mut loaded = 0usize;
             if let Some(source) = vrf_state_url.filter(|_| !pending.is_empty()) {
-                let indices = runtime.block_on(resolve_indices(beacon_node.as_ref(), &pending));
-                let states =
-                    pq::RecordFile::new(reqwest::Client::new(), source, ethlambda_crypto::vrf::STATE_RECORD_SIZE);
-                let mut fetched = runtime.block_on(fetch_vrf_states(&states, &pending, &indices));
+                let states = pq::RecordFile::new(
+                    reqwest::Client::new(),
+                    source,
+                    ethlambda_crypto::vrf::STATE_RECORD_SIZE,
+                );
+                let VrfStates {
+                    mut records,
+                    mut misses,
+                } = runtime.block_on(load_vrf_states(beacon_node.as_ref(), &states, &pending));
+                let mut first_refusal = None;
                 pending.retain(|pubkey| {
-                    let encoded = crate::beacon_node::dto::encode_hex(&pubkey.0);
-                    let Some(&index) = indices.get(pubkey) else {
-                        warn!(pubkey = %encoded, "No validator index for this key; hashing its VRF tree");
+                    let Some((index, record)) = records.remove(pubkey) else {
                         return true;
-                    };
-                    let record = match fetched.remove(pubkey) {
-                        Some(Ok(Some(record))) => record,
-                        Some(Ok(None)) => {
-                            warn!(pubkey = %encoded, index, "The VRF state file has no record for this validator; hashing its tree");
-                            return true;
-                        }
-                        Some(Err(err)) => {
-                            warn!(pubkey = %encoded, index, %err, "Could not fetch this validator's VRF state; hashing its tree");
-                            return true;
-                        }
-                        // Not fetched: the source failed its first record,
-                        // which `fetch_vrf_states` reported.
-                        None => return true,
                     };
                     match pq::adopt_vrf_state(pubkey, &record, &validators_dir) {
                         Ok(()) => {
@@ -1798,11 +1788,26 @@ fn prepare_vrf_trees<B: BeaconNodeApi + 'static>(
                             false
                         }
                         Err(err) => {
-                            warn!(pubkey = %encoded, index, %err, "Refused this validator's VRF state; hashing its tree");
+                            let encoded = crate::beacon_node::dto::encode_hex(&pubkey.0);
+                            debug!(pubkey = %encoded, index, %err, "Refused this validator's VRF state");
+                            misses.refused += 1;
+                            first_refusal.get_or_insert(err.to_string());
                             true
                         }
                     }
                 });
+                if !pending.is_empty() {
+                    warn!(
+                        source = states.source(),
+                        loaded,
+                        no_index = misses.no_index,
+                        no_record = misses.no_record,
+                        unreadable = misses.unreadable,
+                        refused = misses.refused,
+                        first_refusal = first_refusal.as_deref().unwrap_or("-"),
+                        "Some keys' VRF states were not in the state file; hashing their trees instead"
+                    );
+                }
             }
             if !pending.is_empty() {
                 info!(
@@ -2056,31 +2061,47 @@ async fn load_xmss_cache<B: BeaconNodeApi>(
     records
 }
 
-/// Each of `pubkeys`' validator index, from the beacon node, retried as
-/// [`load_xmss_cache`] retries the registry while the node is not answering
-/// (a validator client may start before its node). Keys the node does not
-/// know are left out.
+/// Each of `pubkeys`' validator index, from the beacon node. Keys the node
+/// does not know are left out.
+///
+/// Retried every [`REGISTRY_RETRY`] until the node answers and knows at least
+/// one of the keys, with no limit, unlike [`load_xmss_cache`]'s bounded wait.
+/// Giving up there costs seconds of building per key; giving up here costs
+/// minutes of hashing per key (hours for a few hundred), and a validator
+/// client whose node does not answer has no proposal to make meanwhile. A
+/// client started before its node, or a node still loading its state, cost
+/// the PQ devnet every key's tree this way.
 async fn resolve_indices<B: BeaconNodeApi>(
     beacon_node: &B,
     pubkeys: &[BlsPubkey],
-) -> std::collections::HashMap<BlsPubkey, u64> {
-    for attempt in 1..=REGISTRY_ATTEMPTS {
+) -> HashMap<BlsPubkey, u64> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
         match beacon_node.validator_indices(pubkeys).await {
-            Ok(entries) => {
+            Ok(entries) if !entries.is_empty() || pubkeys.is_empty() => {
                 return entries
                     .into_iter()
                     .map(|entry| (entry.pubkey, entry.index))
                     .collect();
             }
+            Ok(_) => {
+                if worth_a_warning(attempt) {
+                    warn!(
+                        attempt,
+                        keys = pubkeys.len(),
+                        "The beacon node knows none of these keys yet; asking again before looking up their VRF states"
+                    );
+                }
+            }
             Err(err) => {
                 if worth_a_warning(attempt) {
                     warn!(attempt, %err, "Could not resolve validator indices for the VRF states; retrying");
                 }
-                tokio::time::sleep(REGISTRY_RETRY).await;
             }
         }
+        tokio::time::sleep(REGISTRY_RETRY).await;
     }
-    std::collections::HashMap::new()
 }
 
 /// Whether a startup retry's `attempt` is logged: the first and every fifth,
@@ -2090,40 +2111,121 @@ fn worth_a_warning(attempt: u32) -> bool {
     attempt == 1 || attempt.is_multiple_of(5)
 }
 
+/// How many times one VRF state record is read before its key is hashed
+/// instead, [`REGISTRY_RETRY`] apart and doubling: about half a minute in all.
+/// A read that fails is a server or disk that failed for now, and one key's
+/// hashing costs minutes.
+const STATE_READ_ATTEMPTS: u32 = 5;
+
+/// What [`load_vrf_states`] found for the keys it was given.
+#[derive(Debug, Default)]
+struct VrfStates {
+    /// Each found key's validator index and state record, not yet checked
+    /// against the key's seed.
+    records: HashMap<BlsPubkey, (u64, Vec<u8>)>,
+    /// Why the other keys have none.
+    misses: VrfStateMisses,
+}
+
+/// How many keys got no VRF state from the state file, by reason. The
+/// reasons point at different fixes, so they are reported apart.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct VrfStateMisses {
+    /// The beacon node does not know the key: not a validator on this chain.
+    no_index: usize,
+    /// The file has no record at the key's index: it covers fewer validators.
+    no_record: usize,
+    /// The record could not be read, after [`STATE_READ_ATTEMPTS`] tries.
+    unreadable: usize,
+    /// The record is not the key's: another key set, or another VRF rule.
+    /// Counted by the caller, which checks each record against its seed.
+    refused: usize,
+}
+
 /// Each of `pubkeys`' VRF state record from `states`, at the validator index
-/// `indices` gives it (a key with none is left out), [`RECORD_FETCHES`] at a
+/// the beacon node gives it ([`resolve_indices`]), [`RECORD_FETCHES`] at a
 /// time: sixteen fetched one after another took longer than a slot.
 ///
 /// The first record is fetched alone, as [`load_xmss_cache`] does: a server
 /// that ignores the range sends the whole file, which `states` then keeps
-/// rather than being sent it once per key. A source that fails it is
-/// reported here, once, and nothing else is fetched.
-async fn fetch_vrf_states(
+/// rather than being sent it once per key. A source that still fails it
+/// after [`STATE_READ_ATTEMPTS`] is reported once, and nothing else is
+/// fetched.
+async fn load_vrf_states<B: BeaconNodeApi>(
+    beacon_node: &B,
     states: &pq::RecordFile,
     pubkeys: &[BlsPubkey],
-    indices: &HashMap<BlsPubkey, u64>,
-) -> HashMap<BlsPubkey, std::result::Result<Option<Vec<u8>>, String>> {
+) -> VrfStates {
     use futures_util::StreamExt as _;
 
-    let fetch =
-        |(pubkey, index): (BlsPubkey, u64)| async move { (pubkey, states.fetch(index).await) };
-    let mut wanted = pubkeys
-        .iter()
-        .filter_map(|pubkey| Some((*pubkey, *indices.get(pubkey)?)));
-    let Some(first) = wanted.next() else {
-        return HashMap::new();
+    let indices = resolve_indices(beacon_node, pubkeys).await;
+    let mut found = VrfStates::default();
+    let mut wanted = Vec::with_capacity(indices.len());
+    for pubkey in pubkeys {
+        match indices.get(pubkey) {
+            Some(&index) => wanted.push((*pubkey, index)),
+            None => {
+                let encoded = crate::beacon_node::dto::encode_hex(&pubkey.0);
+                debug!(pubkey = %encoded, "The beacon node does not know this key; no VRF state to look up");
+                found.misses.no_index += 1;
+            }
+        }
+    }
+    let fetch = |(pubkey, index): (BlsPubkey, u64)| async move {
+        (pubkey, index, read_vrf_state(states, index).await)
     };
-    let (pubkey, first) = fetch(first).await;
-    if let Err(err) = &first {
-        warn!(source = states.source(), %err, "Could not read the VRF states; hashing every tree");
-        return HashMap::new();
+    let mut wanted = wanted.into_iter();
+    let Some(first) = wanted.next() else {
+        return found;
+    };
+    let first = fetch(first).await;
+    if let (_, index, Err(err)) = &first {
+        warn!(source = states.source(), index, %err, "Could not read the VRF states; hashing every tree");
+        found.misses.unreadable += 1 + wanted.len();
+        return found;
     }
     let rest: Vec<_> = futures_util::stream::iter(wanted)
         .map(fetch)
         .buffer_unordered(RECORD_FETCHES)
         .collect()
         .await;
-    std::iter::once((pubkey, first)).chain(rest).collect()
+    for (pubkey, index, fetched) in std::iter::once(first).chain(rest) {
+        match fetched {
+            Ok(Some(record)) => {
+                found.records.insert(pubkey, (index, record));
+            }
+            Ok(None) => {
+                debug!(index, "The VRF state file has no record for this validator");
+                found.misses.no_record += 1;
+            }
+            Err(err) => {
+                debug!(index, %err, "Could not read this validator's VRF state");
+                found.misses.unreadable += 1;
+            }
+        }
+    }
+    found
+}
+
+/// One VRF state record, read up to [`STATE_READ_ATTEMPTS`] times. A record
+/// the file does not have is an answer, not a failure, and is not asked
+/// again.
+async fn read_vrf_state(
+    states: &pq::RecordFile,
+    index: u64,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    let mut delay = REGISTRY_RETRY;
+    for attempt in 1..STATE_READ_ATTEMPTS {
+        match states.fetch(index).await {
+            Ok(record) => return Ok(record),
+            Err(err) => {
+                debug!(index, attempt, %err, "Could not read a VRF state record; retrying");
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+    }
+    states.fetch(index).await
 }
 
 /// Whether a validator whose Beacon API `status` is this one is sent a builder
@@ -2392,6 +2494,115 @@ mod tests {
         let records = load_xmss_cache(&node, &keys, "/nonexistent".to_string()).await;
         assert!(records.is_empty());
         assert_eq!(started.elapsed(), REGISTRY_RETRY * (REGISTRY_ATTEMPTS - 1));
+    }
+
+    /// A state file of `count` records, each filled with its index.
+    fn state_file(directory: &tempfile::TempDir, count: u8) -> String {
+        let path = directory.path().join("states.vrf");
+        let file: Vec<u8> = (0..count)
+            .flat_map(|index| [index; ethlambda_crypto::vrf::STATE_RECORD_SIZE])
+            .collect();
+        std::fs::write(&path, file).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    fn states(source: String) -> pq::RecordFile {
+        pq::RecordFile::new(
+            reqwest::Client::new(),
+            source,
+            ethlambda_crypto::vrf::STATE_RECORD_SIZE,
+        )
+    }
+
+    /// Each known key gets the record at its own index; a key the node does
+    /// not know and a key past the file's end are counted apart.
+    #[tokio::test]
+    async fn each_known_key_gets_the_state_record_at_its_index() {
+        let mut node = node();
+        node.validators[1].index = 5;
+        let directory = tempfile::tempdir().unwrap();
+        let states = states(state_file(&directory, 3));
+        let keys = [pubkey(1), pubkey(2), pubkey(3)];
+
+        let found = load_vrf_states(&node, &states, &keys).await;
+        // pubkey(1) is index 11, past the three records; pubkey(2) is 5, too.
+        assert!(found.records.is_empty());
+        assert_eq!(
+            found.misses,
+            VrfStateMisses {
+                no_index: 1,
+                no_record: 2,
+                ..VrfStateMisses::default()
+            }
+        );
+
+        node.validators[0].index = 2;
+        let found = load_vrf_states(&node, &states, &keys).await;
+        let (index, record) = &found.records[&pubkey(1)];
+        assert_eq!(*index, 2);
+        assert_eq!(*record, vec![2; ethlambda_crypto::vrf::STATE_RECORD_SIZE]);
+        assert_eq!(found.misses.no_record, 1);
+    }
+
+    /// A node that does not answer for longer than the leanXMSS cache waits
+    /// does not cost every key its state: the lookup waits for it, and the
+    /// records are read once it answers.
+    #[tokio::test(start_paused = true)]
+    async fn the_vrf_state_lookup_waits_for_the_beacon_node() {
+        let mut node = node();
+        node.validators[0].index = 0;
+        let node = Arc::new(node.failing_call("validator_indices", "down"));
+        let late = REGISTRY_RETRY * (REGISTRY_ATTEMPTS * 3);
+        let answering = node.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(late).await;
+            answering.stop_failing("validator_indices");
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let states = states(state_file(&directory, 1));
+
+        let started = tokio::time::Instant::now();
+        let found = load_vrf_states(node.as_ref(), &states, &[pubkey(1)]).await;
+        assert!(started.elapsed() >= late);
+        assert!(found.records.contains_key(&pubkey(1)));
+        assert_eq!(found.misses, VrfStateMisses::default());
+    }
+
+    /// A node that answers but knows none of the keys yet is asked again
+    /// rather than taken at its word.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_knows_none_of_the_keys_is_asked_again() {
+        let mut node = node();
+        node.validators.clear();
+        let node = Arc::new(node);
+        let asked = node.clone();
+        let indices =
+            tokio::spawn(async move { resolve_indices(asked.as_ref(), &[pubkey(1)]).await });
+        tokio::time::sleep(REGISTRY_RETRY * 10).await;
+        assert!(!indices.is_finished());
+        assert!(node.validator_indices_call_count() > 1);
+    }
+
+    /// A state file that cannot be read is retried a bounded number of
+    /// times, then every key is counted unreadable and left to be hashed.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_state_file_is_retried_then_given_up() {
+        let mut node = node();
+        node.validators[0].index = 0;
+        let directory = tempfile::tempdir().unwrap();
+        let gone = directory
+            .path()
+            .join("missing")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let started = tokio::time::Instant::now();
+        let found = load_vrf_states(&node, &states(gone), &[pubkey(1), pubkey(2)]).await;
+        assert!(found.records.is_empty());
+        assert_eq!(found.misses.unreadable, 2);
+        // 2 + 4 + 8 + 16 seconds between the five reads.
+        assert_eq!(started.elapsed(), REGISTRY_RETRY * 15);
     }
 
     fn pubkey(byte: u8) -> BlsPubkey {

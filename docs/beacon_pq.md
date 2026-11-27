@@ -392,7 +392,14 @@ it:
    record must fold the key's own leaf 0 to its root, so a record of another
    validator's, or of another VRF rule's, falls through to the next source.
    A proof then hashes only the leaves below the slot's highest bit, a few
-   milliseconds on a young chain.
+   milliseconds on a young chain. The validator index comes from the beacon
+   node, which is asked until it answers and knows at least one of the keys,
+   with no limit: a client that gave up after two minutes, as it still does
+   for the leanXMSS cache, hashed every key's tree instead (hours for 500
+   keys) when it started before its node. A record that cannot be read is
+   tried five times over about half a minute. One warning names how many
+   keys fell through and why (`no_index`, `no_record`, `unreadable`,
+   `refused`, with the first refusal's error).
 3. The whole tree, hashed. It keeps the `2^15` nodes 16 levels above the
    leaves (1 MiB, commitments only, so no secret), and a proof rebuilds one
    `2^16`-leaf subtree, about 30 ms. The hashing runs in a rayon pool of its
