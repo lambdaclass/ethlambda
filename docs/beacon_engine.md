@@ -170,13 +170,14 @@ keeps it harmless:
   on its own lookup.
 
 The overlap shows in the import timing tree: the transition that ran during the
-round trip is reported under `stf` (used or discarded), and `engine` reports only
-what the question cost beyond it: building the request (a copy of the
-payload) and the wait that was left once the transition finished, the request's
-construction alone when the answer was already in. Without an execution client,
-and for forks that have no request to send (pre-merge, gloas), nothing overlaps,
-`engine` is zero, and the transition still runs ahead of `on_block`, on its
-own. How long the execution client itself took to answer is
+round trip is reported under `cl` (used or discarded), `on_block` after the
+verdict under `store`, and `el_wait` reports only what the question cost beyond
+the transition: building the request (a copy of the payload) and the wait that
+was left once the transition finished, the request's construction alone when
+the answer was already in. Without an execution client, and for forks that have
+no request to send (pre-merge, gloas), the transition still runs ahead of
+`on_block`, on its own, and is reported under `cl`; nothing overlaps, and
+`el_wait` is zero. How long the execution client itself took to answer is
 `lean_engine_new_payload_seconds{outcome}`, timed around every `engine_newPayload*`
 request this module sends (`timed_new_payload`), a gloas envelope's included.
 

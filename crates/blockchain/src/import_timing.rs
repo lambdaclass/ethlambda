@@ -55,10 +55,9 @@
 //! writes the block and its post-state. The call ends by handing the
 //! post-state to the storage crate's background writer and blocks while that
 //! writer's queue is full. That wait is nested inside the `store` pair and is
-//! recorded as its own `writer_wait` pair. The `stf` row reports `cl` plus
-//! `store` minus the wait (saturating), so `stf` is state-transition work and
-//! the rows still sum to the end-to-end time. Lean's `stf` row is its own
-//! `stf` pair, with no wait recorded.
+//! recorded as its own `writer_wait` pair. The `store` row reports its pair
+//! minus the wait (saturating), so the rows still sum to the end-to-end time.
+//! Lean's state transition is its own `stf` pair, with no wait recorded.
 //!
 //! One consequence worth keeping in mind when reading the numbers: a gossip
 //! block's total and a fetched block's total do not start at the same point in
@@ -218,8 +217,8 @@ pub struct ImportTimings {
     /// This pair spans the whole question, from building the request to the
     /// later of the answer and the end of the transition that ran meanwhile
     /// (see [`Self::cl_start`]). That transition lies inside it, and the
-    /// `engine` row reports the pair minus it, the way `stf` excludes
-    /// `writer_wait`, so the overlap is counted once, under `stf`. Both ends
+    /// `el_wait` row reports the pair minus it, the way `store` excludes
+    /// `writer_wait`, so the overlap is counted once, under `cl`. Both ends
     /// are the same instant, a recorded zero taken before the transition,
     /// when there was no request to send (no execution client, or a block
     /// with no payload in it: pre-merge or gloas). How long the execution
@@ -248,11 +247,11 @@ pub struct ImportTimings {
     /// to send, and on its own otherwise.
     ///
     /// A request's round trip overlaps it, so it lies inside the `engine`
-    /// pair: the `stf` row adds it and the `engine` row subtracts it, so the
-    /// rows still sum to the end-to-end time instead of counting the overlap
-    /// twice. A discarded one is added too, so the transition an
-    /// `INVALIDATED` verdict makes `on_block` run again shows as the second
-    /// transition it is, and a held block still shows the one it paid for.
+    /// pair, and the `el_wait` row subtracts it, so the rows still sum to the
+    /// end-to-end time instead of counting the overlap twice. A discarded one
+    /// is reported too, so the transition an `INVALIDATED` verdict makes
+    /// `on_block` run again (inside `store`) shows as the second transition
+    /// it is, and a held block still shows the one it paid for.
     /// `None` only for a block `fork_choice::speculate_transition` declined,
     /// which `on_block` then refuses before any transition.
     pub cl_start: Option<Instant>,
@@ -264,17 +263,16 @@ pub struct ImportTimings {
     /// stays `None` on beacon. An `INVALIDATED` verdict makes it run the
     /// transition again, with an `invalid()` engine.
     ///
-    /// This pair brackets the whole call, writer wait included. The `stf` row
-    /// reports it minus [`Self::writer_wait_start`]..[`Self::writer_wait_end`],
-    /// plus the `cl` pair.
+    /// This pair brackets the whole call, writer wait included. The `store`
+    /// row reports it minus [`Self::writer_wait_start`]..[`Self::writer_wait_end`].
     pub store_start: Option<Instant>,
     pub store_end: Option<Instant>,
 
     /// Beacon: what became of the `cl` transition when the execution client
     /// was asked, set by [`Self::record_speculation`]. Not a mark, like
     /// [`Self::source`]: it travels with them so the import's log line can
-    /// say whether its `stf` row holds a transition that was discarded and
-    /// run again.
+    /// say whether its `store` row holds a transition run again after the
+    /// `cl` one was discarded.
     pub speculation: Option<SpeculationOutcome>,
 
     /// Beacon: the blocking hand-off of the post-state to the storage crate's
@@ -448,33 +446,31 @@ impl ImportTimings {
     }
 
     /// Every section, in the order a block crosses them, whether or not it
-    /// crossed this one.
+    /// crossed this one. The names are the `block_events` sections', so a row
+    /// here and a `<name>_start`/`<name>_end` pair there are the same span,
+    /// with two exceptions that keep the rows summing to the end-to-end time:
     ///
-    /// The `stf` row is the import's state-transition work: lean's `stf`
-    /// pair, or beacon's `store` pair plus its `cl` pair. It excludes
-    /// `writer_wait` when one was recorded, since the wait is nested inside
-    /// the `store` pair; that keeps the rows summing to the end-to-end time.
-    /// The `cl` transition moves the same way, out of the `engine` pair it
-    /// ran inside, when a request overlapped it, and into `stf`.
+    /// - `store` excludes `writer_wait` when one was recorded, since the wait
+    ///   is nested inside the `store` pair.
+    /// - `el_wait` is the `engine` pair less the `cl` transition, which ran
+    ///   inside it when a request overlapped it: building the request, and
+    ///   the wait for the answer left once the transition was done. The
+    ///   request itself is `block_events`' `el_start`..`el_end`, and
+    ///   `lean_engine_new_payload_seconds`.
+    ///
+    /// Lean's state transition is `stf`; beacon's is `cl` and then `store`.
     fn rows(&self) -> Vec<Row> {
-        // A block has one pair or the other: lean's transition, or beacon's
-        // `on_block` after it.
-        let mut stf = Row::new(
-            "stf",
-            self.stf_start.or(self.store_start),
-            self.stf_end.or(self.store_end),
-        );
         let writer_wait = Row::new("writer_wait", self.writer_wait_start, self.writer_wait_end);
-        if let (Some(total), Some(wait)) = (stf.elapsed, writer_wait.elapsed) {
-            stf.elapsed = Some(total.saturating_sub(wait));
+        let mut store = Row::new("store", self.store_start, self.store_end);
+        if let (Some(total), Some(wait)) = (store.elapsed, writer_wait.elapsed) {
+            store.elapsed = Some(total.saturating_sub(wait));
         }
-        let mut engine = Row::new("engine", self.engine_start, self.engine_end);
-        // Also when the import stopped before `on_block` (a held block), so
-        // the transition it paid for is not lost.
-        if let Some(cl) = span(self.cl_start, self.cl_end) {
-            stf.elapsed = Some(stf.elapsed.unwrap_or_default() + cl);
-            stf.end = stf.end.or(self.cl_end);
-            engine.elapsed = engine.elapsed.map(|total| total.saturating_sub(cl));
+        let cl = Row::new("cl", self.cl_start, self.cl_end);
+        let mut el_wait = Row::new("el_wait", self.engine_start, self.engine_end);
+        if let Some(transition) = cl.elapsed {
+            el_wait.elapsed = el_wait
+                .elapsed
+                .map(|total| total.saturating_sub(transition));
         }
         vec![
             Row::new("decode", self.decode_start, self.decode_end),
@@ -495,7 +491,8 @@ impl ImportTimings {
                 self.columns_wait_start,
                 self.columns_wait_end,
             ),
-            engine,
+            cl,
+            el_wait,
             Row::new(
                 "verify_struct",
                 self.verify_structural_start,
@@ -506,7 +503,8 @@ impl ImportTimings {
                 self.verify_crypto_start,
                 self.verify_crypto_end,
             ),
-            stf,
+            Row::new("stf", self.stf_start, self.stf_end),
+            store,
             writer_wait,
             Row::new("db_write", self.db_write_start, self.db_write_end),
             Row::new("fc_head", self.fc_head_start, self.fc_head_end),
@@ -628,7 +626,7 @@ impl BlockImportReport {
             // Beacon: the consensus half, the block's transition computed
             // ahead of `on_block`, while the request (`el_start`..`el_end`)
             // is in flight when there is one. Written whether or not it was
-            // used, as the log line's `stf` row counts it.
+            // used, as the log line's `cl` row is.
             ("cl_start", t.cl_start),
             ("cl_end", t.cl_end),
             // Lean's transition.
@@ -1198,14 +1196,14 @@ mod tests {
     }
 
     #[test]
-    fn the_stf_row_excludes_the_writer_wait() {
+    fn the_store_row_excludes_the_writer_wait() {
         let base = Instant::now();
         let mut timings = ImportTimings::default();
         (timings.store_start, timings.store_end) = pair(base, 0, 90);
         (timings.writer_wait_start, timings.writer_wait_end) = pair(base, 60, 30);
 
         assert_eq!(
-            row_elapsed(&timings, "stf"),
+            row_elapsed(&timings, "store"),
             Some(Duration::from_millis(60))
         );
         assert_eq!(
@@ -1218,28 +1216,28 @@ mod tests {
             .filter(|row| row.elapsed.is_some())
             .map(|row| row.name)
             .collect();
-        assert_eq!(present, vec!["stf", "writer_wait"]);
+        assert_eq!(present, vec!["store", "writer_wait"]);
     }
 
     #[test]
-    fn an_absent_writer_wait_leaves_stf_unchanged() {
+    fn an_absent_writer_wait_leaves_store_unchanged() {
         let base = Instant::now();
         let mut timings = ImportTimings::default();
         (timings.store_start, timings.store_end) = pair(base, 0, 90);
 
         assert_eq!(
-            row_elapsed(&timings, "stf"),
+            row_elapsed(&timings, "store"),
             Some(Duration::from_millis(90))
         );
         assert_eq!(row_elapsed(&timings, "writer_wait"), None);
     }
 
     #[test]
-    fn an_overlapped_transition_is_charged_to_stf_and_not_to_engine() {
+    fn an_overlapped_transition_is_charged_to_cl_and_not_to_el_wait() {
         // 5 ms building the request, a 70 ms transition while it is in flight,
-        // 30 ms more waiting for the answer, then 20 ms of import. The engine
-        // row keeps the 35 ms the transition did not hide, building the
-        // request included, and stf gains the 70 ms.
+        // 30 ms more waiting for the answer, then 20 ms of import. The
+        // el_wait row keeps the 35 ms the transition did not hide, building
+        // the request included, and cl has the 70 ms.
         let base = Instant::now();
         let mut timings = ImportTimings::default();
         (timings.engine_start, timings.engine_end) = pair(base, 0, 105);
@@ -1247,12 +1245,13 @@ mod tests {
         (timings.store_start, timings.store_end) = pair(base, 105, 20);
 
         assert_eq!(
-            row_elapsed(&timings, "engine"),
+            row_elapsed(&timings, "el_wait"),
             Some(Duration::from_millis(35))
         );
+        assert_eq!(row_elapsed(&timings, "cl"), Some(Duration::from_millis(70)));
         assert_eq!(
-            row_elapsed(&timings, "stf"),
-            Some(Duration::from_millis(90))
+            row_elapsed(&timings, "store"),
+            Some(Duration::from_millis(20))
         );
         let rows: Duration = timings
             .rows()
@@ -1267,36 +1266,33 @@ mod tests {
     }
 
     #[test]
-    fn an_engine_question_with_no_speculation_is_all_engine() {
+    fn an_engine_question_with_no_transition_is_all_el_wait() {
         // A request sent, but nothing computed meanwhile (the block failed a
         // guard the speculation shares with `on_block`): every moment of the
-        // question is the engine's, none of it disappears.
+        // question is the wait's, none of it disappears.
         let base = Instant::now();
         let mut timings = ImportTimings::default();
         (timings.engine_start, timings.engine_end) = pair(base, 0, 40);
 
         assert_eq!(
-            row_elapsed(&timings, "engine"),
+            row_elapsed(&timings, "el_wait"),
             Some(Duration::from_millis(40))
         );
-        assert_eq!(row_elapsed(&timings, "stf"), None);
+        assert_eq!(row_elapsed(&timings, "cl"), None);
     }
 
     #[test]
-    fn a_held_block_still_charges_its_speculation_to_stf() {
+    fn a_held_block_still_reports_its_transition() {
         // No verdict: the 70 ms transition ran, then 300 ms of waiting, then
-        // the block was held without a transition of its own.
+        // the block was held without reaching `on_block`.
         let base = Instant::now();
         let mut timings = ImportTimings::default();
         (timings.cl_start, timings.cl_end) = pair(base, 0, 70);
         (timings.engine_start, timings.engine_end) = pair(base, 0, 370);
 
+        assert_eq!(row_elapsed(&timings, "cl"), Some(Duration::from_millis(70)));
         assert_eq!(
-            row_elapsed(&timings, "stf"),
-            Some(Duration::from_millis(70))
-        );
-        assert_eq!(
-            row_elapsed(&timings, "engine"),
+            row_elapsed(&timings, "el_wait"),
             Some(Duration::from_millis(300))
         );
     }
@@ -1304,28 +1300,29 @@ mod tests {
     #[test]
     fn an_engine_with_nothing_to_wait_for_is_a_recorded_zero() {
         // No request sent: the row is present and zero, so every beacon block
-        // observes it, and the transition computed after it all goes to `stf`.
+        // observes it, and the transition computed after it is all `cl`.
         let base = Instant::now();
         let mut timings = ImportTimings::default();
         (timings.engine_start, timings.engine_end) = (Some(base), Some(base));
         (timings.cl_start, timings.cl_end) = pair(base, 0, 70);
         (timings.store_start, timings.store_end) = pair(base, 70, 5);
 
-        assert_eq!(row_elapsed(&timings, "engine"), Some(Duration::ZERO));
+        assert_eq!(row_elapsed(&timings, "el_wait"), Some(Duration::ZERO));
+        assert_eq!(row_elapsed(&timings, "cl"), Some(Duration::from_millis(70)));
         assert_eq!(
-            row_elapsed(&timings, "stf"),
-            Some(Duration::from_millis(75))
+            row_elapsed(&timings, "store"),
+            Some(Duration::from_millis(5))
         );
     }
 
     #[test]
-    fn a_writer_wait_longer_than_stf_saturates_stf_to_zero() {
+    fn a_writer_wait_longer_than_store_saturates_store_to_zero() {
         let base = Instant::now();
         let mut timings = ImportTimings::default();
         (timings.store_start, timings.store_end) = pair(base, 0, 10);
         (timings.writer_wait_start, timings.writer_wait_end) = pair(base, 0, 25);
 
-        assert_eq!(row_elapsed(&timings, "stf"), Some(Duration::ZERO));
+        assert_eq!(row_elapsed(&timings, "store"), Some(Duration::ZERO));
         assert_eq!(
             row_elapsed(&timings, "writer_wait"),
             Some(Duration::from_millis(25))
@@ -1618,8 +1615,8 @@ mod tests {
     }
 
     /// A speculation the import discarded is written too, as the log line's
-    /// `stf` row counts it: an `INVALID` verdict fails the block after a
-    /// second transition, and both are state-transition work it paid for.
+    /// `cl` row is: an `INVALID` verdict fails the block after a second
+    /// transition, and both are state-transition work it paid for.
     #[test]
     fn a_discarded_speculation_is_written_with_the_failed_import() {
         let base = Instant::now();

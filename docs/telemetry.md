@@ -69,11 +69,11 @@ state transition, or failed); a block that never leaves a hold has no rows, and
 a re-delivery of a block already stored writes none. Every row starts or ends a
 section, `x_start` and `x_end`, and the time it took is the one minus the
 other. Most sections are the [import timing](./metrics.md#block-import-timing)'s
-own, under the same name; the others map onto it as follows. `import` is its
-`total`. Beacon's `cl` plus `store`, less `writer_wait`, is its `stf` row.
-Beacon's per-block `fc_head` is the arrival's `get_head`. `el` is the request
-inside its `engine` row, which reports only the wait the transition did not
-hide. The only block that writes no rows is lean's locally built one, which
+own, under the same name (`cl`, `store`, `stf`, `writer_wait`, ...); the
+others map onto it as follows. `import` is its `total`. Its `store` row
+excludes `writer_wait`. Beacon's per-block `fc_head` is the arrival's
+`get_head`. `el` is the request itself, whose `el_wait` row reports only the
+wait the transition did not hide. The only block that writes no rows is lean's locally built one, which
 crossed no wire and carries no source. A block re-delivered after waiting for
 its slot reports under its original source and adds `defer_start` and
 `defer_end`. On `beacon`, a proposal handed over by a validator client enters
@@ -112,8 +112,8 @@ inside it. At an epoch's first block the transition also makes two passes over
 the registry that `on_block` used to make after it: the balances of the new
 checkpoint, and the unslashed target balances its unrealized justification is
 weighed with. The block's state-transition time is the two spans added together
-(less `writer_wait`), as the import's log line and
-`lean_block_import_phase_seconds{phase="stf"}` count it. The transition is kept
+(less `writer_wait`), the import's log line's `cl` and `store` rows. The
+transition is kept
 only for a verdict that agrees with it: after an `Invalid` verdict
 `store_start`..`store_end` runs it again, and both spans are transitions the
 import paid for.

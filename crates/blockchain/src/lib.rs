@@ -1967,7 +1967,7 @@ impl BlockChainServer {
                 // The `engine` pair spans the whole question, from building the
                 // request to the later of its answer and the transition's end.
                 // The transition lies inside it and the report subtracts it, so
-                // the `engine` row is what the question cost beyond the
+                // the `el_wait` row is what the question cost beyond the
                 // transition: building the request, and any wait left once the
                 // transition is done. A recorded zero without a request, taken
                 // before the transition. The execution client's own time is
@@ -2012,7 +2012,7 @@ impl BlockChainServer {
                     &committees,
                 );
                 let transition_end = Instant::now();
-                // Charged to `stf` whether or not the import ends up using
+                // Reported as `cl` whether or not the import ends up using
                 // it: it is state-transition work either way. `None` for a
                 // block `on_block` refuses before its transition, which then
                 // fails there without running one.
@@ -2118,8 +2118,8 @@ impl BlockChainServer {
                 // The speculation is only worth handing on for a verdict its
                 // `valid()` engine agrees with. `INVALIDATED` makes `on_block`
                 // run the transition itself with `invalid()`, exactly as
-                // before. A discarded speculation stays in the `stf` row, so
-                // the transition run twice shows as twice.
+                // before. A discarded speculation stays in the `cl` row, and
+                // `store` holds the second transition, so it shows as twice.
                 // `stands_in_for` is the question `on_block_speculative`
                 // itself asks, so `used` is counted exactly when it is used.
                 // A block nobody was asked about is not counted: its
