@@ -567,7 +567,7 @@ mod tests {
 
     fn event(slot: u64) -> BlockEvent {
         BlockEvent {
-            stage: "received",
+            stage: "import_start",
             at: Instant::now(),
             slot,
             block_root: [1; 32],

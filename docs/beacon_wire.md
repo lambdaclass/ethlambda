@@ -153,8 +153,9 @@ joined on demand, see [Sync committee subnets](#sync-committee-subnets).
 for blobs, deprecated at fulu in favor of the column matrix below.
 
 `data_column_sidecar_{0..127}` is no longer in that absent list. This node
-subscribes to `sampling_size(CUSTODY_REQUIREMENT)` of them — the sampling size
-floored by `SAMPLES_PER_SLOT` above `CUSTODY_REQUIREMENT` itself — chosen by
+subscribes to `sampling_size(custody_group_count)` of them (the custody count
+it started with, see [Validator custody](#validator-custody), floored by
+`SAMPLES_PER_SLOT`; at the default `CUSTODY_REQUIREMENT` that is 8), chosen by
 `custody_columns(node_id, …)`, a public function of this node's own discv5
 node id (`das-core.md`), so any peer can compute the same set without asking.
 `NUMBER_OF_CUSTODY_GROUPS` and `DATA_COLUMN_SIDECAR_SUBNET_COUNT` are equal
@@ -703,8 +704,10 @@ Both per-item lookups are lenient the way the block protocols are: a column
 this node never custodied, or a root it holds no header for, is left out of
 the answer rather than turned into an error, since the spec's own words are
 "Clients MUST respond with at least one sidecar, if they have it." A
-`data_column_sidecars_by_range/1` request starting before `Store::anchor_slot`
-gets `RESOURCE_UNAVAILABLE` instead of a merely-empty answer, the same
+`data_column_sidecars_by_range/1` request starting before `Store::anchor_slot`,
+or before the later slot from which a custody set grown at startup is complete
+(see Validator custody below), gets `RESOURCE_UNAVAILABLE` instead of a
+merely-empty answer, the same
 distinction the block-range handler draws and for the same reason: an empty
 window this node's canonical chain skipped is normal, but a window below where
 this node's chain begins cannot be served from any point onward. That floor is
@@ -933,7 +936,9 @@ checkpoint from `Store::beacon_finalized_checkpoint`, and
 `earliest_available_slot` from the anchor's own slot rather than
 `finalized_epoch * SLOTS_PER_EPOCH`, since this node keeps only the unfinalized
 window above its anchor and the epoch's first slot is not necessarily one it
-holds. Naming that slot tells a peer not to ask for anything older; naming zero
+holds. A start that custodies more groups than the data directory held moves it
+later, to the slot after that start's head: the new groups' columns are held
+only from there (see [Validator custody](#validator-custody)). Naming that slot tells a peer not to ask for anything older; naming zero
 would claim genesis is in reach. There is one window where `beacon_head` answers
 `None`, between `init_beacon` seeding `KEY_HEAD` and fork choice inserting the
 block that root names, and every field but the fork digest falls back to zero
@@ -947,7 +952,7 @@ syncing" rather than as a conflicting chain.
 | --- | --- |
 | `eth2` | the computed `ENRForkID` |
 | `attnets` | 64 bits, with this node's `SUBNETS_PER_NODE` backbone subnets set |
-| `cgc` | `CUSTODY_REQUIREMENT` |
+| `cgc` | the custody count the node started with: `--custody-group-count`, or the recorded validator custody count when that is higher |
 | `quic` | `--gossipsub-port` |
 | `tcp` | `--gossipsub-port`, the same number: TCP and UDP are separate namespaces |
 | `udp` | `--discovery.port` |
@@ -962,17 +967,56 @@ Two of these advertise less, or more, than they look like:
 - `syncnets` names the sync committee subnets joined on a validator client's
   request, so it is all-unset until one asks. It is advertised in MetaData
   only; the ENR has no `syncnets` entry.
-- `cgc` advertises `CUSTODY_REQUIREMENT`, the floor below which peers may
-  reject a record outright, not `sampling_size(CUSTODY_REQUIREMENT)`, the
-  larger number of columns this node actually custodies, stores and serves
-  (see [Data column sidecars](#data-column-sidecars)). That undersells rather
-  than oversells: a request for more than `cgc`'s worth of columns still
-  succeeds, since this node holds every column its own node id assigned it at
-  the sampling size, not merely `cgc`'s worth.
+- `cgc` advertises the startup custody count (`CUSTODY_REQUIREMENT` by
+  default), not its `sampling_size`, the number of groups this node actually
+  custodies, stores and serves when that is larger (see
+  [Data column sidecars](#data-column-sidecars)). That undersells rather than
+  oversells: a request for more than `cgc`'s worth of columns still succeeds,
+  since this node holds every column its own node id assigned it at the
+  sampling size, not merely `cgc`'s worth. `MetaData` v3's
+  `custody_group_count` starts at the same count (it used to say
+  `CUSTODY_REQUIREMENT` whatever the flag was) and may rise past `cgc` at
+  runtime; the record cannot follow until a restart.
 
 The `tcp` entry is what makes us discoverable in return: lighthouse's discovery
 predicate requires `enr.tcp4().is_some() || enr.tcp6().is_some()` and applies it
 as a query filter, so a `quic`-only record is invisible to it.
+
+## Validator custody
+
+Fulu `validator.md` ("Validator custody") has a node with validators attached
+custody `get_validators_custody_requirement` groups: their total effective
+balance over `BALANCE_PER_ADDITIONAL_CUSTODY_GROUP` (32 ETH), at least
+`VALIDATOR_CUSTODY_REQUIREMENT` (8) and at most `NUMBER_OF_CUSTODY_GROUPS`
+(128). A node whose validators' balance falls keeps custodying its highest
+count, across restarts too. What this node does about it, and what it does not
+yet:
+
+| Piece | Where | What it does |
+| --- | --- | --- |
+| Attached validators | `ethlambda_network_api::AttachedValidators`, filled by the Beacon API | Every index named to `beacon_committee_subscriptions` (aggregator or not) and `prepare_beacon_proposer`, with the epoch it was last named in. One not named again for `EXPIRY_EPOCHS` (2) epochs stops counting, so a detached validator client stops raising custody |
+| Requirement | `das::get_validators_custody_requirement` | Off the latest finalized state's effective balances, as the specification says, once an epoch. Not the head's: the record never falls, so a raise read off a branch that is later reorged out would stay for good. The p2p actor (`beacon::validator_custody::refresh`) starts the run; the computation goes to a `spawn_blocking` task (`compute`), which takes the effective balances from the fork choice's `JustifiedBalances` snapshot for the finalized checkpoint when it is cached (it keeps the last 8 epoch boundaries) and otherwise reads the state that snapshot is built from, whose rebuild would stall the actor: `fork_choice::checkpoint_state`, the checkpoint block's post-state advanced to its epoch's first slot, not the post-state itself, which is an epoch behind when that slot was empty and may hold other effective balances, so the count recorded for a checkpoint does not depend on what was cached; a panic there reports the run unavailable. The outcome comes back as `ValidatorCustodyComputed` (`finish`). An unreadable state retries the run at the next slot. With no attached validator in the registry there is no requirement at all, not the floor of 8: a plain follower is never raised. Indices the state does not know are skipped |
+| Highest count | `Store::raise_validator_custody_count`, metadata key `validator_custody_count` | Only ever raised. Absent in an older directory, which reads as nothing recorded; `DB_VERSION` did not change |
+| Startup | `beacon::startup_custody` in the binary | Custodies and advertises the larger of `--custody-group-count` and the recorded count. The record is the validators' requirement alone, so the flag stays the operator's floor above it |
+| Runtime | `beacon::validator_custody::apply` | Raises `MetaData` v3's `custody_group_count` (and `/eth/v1/node/identity`'s copy), under a new sequence number, up to the startup count's `sampling_size`: groups the node already subscribes to, stores, requires for availability and serves. At the default count that is 8, all one attached validator requires. A requirement past it is recorded and warned about; the next start applies it |
+| History | `ethlambda_storage::CustodyRecord`, metadata keys `custodied_group_count` and `custody_since_slot` | Each start records how many groups it holds, just before its chain actor spawns, so a start that fails earlier records nothing. A start that holds more than the previous one records the slot after the highest block the directory holds (the head's or a side branch's, whose blocks carry only the old set's columns), and `Status` v2 reports the later of that and the anchor as `earliest_available_slot`, since nothing backfills the new groups' older columns. A directory with no record is taken as holding its set from the anchor |
+
+Known gaps:
+
+- **The custody set is fixed for the life of the process.** The gossip
+  subscriptions (`BeaconWire::custody_columns`), the chain actor's
+  availability check and envelope gate, the engine's `forkchoiceUpdatedV4`
+  custody columns and the Beacon API's `CustodyColumns` each hold a copy made
+  at startup, so a requirement past the startup sampling size takes a restart.
+  Advertising and custodying therefore never disagree: the runtime raise stays
+  inside the held set.
+- **The ENR's `cgc` keeps its startup value until a restart.** ethrex's
+  `DiscoveryServer` cannot replace the record it serves, the same gap as the
+  `eth2` entry at a fork boundary. A runtime raise reaches `MetaData` only,
+  which understates nothing a peer relies on: a peer reading only the record
+  asks this node for fewer columns than it holds.
+- **No backfill.** After a start that grew the set, `earliest_available_slot`
+  stays at that start's slot rather than moving back as a backfill would let it.
 
 ## Metrics
 

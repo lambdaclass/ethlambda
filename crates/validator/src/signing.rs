@@ -51,6 +51,7 @@ use crate::keys::web3signer::{
 };
 use crate::keys::{SigningMethod, ValidatorStore};
 use crate::shared_config::SharedConfig;
+use crate::slashed::SlashedValidators;
 
 pub use crate::keys::web3signer::AggregateAndProofRef;
 
@@ -106,6 +107,10 @@ pub struct SigningContext {
     /// a RANDAO reveal or an aggregate, or `None` with the protection off.
     /// See [`Self::doppelganger_allows`].
     doppelganger: Option<Arc<Doppelganger>>,
+    /// The loaded keys the chain reports slashed, which get no more proposer,
+    /// attester or attestation aggregation duties.
+    /// See [`Self::slashed`].
+    slashed: SlashedValidators,
 }
 
 /// Whether `a` and `b` give every fork the same epoch and version, and so
@@ -208,7 +213,22 @@ impl SigningContext {
             schedule_generation: AtomicU64::new(0),
             verifications: Arc::new(Semaphore::new(cores)),
             doppelganger: None,
+            slashed: SlashedValidators::default(),
         }
+    }
+
+    /// Track slashed keys with `slashed`, in place of a tracker that finds
+    /// none yet and never stops the client.
+    pub fn with_slashed(mut self, slashed: SlashedValidators) -> Self {
+        self.slashed = slashed;
+        self
+    }
+
+    /// The loaded keys the chain reports slashed: what the epoch refresh
+    /// records each lookup's answer in, and what the services that send
+    /// something for a key ask before they do (see [`crate::slashed`]).
+    pub fn slashed(&self) -> &SlashedValidators {
+        &self.slashed
     }
 
     /// Put the slashable signatures behind doppelganger protection.

@@ -99,9 +99,10 @@ pub(crate) struct Sample {
     /// run is absent, not zero; one that ran several times (`process_epoch`
     /// across a long skip) is the sum of its runs.
     pub stf_phases: BTreeMap<String, f64>,
-    /// What the `stf` phase spent outside every step in `stf_phases`: cloning
-    /// the parent state, building the epoch-boundary balances, and anything
-    /// else not given a step of its own. Absent when `stf` did not run.
+    /// What the `cl` and `store` phases spent outside every step in
+    /// `stf_phases`: cloning the parent state, building the checkpoint
+    /// balances, the target-balance scan, `on_block`'s store writes, and
+    /// anything else not given a step of its own. Absent when neither ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stf_unattributed_seconds: Option<f64>,
     /// User plus system CPU seconds the whole process spent during the import,
@@ -414,10 +415,10 @@ impl Report {
         let _ = writeln!(
             out,
             "  {:<16} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10}",
-            "class", "blocks", "wall p50", "wall p95", "wall p99", "stf p50", "stf p99"
+            "class", "blocks", "wall p50", "wall p95", "wall p99", "cl p50", "cl p99"
         );
         for (class, summary) in &self.summary.by_class {
-            let stf = summary.distribution.phases.get("stf");
+            let stf = summary.distribution.phases.get("cl");
             let _ = writeln!(
                 out,
                 "  {:<16} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10}",
@@ -573,21 +574,21 @@ mod tests {
     fn a_phase_missing_from_one_sample_still_gets_a_column_with_stats_over_only_the_samples_that_have_it()
      {
         let samples = vec![
-            sample(1, &[("stf", 0.1), ("decode", 0.2)]),
-            sample(2, &[("stf", 0.3)]),
+            sample(1, &[("store", 0.1), ("decode", 0.2)]),
+            sample(2, &[("store", 0.3)]),
         ];
         let report = report(samples);
 
         // `decode` ran on one of two samples: its Stats reflect only that one
         // observation, not a zero-filled second one.
         let phases = &report.summary.overall.phases;
-        assert_eq!(phases["stf"].count, 2);
+        assert_eq!(phases["store"].count, 2);
         assert_eq!(phases["decode"].count, 1);
         assert!((phases["decode"].mean_seconds - 0.2).abs() < 1e-9);
 
         let table = report.human_table();
         assert!(table.contains("decode"), "column missing from human_table");
-        assert!(table.contains("stf"), "column missing from human_table");
+        assert!(table.contains("store"), "column missing from human_table");
         // The second sample's row has no `decode` entry: it must render as a
         // placeholder, not a fabricated zero.
         assert!(
@@ -641,11 +642,11 @@ mod tests {
 
     #[test]
     fn the_summary_splits_by_class_and_leaves_out_classes_nothing_fell_into() {
-        let mut boundary = sample(1, &[("stf", 0.9)]);
+        let mut boundary = sample(1, &[("cl", 0.9)]);
         boundary.class = BlockClass::EpochBoundary;
         boundary.wall_seconds = 1.0;
-        let ordinary_a = sample(2, &[("stf", 0.1)]);
-        let ordinary_b = sample(3, &[("stf", 0.2), ("decode", 0.01)]);
+        let ordinary_a = sample(2, &[("cl", 0.1)]);
+        let ordinary_b = sample(3, &[("cl", 0.2), ("decode", 0.01)]);
         let report = report(vec![boundary, ordinary_a, ordinary_b]);
 
         let by_class = &report.summary.by_class;
@@ -659,16 +660,16 @@ mod tests {
         assert!(!by_class.contains_key("after_skip"));
 
         let ordinary = &by_class["ordinary"].distribution;
-        assert!((ordinary.phases["stf"].mean_seconds - 0.15).abs() < 1e-9);
+        assert!((ordinary.phases["cl"].mean_seconds - 0.15).abs() < 1e-9);
         assert_eq!(ordinary.phases["decode"].count, 1);
         assert!((by_class["epoch_boundary"].distribution.wall.mean_seconds - 1.0).abs() < 1e-9);
         // The whole-run summary still covers all three.
-        assert_eq!(report.summary.overall.phases["stf"].count, 3);
+        assert_eq!(report.summary.overall.phases["cl"].count, 3);
     }
 
     #[test]
     fn the_report_carries_the_new_shape_at_the_documented_paths() {
-        let mut block = sample(1, &[("stf", 0.5)]);
+        let mut block = sample(1, &[("cl", 0.5)]);
         block.stf_phases = [("process_epoch".to_string(), 0.3)].into_iter().collect();
         block.stf_unattributed_seconds = Some(0.05);
         block.cpu_seconds = Some(0.7);
@@ -712,9 +713,9 @@ mod tests {
 
         // Summary paths: the old ones are where they were, flattened.
         let summary = &json["summary"];
-        assert_eq!(summary["phases"]["stf"]["count"], 1);
-        assert!(summary["phases"]["stf"]["p95_seconds"].is_number());
-        assert!(summary["phases"]["stf"]["p99_seconds"].is_number());
+        assert_eq!(summary["phases"]["cl"]["count"], 1);
+        assert!(summary["phases"]["cl"]["p95_seconds"].is_number());
+        assert!(summary["phases"]["cl"]["p99_seconds"].is_number());
         assert_eq!(summary["stf_phases"]["process_epoch"]["count"], 1);
         assert_eq!(summary["cpu"]["count"], 1, "only one sample had a reading");
         assert_eq!(summary["stf_unattributed"]["count"], 1);
@@ -756,7 +757,7 @@ mod tests {
 
     #[test]
     fn the_human_table_names_the_new_columns_and_sections() {
-        let mut block = sample(1, &[("stf", 0.5)]);
+        let mut block = sample(1, &[("cl", 0.5)]);
         block.stf_phases = [("state_root".to_string(), 0.2)].into_iter().collect();
         block.cpu_seconds = Some(0.6);
         let table = report(vec![block]).human_table();

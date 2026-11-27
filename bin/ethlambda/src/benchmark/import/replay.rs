@@ -118,18 +118,25 @@ fn delta(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> BTree
         .collect()
 }
 
-/// The seconds the `stf` import phase spent outside every STF step, or `None`
-/// when `stf` did not run.
+/// The seconds the block's state transition spent outside every STF step, or
+/// `None` when no transition ran.
 ///
-/// The steps are nested inside `stf`, so their sum cannot exceed it; the clamp
-/// only absorbs the few microseconds two separate clock readings can disagree
-/// by, rather than reporting a negative duration.
+/// A beacon import's transition is two phases, `cl` (the transition) and
+/// `store` (`on_block` with it), and the steps are nested inside the two, so
+/// their sum cannot exceed them. Both count: a debug-assertions build runs the
+/// transition a second time inside `store`, as a check, and its steps are
+/// observed too. The clamp only absorbs the few microseconds two separate
+/// clock readings can disagree by, rather than reporting a negative duration.
 fn stf_unattributed(
     phases: &BTreeMap<String, f64>,
     stf_phases: &BTreeMap<String, f64>,
 ) -> Option<f64> {
-    let stf = *phases.get("stf")?;
-    Some((stf - stf_phases.values().sum::<f64>()).max(0.0))
+    let (cl, store) = (phases.get("cl"), phases.get("store"));
+    if cl.is_none() && store.is_none() {
+        return None;
+    }
+    let transition = cl.unwrap_or(&0.0) + store.unwrap_or(&0.0);
+    Some((transition - stf_phases.values().sum::<f64>()).max(0.0))
 }
 
 /// The phases a sample records: every per-block section, plus the
@@ -505,8 +512,10 @@ mod tests {
     }
 
     #[test]
-    fn the_unattributed_stf_time_is_what_the_steps_leave_of_the_stf_phase() {
-        let phases: BTreeMap<String, f64> = [("stf".to_string(), 1.0)].into_iter().collect();
+    fn the_unattributed_stf_time_is_what_the_steps_leave_of_the_transition() {
+        let phases: BTreeMap<String, f64> = [("cl".to_string(), 0.8), ("store".to_string(), 0.2)]
+            .into_iter()
+            .collect();
         let steps: BTreeMap<String, f64> = [
             ("process_epoch".to_string(), 0.6),
             ("state_root".to_string(), 0.3),
@@ -525,8 +534,8 @@ mod tests {
     }
 
     #[test]
-    fn steps_that_overshoot_the_stf_phase_by_clock_skew_clamp_to_zero() {
-        let phases: BTreeMap<String, f64> = [("stf".to_string(), 1.0)].into_iter().collect();
+    fn steps_that_overshoot_the_transition_by_clock_skew_clamp_to_zero() {
+        let phases: BTreeMap<String, f64> = [("cl".to_string(), 1.0)].into_iter().collect();
         let steps: BTreeMap<String, f64> = [("state_root".to_string(), 1.000_001)]
             .into_iter()
             .collect();

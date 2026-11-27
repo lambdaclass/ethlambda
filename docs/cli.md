@@ -120,7 +120,7 @@ from a normal build.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--custody-group-count` | `CUSTODY_REQUIREMENT` (4) | How many custody groups this node custodies, advertised as the ENR's `cgc` |
+| `--custody-group-count` | `CUSTODY_REQUIREMENT` (4) | The fewest custody groups this node custodies, advertised as the ENR's `cgc` and `MetaData`'s `custody_group_count`. Validator custody can raise it (see below) |
 | `--execution-endpoint` | none | Base URL of the execution client's Engine API endpoint, e.g. `http://127.0.0.1:8551`. Must be given together with `--execution-jwt-secret` |
 | `--execution-jwt-secret` | none | File holding the 32-byte hex JWT secret shared with the execution client |
 | `--safe-slots-to-import-optimistically` | the specification's own value | How far behind the wall clock a block must be before it may be imported optimistically on age alone |
@@ -147,8 +147,34 @@ lookup finds a custodian at all.
 
 Changing it changes which columns this node custodies, since the custody set is
 a function of the node id *and* the count. Sidecars already on disk belong to
-the old set: nothing is corrupted, but the node advertises a set it has not
-finished filling until it backfills the difference.
+the old set: nothing is corrupted, and nothing backfills the difference, so a
+start with more groups than the data directory held records the slot after the
+highest block it holds (the head's or a side branch's) and reports it in
+`Status` as `earliest_available_slot` (peers do not ask it for older columns of
+the new groups). The record is written only once the start is past its last
+fallible step, just before the chain actor spawns, so a start that fails
+earlier leaves it as it was.
+
+**Validator custody.** Fulu `validator.md` has a node with validators attached
+custody one group per 32 ETH of their total effective balance, at least 8 and
+at most 128, and keep the highest count it has reached. The node learns its
+validators from the indices a validator client names to
+`beacon_committee_subscriptions` and `prepare_beacon_proposer`, and forgets a
+validator not named again for two epochs. Once an epoch it computes their
+requirement off the latest finalized state, as the specification says (not the
+head's, since the record never falls and a branch that is later reorged out
+must not raise it), and records the highest one in the data directory. The count a start runs with is the larger of this flag and that
+record, so the flag is the operator's own floor: raising it, or lowering it to
+no less than the record, takes effect at the next start.
+
+A running node changes only what it *advertises*, and only within what it
+already holds: `MetaData`'s `custody_group_count` rises (under a new sequence
+number) as far as the startup count's sampling size, which at the default is
+the 8 groups one attached validator requires. A requirement past that is
+recorded and logged as a warning, and the next start custodies and advertises
+it. The ENR's `cgc` keeps its startup value until a restart, the same
+limitation as the fork digest's `eth2` entry (ethrex's `DiscoveryServer`
+cannot replace the record it serves).
 
 With neither execution flag, the follower contacts no execution client and
 imports blocks without validating their payloads, which is what it did before
@@ -191,9 +217,12 @@ numbers are accepted quoted or bare, and unrecognised keys (on a current
 config, the heze schedule this build does not claim) are dropped
 with one warning line naming each. Its `PRESET_BASE` (`mainnet` or `minimal`)
 selects the preset the process runs, before anything is decoded against it; a
-missing or unknown one is a hard startup error. The validator client has no
-`--network` and adopts the preset its beacon node's `/eth/v1/config/spec`
-reports. Sepolia's config schedules gloas, which this build follows, so
+missing or unknown one is a hard startup error. The validator client adopts
+the preset its beacon node's `/eth/v1/config/spec` reports. With its optional
+`--network`, resolving the network selects that network's `PRESET_BASE`
+first, and only a node reporting the same preset can be the one the client
+adopts it from (see [the chain check](#several-beacon-nodes-the-chain-check)).
+Sepolia's config schedules gloas, which this build follows, so
 it parses and runs like any other fork. A scheduled fork the build claims but
 does not follow gets a separate, explicit warning at startup, since the chain
 follower would stop tracking the chain there regardless of what parsed
@@ -318,10 +347,10 @@ not chain-specific, branches once, and shares the shutdown:
 | build the aggregator, sync-status and event handles | shared | shared |
 | open `--data-dir`'s RocksDB backend | shared | shared |
 | resolve `--node-key`, else load `<data-dir>/node.key`, generating it on first start (after the open, so RocksDB's lock covers the write) | shared | shared |
-| **the one `match`**: produce a `ChainSetup` | genesis config, validator keys, checkpoint sync or resume onto the shared backend, subnets | `beacon::wire_params` (genesis metadata, epoch, fork digest), then checkpoint sync or resume onto the same backend |
+| **the one `match`**: produce a `ChainSetup` | genesis config, validator keys, checkpoint sync or resume onto the shared backend, subnets | checkpoint sync or resume onto the same backend, then `beacon::startup_custody` (the custody count, from the flag and the directory's recorded validator custody), then `beacon::wire_params` (genesis metadata, epoch, fork digest, custody columns) |
 | build the swarm, spawn P2P, start discv5 | shared; discv5 only with `--discovery.enable` | shared |
 | start the HTTP server | shared | shared |
-| spawn the chain actor and wire it to P2P | yes | yes: `BlockChain::spawn_beacon` |
+| spawn the chain actor and wire it to P2P | yes | yes: record this start's custody set in the data directory (`StartupCustody::record`), then `BlockChain::spawn_beacon` |
 | ctrl-c or SIGTERM, stop and join the actors | shared | shared |
 
 `ChainSetup` is what the `match` produces: the wire configuration, the ENR
@@ -380,8 +409,27 @@ said, and asks them all again every 2 seconds, as Lighthouse's validator client
 does, rather than exiting: a client started beside its beacon node otherwise
 exits before the node's API is up. Only when every node answered, each with a
 preset this client cannot run on or a spec it cannot read, does startup fail; a
-body that is not JSON at all (a proxy's page while the node boots) is waited out. A
-response without the slot
+body that is not JSON at all (a proxy's page while the node boots) is waited out.
+
+With `--network`, the reference must also be on the network it names, compared
+on the fields that never move over a network's life: `PRESET_BASE`,
+`genesis_time`, `genesis_validators_root`, the slot duration and
+`GENESIS_FORK_VERSION`. A node that differs in one is never the reference and is
+not used, and a node on another network counts as a final answer: when every
+node answered, each on another network, on a preset this client cannot run on,
+or with a spec it cannot read, startup fails naming why each is off; otherwise it
+waits for one on the network. The fork schedule is not held to the network's,
+since the beacon nodes or the network's config (this binary's, for a built-in
+network; the directory's `config.yaml` otherwise) may predate a change to it:
+the client still follows the nodes' schedule (below), and warns once an epoch,
+naming both values, when it differs from the network's config. Nor does the
+network's schedule pick the reference among nodes on the network that disagree
+on a fork: list order does, as without `--network`, since preferring the node
+that matches a stale config would follow the stale schedule and drop the
+upgraded node at the old epoch. Without `--network` the first
+node to answer sets the chain, whatever it is.
+
+A response without the slot
 duration, `GENESIS_FORK_VERSION`, or the epoch and version of any fork from
 altair to fulu is refused rather than filled in from mainnet; only gloas may be
 absent, meaning unscheduled.
@@ -444,6 +492,7 @@ slot's end, so a node serving a wrong one cannot park a duty past its slot.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Every node on this client's chain is asked `/eth/v1/node/syncing` once a slot and ranked by the answer, list order breaking ties. The first that answers serves the request, so the order is a preference, not load balancing. A node on another chain, or not checked yet, is skipped: see [the chain check](#several-beacon-nodes-the-chain-check), [The per-slot sync check](#the-per-slot-sync-check) and [Ranking and broadcast](#ranking-and-broadcast) |
+| `--network` | none | The network every beacon node must be on: a built-in name (`mainnet`, `sepolia`, `hoodi`, `plataberget`) or a directory of published network files, resolved as `beacon --network` resolves it (a directory's `genesis.ssz` is decoded and its bootnodes file read, at startup). A node on another network (preset, genesis, slot duration or genesis fork version) is not used. Startup fails once every configured node has answered and none is on it, and waits while one has not answered. The fork schedule still comes from the beacon nodes and is only warned about when it differs from the network's, so a rescheduled fork needs the beacon nodes upgraded for the client to follow it. Nor does it pick which node the client starts from, since the network's config may be the stale side. Without it the client runs on the first answering node's chain. See [the chain check](#several-beacon-nodes-the-chain-check) |
 | `--broadcast` | none | Signed messages to send to every beacon node on this client's chain at once instead of the first that accepts them, comma-separated: `attestations` (attestations, aggregates, payload attestations), `blocks` (blocks and envelopes, never a blinded block), `sync-committee` (messages and contributions). `subscriptions` and `none` are accepted, as Lighthouse takes them, and change nothing, since subscriptions, fee recipients, builder registrations and proposer preferences always go to every node. See [Ranking and broadcast](#ranking-and-broadcast) |
 | `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml`, which also lists the keys a remote signer holds (see [Remote signing](#remote-signing-web3signer)). Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`, password in `--secrets-dir/<0xpubkey>`) are discovered and the file is written |
 | `--secrets-dir` | required | Directory holding one password file per keystore, named after the validator's public key |
@@ -452,7 +501,8 @@ slot's end, so a node serving a wrong one cannot park a duty past its slot.
 | `--keymanager-port` | `5062` | Keymanager API port. Only bound with `--enable-keymanager` |
 | `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node pays its own fallback address (on ethlambda, `beacon --fallback-fee-recipient`), which is the zero address unless its operator set one, and may not be yours. The addresses reach each beacon node as one `prepare_beacon_proposer` request every slot, listing each validator that has an index on chain and an address, as Lighthouse's validator client sends it. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay |
 | `--gas-limit` | `60000000` | The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with `--builder-proposals`). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client's own payloads toward it as well, so a network whose gas limit is not 60M needs it set, or every proposal pulls the limit toward 60M. **Sepolia and Platåberget schedule `200000000`** (their `config.yaml`'s `GAS_LIMIT_SCHEDULE`, which this client does not read yet, [#795](https://github.com/lambdaclass/ethlambda/issues/795)), so on either pass `--gas-limit 200000000`. Must be positive |
-| `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
+| `--graffiti` | none | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. Conflicts with `--graffiti-file`, as in Lighthouse. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. Without it a block request carries no graffiti and the beacon node applies its own default; an ethlambda beacon node appends both clients' versions to whatever the graffiti is (see [`rpc.md`](rpc.md#validator-endpoints)). See [Graffiti](#graffiti) |
+| `--graffiti-file` | none | A file of per-validator graffiti in Lighthouse's format (`default: <text>`, `<0xpubkey>: <text>`), read again before every proposal and ahead of the keymanager API's per-validator graffiti. Conflicts with `--graffiti`, as in Lighthouse. A file that does not parse refuses startup; once running, a bad read logs a warning and the validator's own graffiti applies, else none. See [Graffiti](#graffiti) |
 | `--enable-keymanager` | off | Serve the keymanager API: keystores, remote keys, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
 | `--keymanager-token-file` | `api-token.txt` in `--validators-dir` | File to read the keymanager API's bearer token from instead, for a token shared with other tooling, such as the one ethereum-package gives every validator client. Never written or created, so a missing file, or one shorter than 16 characters once trimmed or holding a character an `Authorization` header cannot carry (anything but visible ASCII, spaces and tabs), is a startup error. Only read with `--enable-keymanager`; set without it, startup warns. See [The keymanager API](#the-keymanager-api) |
 | `--web3signer-url` | none | Base URL of a Web3Signer (`https://signer:9000`): the signer a remote key imported through `POST /eth/v1/remotekeys` without a `url` of its own is assigned to. Checked for shape at startup. Keys whose definitions entry names a signer need no default |
@@ -463,6 +513,7 @@ slot's end, so a node serving a wrong one cannot park a duty past its slot.
 | `--self-build-only` | off | Never sign a block built on a builder's payload (Lodestar's `executiononly`). From gloas each block request asks for no bid (`builder_boost_factor` `0`, `min_bid` `2^64 - 1`), and a block whose bid names a builder anyway, from a node that ignores `min_bid`, is refused before slashing protection records the slot. When the beacon node cannot build the payload itself, the slot is missed rather than built on a bid. Before gloas nothing changes: without `--builder-proposals` a blinded block is already refused. Conflicts with `--builder-proposals`, `--builder-boost-factor`, `--prefer-builder-proposals` and `--builder-min-bid` |
 | `--init-slashing-protection` | off | Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing |
 | `--enable-doppelganger-protection` | off | Sign no attestation or block for a validator until the beacon node has seen it stay silent for a full epoch, and stop if it sees one act meanwhile. Applies at every start and to every key the keymanager API imports, and costs two to three epochs of attestations each time. See [Doppelganger protection](#doppelganger-protection) |
+| `--shut-down-when-slashed` | off | Stop when the chain reports a loaded validator slashed, exiting with code `3`, rather than only dropping that key's proposer, attester and aggregation duties. See [Slashed validators](#slashed-validators) |
 | `--disable-event-stream` | off | Read no beacon node's event stream, so every attestation, sync committee message and payload timeliness committee vote waits for its offset into the slot. One flag for what Lighthouse splits between `--disable-beacon-head-monitor` and `--disable-payload-available-monitor`; Prysm's nearest is `--disable-attest-timely`. For a node whose stream is broken, or a proxy in front of it that holds events back. See [Duties start on the block](#duties-start-on-the-block) |
 
 ### What it does today
@@ -859,6 +910,69 @@ the epochs checked goes unseen until it comes back, when nothing is checking any
 more. `ethlambda_validator_doppelganger_detecting` counts the keys still
 withheld.
 
+### Slashed validators
+
+Each epoch's refresh resolves every loaded key through
+`POST /eth/v1/beacon/states/head/validators`, and reads each one's
+`validator.slashed` (not its `status`, which stops saying so once the validator
+reaches `withdrawal_possible`). A slashing shows in the head state once a block
+includes it, so it is seen within an epoch of that block. The client does not
+subscribe to the beacon node's `proposer_slashing` or `attester_slashing`
+events yet, which would cut that to seconds.
+
+A key reported slashed:
+
+- is logged at error, with its index, pubkey and status, by the first refresh
+  that finds it, and counted in `ethlambda_validator_validators_slashed` while
+  it stays loaded;
+- gets no more proposals (the chain refuses a block from a slashed proposer),
+  attestations or attestation aggregations (its attestations earn nothing).
+  When the refresh that finds it runs beside the slot's duties, as an epoch's
+  usually does after its block, that slot still serves the ones it read before
+  the answer came;
+- keeps its sync committee duties, contributions as a selected aggregator
+  included, and its payload timeliness committee duties, which the chain
+  still counts: a slashed sync committee member is rewarded for taking
+  part and penalised for missing, as any other, and nothing in gloas refuses
+  or ignores a slashed member's payload attestation;
+- is left out of builder registrations, fee recipient preparations and
+  proposer preferences.
+
+The other keys go on. They are the ones at risk: a slashing means the setup is
+broken (a key running in a second place, slashing protection bypassed, a
+leaked key), and whatever caused it usually applies to every key that shares
+the validators directory or the copied setup. Each refresh's answer replaces
+the last, so a key leaves the set only when it is no longer loaded or when a
+node's earlier answer was wrong.
+
+With `--shut-down-when-slashed` the first refresh that finds a slashed key
+stops the client instead, before it sends anything else for the epoch, with an
+error saying not to restart it until the cause is found. An epoch's refresh
+usually runs after the slot's block, beside the slot's other duties, and the
+stop drops those where they stand: no key attests, aggregates or serves a
+committee once the slashing is seen. The process exits
+with code **3**, distinct from the `1` of any other failure, clap's `2` for a
+bad command line and the `101` of a panic. Every start finds the same key
+again, so tell the supervisor not to restart on it: systemd's
+`RestartPreventExitStatus=3` next to `Restart=on-failure`. Kubernetes can
+match on exit codes from 1.34 on, through a container's `restartPolicyRules`
+(alpha behind the `ContainerRestartRules` feature gate in 1.34, beta and on by
+default from 1.35): a rule that restarts the container on every exit code but
+3. An older cluster has no per-code equivalent, and restarts the pod into the
+same stop until the key is removed. The flag is off by default, as Teku's
+`--shut-down-when-validator-slashed-enabled` is.
+
+With the flag on, the keymanager API is up only for the moment before the
+stop, too short to delete the slashed key through it. Once the cause is
+found, start the client without `--shut-down-when-slashed`, delete the key
+with `DELETE /eth/v1/keystores` (or `/eth/v1/remotekeys`), and turn the
+flag back on at the next restart.
+
+The answer is one beacon node's: with several `--beacon-nodes` the lookup
+takes the first that answers, and nothing confirms it against another. A node
+that wrongly reports a key slashed stops the client with the flag on, and
+costs that key an epoch of duties without it.
+
 ### Duty offsets come from the network
 
 The slot length and the duty offsets are read from the beacon node's
@@ -1097,7 +1211,7 @@ give one validator its own value in place of the command line's default:
 | Setting | Default | Takes effect |
 |---|---|---|
 | `feerecipient` | `--suggested-fee-recipient` | Once the duties of the slot it is set in are done, when the fee recipients are sent to the beacon node again, as they are after every slot's duties (the next slot's while a slow beacon node still holds the last send). A validator imported since the last epoch boundary, or with no index on chain yet, is first sent once an epoch boundary resolves its index. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch. With `--builder-proposals`, the next builder registration carries it too, usually at the next slot (later while the epoch's full registration send is still running) and again every slot until a node accepts it or the epoch's full send carries it, and an ethlambda beacon node takes it from there. A `DELETE` that leaves a validator with no address at all (no `--suggested-fee-recipient` either) sends no fee recipient and no registration, so the beacon node and the builder keep paying the address they were last given. From gloas, the proposer preferences carry it, from the next dependent root on |
-| `graffiti` | `--graffiti` | The next proposal |
+| `graffiti` | `--graffiti` | The next proposal, unless `--graffiti-file` names the key or has a `default` line (see [Graffiti](#graffiti)) |
 | `gas_limit` | `--gas-limit` | Before gloas, the next builder registration with `--builder-proposals` (usually at the next slot, later while the epoch's full registration send is still running, and again every slot until a node accepts it or the epoch's full send carries it), and stored and served only without it. From gloas, the proposer preferences' target gas limit, from the next dependent root on, flag or not |
 
 **These persist.** Each is written onto the validator's entry in
@@ -1130,7 +1244,9 @@ nothing is written.
 A few answers worth knowing: `GET feerecipient` is a `500` when the validator
 has no address and there is no `--suggested-fee-recipient` default, as
 Lighthouse answers it; `POST feerecipient` refuses the zero address, as the
-specification requires; `POST graffiti` refuses text over 32 bytes rather than
+specification requires; `GET graffiti` answers what the next proposal would
+carry, `--graffiti-file` included, and an empty string when no graffiti is set
+anywhere; `POST graffiti` refuses text over 32 bytes rather than
 truncating it; `POST gas_limit` refuses `0`, as `--gas-limit` does; and every
 route answers `404` for a key this client does not hold.
 
@@ -1144,6 +1260,91 @@ returns the deleted keys' records as a minimal EIP-3076 interchange, answering
 
 The specification requires TLS. This binds to `--http-address`, loopback by
 default; exposing it further means putting a TLS terminator in front.
+
+### Graffiti
+
+A block's graffiti comes from the first of these that has one for the
+proposing validator, Lighthouse's order:
+
+1. `--graffiti-file`'s line for the validator's public key;
+2. `--graffiti-file`'s `default` line;
+3. the validator's own graffiti, set through the keymanager API or written by
+   hand into `validator_definitions.yml`;
+4. `--graffiti`.
+
+`--graffiti-file` and `--graffiti` cannot be given together, as in
+Lighthouse, so the file and the last step never both apply. With a file, a
+validator it has no line for and no `default` line covers, or a proposal whose
+read of it fails, takes the validator's own graffiti, else none.
+
+With none of them, the block request carries no `graffiti` parameter and the
+beacon node applies its own default. An ethlambda beacon node reads an absent
+graffiti as an empty one and appends both clients' codes and commits to it,
+as it does to any graffiti (see [`rpc.md`](rpc.md#validator-endpoints)).
+
+`--graffiti-file` takes Lighthouse's format, so a file written for
+Lighthouse's flag works unchanged:
+
+```text
+default: ethlambda
+0x87a580d31d7bc69069b55f5a01995a610dd391a26dc9e36e81057a17211983a79266800ab8531f21f1083d7d84085007: mr f was here
+```
+
+A line splits at its first `:`. The key before it is exactly `default` or a
+`0x`-prefixed public key, and the text after it, trimmed, is the graffiti, so
+the text may hold colons of its own (`graffitiwall:720:641:#ffff00`). An empty
+graffiti is a graffiti, 32 zero bytes, which a beacon node may treat apart
+from an absent one. Lines of whitespace alone are skipped; there is no comment
+syntax, so a `#` line is refused. A key named twice takes its last line.
+
+The file is read again before every proposal, and for every `GET graffiti`,
+and each read starts from nothing: an edited line applies from the next
+proposal, and a deleted one stops applying there. (Lighthouse merges each read
+into what it read at startup, so a deleted line stays in effect there until a
+restart.) A script can therefore rotate graffiti by rewriting the file; write
+it to a temporary path and rename it over the old one, so a proposal never
+reads it half-written.
+
+A file that cannot be read or does not parse, a graffiti over 32 bytes among
+them, refuses startup, as an over-long `--graffiti` does. So does a path that
+is not a regular file (a FIFO, a directory, a device), a file over 16 MiB, and
+one not read within 5 seconds, so a stalled mount refuses startup rather than
+hang it. A FIFO is refused at once, not after the 5 seconds: the file is
+opened without waiting for a writer (`O_NONBLOCK`), and what was opened is
+checked to be a regular file before it is read. One read within 5 seconds
+but in more than 250 ms starts with a warning, since a proposal gives up on a
+read that slow (see below); a cold cache can make one read that slow and the
+next ones fast, so it is not refused. Once the client is running,
+the same failure costs only the file: the proposal takes its graffiti from the
+next source in the list and logs a warning, and the client logs an info line
+once the file reads again. `GET graffiti` skips the file the same way, but
+warns only at the first of a run of failed reads, so a client polling it does
+not repeat the warning. A read that takes longer than 250 ms is given up on
+the same way, so a stalled mount cannot cost a proposal its slot; the read
+runs alongside the RANDAO signature, so it adds nothing when that takes as
+long. A UTF-8 byte-order mark at the start of the file is ignored.
+
+Each read runs on a thread of its own, and only one runs at a time: a
+proposal or `GET graffiti` that comes while one runs takes that read's answer
+rather than starting another. The 250 ms count from the read's start, so a
+caller that joins a running read waits only what is left of them, and one
+that finds the read running longer than that skips the file at once. So a
+stalled file holds one thread, never one slashing protection runs on, and
+costs a proposal at most 250 ms; and a caller that joins a read takes the
+file as it was at most 250 ms before it asked. The price of one read at a
+time: a read that never returns, as one of a hung network mount does, turns
+the file off until it returns or the client restarts. Every proposal
+meanwhile skips the file with a warning, even once the file is put right,
+since the stuck read is still the running one. A FIFO put in the file's place
+cannot cause this, since it is refused at once like a directory, and the next
+proposal reads the file again; only a filesystem that never answers an
+`open`, `fstat` or `read` can.
+
+One thing differs from Lighthouse besides the reload: the keymanager API's
+graffiti routes stay open while the file is set: a `POST graffiti` is written to `validator_definitions.yml` and
+applied as usual, and shows in proposals and in `GET graffiti` whenever the
+file names neither the key nor a `default`. Until then `GET graffiti` keeps
+answering the file's text, since that is what the next proposal carries.
 
 ### Stopping
 

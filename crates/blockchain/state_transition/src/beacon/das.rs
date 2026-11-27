@@ -19,12 +19,14 @@
 //! the wrap, and the all-ones node id is simply the one input that reaches it
 //! on the very first step.
 
+use crate::beacon::config::Config;
 use crate::beacon::constants;
+use crate::beacon::containers::BeaconState;
 use crate::beacon::error::{Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::math::bytes_to_uint64;
 use crate::beacon::preset;
-use crate::beacon::primitives::ColumnIndex;
+use crate::beacon::primitives::{ColumnIndex, Gwei, ValidatorIndex};
 
 /// The index of a custody group: `das-core.md`'s `CustodyIndex`.
 ///
@@ -44,6 +46,56 @@ pub type CustodyIndex = u64;
 /// what it samples.
 pub fn sampling_size(custody_group_count: u64) -> u64 {
     custody_group_count.max(constants::SAMPLES_PER_SLOT)
+}
+
+/// How many custody groups the validators attached to a node require it to
+/// custody: fulu `validator.md`, "Validator custody",
+/// `get_validators_custody_requirement`.
+///
+/// `None` when no index in `validator_indices` names a validator in `state`'s
+/// registry. The specification's function answers
+/// `VALIDATOR_CUSTODY_REQUIREMENT` for an empty list, but its prose applies
+/// the requirement only to "any node with at least one validator attached",
+/// so a node whose validator client named nobody this state knows (none
+/// attached, or indices of validators not yet deposited) owes nothing beyond
+/// its own `CUSTODY_REQUIREMENT`. Answering the floor there would raise every
+/// plain follower to it.
+///
+/// Unknown indices are skipped rather than refused: they come from a
+/// validator client's API calls, not from the chain.
+pub fn get_validators_custody_requirement(
+    state: &BeaconState,
+    validator_indices: &[ValidatorIndex],
+    config: &Config,
+) -> Option<u64> {
+    let mut attached = false;
+    let mut total_node_balance: Gwei = 0;
+    for &index in validator_indices {
+        if let Ok(validator) = state.validator(index) {
+            attached = true;
+            total_node_balance = total_node_balance.saturating_add(validator.effective_balance);
+        }
+    }
+    attached.then(|| validators_custody_requirement(total_node_balance, config))
+}
+
+/// The arithmetic half of [`get_validators_custody_requirement`]: one custody
+/// group per `BALANCE_PER_ADDITIONAL_CUSTODY_GROUP` of `total_node_balance`,
+/// at least `VALIDATOR_CUSTODY_REQUIREMENT` and at most
+/// `NUMBER_OF_CUSTODY_GROUPS`.
+///
+/// Both configuration values are read from `config` rather than from
+/// constants, since a network's `config.yaml` sets them. A zero
+/// `BALANCE_PER_ADDITIONAL_CUSTODY_GROUP` (a broken network directory, since
+/// no published one sets it) asks for every group, the answer the division
+/// tends to as the divisor shrinks.
+pub fn validators_custody_requirement(total_node_balance: Gwei, config: &Config) -> u64 {
+    let count = total_node_balance
+        .checked_div(config.balance_per_additional_custody_group)
+        .unwrap_or(u64::MAX);
+    count
+        .max(config.validator_custody_requirement)
+        .min(constants::NUMBER_OF_CUSTODY_GROUPS)
 }
 
 /// The gossip subnet a data column sidecar travels on:
@@ -247,6 +299,99 @@ mod tests {
         assert_eq!(
             sampling_size(constants::NUMBER_OF_CUSTODY_GROUPS),
             constants::NUMBER_OF_CUSTODY_GROUPS
+        );
+    }
+
+    const ETH: Gwei = 1_000_000_000;
+
+    #[test]
+    fn validator_custody_is_one_group_per_32_eth() {
+        let config = Config::mainnet();
+        assert_eq!(config.balance_per_additional_custody_group, 32 * ETH);
+        assert_eq!(validators_custody_requirement(9 * 32 * ETH, &config), 9);
+        // Integer division: a remainder short of the next 32 ETH buys nothing.
+        assert_eq!(
+            validators_custody_requirement(10 * 32 * ETH - 1, &config),
+            9
+        );
+        assert_eq!(validators_custody_requirement(100 * 32 * ETH, &config), 100);
+    }
+
+    #[test]
+    fn validator_custody_is_floored_at_the_validator_requirement() {
+        let config = Config::mainnet();
+        assert_eq!(config.validator_custody_requirement, 8);
+        assert_eq!(validators_custody_requirement(0, &config), 8);
+        assert_eq!(validators_custody_requirement(32 * ETH, &config), 8);
+        assert_eq!(validators_custody_requirement(8 * 32 * ETH, &config), 8);
+    }
+
+    #[test]
+    fn validator_custody_is_capped_at_every_group() {
+        let config = Config::mainnet();
+        // 4096 ETH is the supernode threshold.
+        assert_eq!(validators_custody_requirement(4096 * ETH, &config), 128);
+        assert_eq!(
+            validators_custody_requirement(1_000_000 * ETH, &config),
+            128
+        );
+        assert_eq!(validators_custody_requirement(u64::MAX, &config), 128);
+    }
+
+    #[test]
+    fn a_zero_balance_per_group_asks_for_every_group() {
+        let config = Config {
+            balance_per_additional_custody_group: 0,
+            ..Config::mainnet()
+        };
+        assert_eq!(
+            validators_custody_requirement(32 * ETH, &config),
+            constants::NUMBER_OF_CUSTODY_GROUPS
+        );
+    }
+
+    #[test]
+    fn the_requirement_sums_the_attached_validators_effective_balances() {
+        let config = Config::mainnet();
+        let mut state = crate::beacon::helpers::test_state::with_validators(200);
+        // Every validator the builder makes has 32 ETH effective balance.
+        let ten: Vec<ValidatorIndex> = (0..10).collect();
+        assert_eq!(
+            get_validators_custody_requirement(&state, &ten, &config),
+            Some(10)
+        );
+        // Effective balance, not the count of validators: one 2048 ETH
+        // validator alone is 64 groups' worth.
+        state.validator_mut(0).unwrap().effective_balance = 2048 * ETH;
+        assert_eq!(
+            get_validators_custody_requirement(&state, &[0], &config),
+            Some(64)
+        );
+        let all: Vec<ValidatorIndex> = (0..200).collect();
+        assert_eq!(
+            get_validators_custody_requirement(&state, &all, &config),
+            Some(constants::NUMBER_OF_CUSTODY_GROUPS)
+        );
+    }
+
+    #[test]
+    fn unknown_validators_count_for_nothing() {
+        let config = Config::mainnet();
+        let state = crate::beacon::helpers::test_state::with_validators(4);
+        // An index past the registry is skipped, not refused.
+        assert_eq!(
+            get_validators_custody_requirement(&state, &[1, 1_000], &config),
+            Some(8)
+        );
+        // No validator this state knows: no requirement at all, rather than
+        // the floor a node with a validator attached would owe.
+        assert_eq!(
+            get_validators_custody_requirement(&state, &[1_000], &config),
+            None
+        );
+        assert_eq!(
+            get_validators_custody_requirement(&state, &[], &config),
+            None
         );
     }
 

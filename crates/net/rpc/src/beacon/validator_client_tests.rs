@@ -574,6 +574,19 @@ async fn an_optimistic_head_is_one_the_client_will_not_attest_through() {
     assert!(!client.is_optimistic_or_syncing().await.unwrap());
 }
 
+/// The proposal check reads this node's `/eth/v1/beacon/headers/{slot}`: the
+/// root of the block it holds at a slot, and nothing at a slot without one.
+#[tokio::test]
+async fn the_client_reads_the_canonical_block_at_a_slot_off_this_node() {
+    let (client, _, _, store) = serve_with_store(None).await;
+    let (slot, root) = store.beacon_head().expect("the anchor is the head");
+
+    let answer = client.canonical_block_root(slot).await.unwrap();
+    assert_eq!(answer, Some(root));
+    let answer = client.canonical_block_root(slot + 1).await.unwrap();
+    assert_eq!(answer, None, "no block after the anchor");
+}
+
 /// Without an execution client to build a payload with, block production
 /// answers 503, which the client reads as a node it can fail over from rather
 /// than a malformed answer.
@@ -827,7 +840,7 @@ async fn produce_with_pool(
         fork: ForkName::Fulu,
         proposer_index: proposer,
         randao_reveal,
-        graffiti: ethlambda_types::primitives::H256(graffiti),
+        graffiti: Some(ethlambda_types::primitives::H256(graffiti)),
         builder_boost_factor: None,
         builder_min_bid: 0,
     };
@@ -1019,6 +1032,22 @@ async fn a_node_failing_block_production_behind_blobber_is_still_syncing() {
     assert_eq!(*relayed.lock().unwrap(), [crate::JSON_CONTENT_TYPE]);
     assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
     assert!(err.is_retryable());
+}
+
+/// A validator client with no graffiti set sends none, and this node then
+/// applies its own default: the two clients' codes and commits alone, with no
+/// leading space.
+#[tokio::test]
+async fn a_block_request_without_graffiti_gets_the_version_suffix_alone() {
+    let p = produce_for_proposer(0).await;
+    let request = BlockRequest {
+        graffiti: None,
+        ..p.request.clone()
+    };
+    let produced = p.client.produce_block(&request).await.unwrap();
+    let mut expected = [0u8; 32];
+    expected[..12].copy_from_slice(b"RH1a2bLA3c4d");
+    assert_eq!(fulu_block(&produced).body.graffiti.0, expected);
 }
 
 /// A voluntary exit in the node's pool rides in the block it produces. The
@@ -2155,7 +2184,7 @@ mod builder_flow {
                 fork: ForkName::Fulu,
                 proposer_index: self.proposer,
                 randao_reveal,
-                graffiti: ethlambda_types::primitives::H256([0; 32]),
+                graffiti: Some(ethlambda_types::primitives::H256([0; 32])),
                 builder_boost_factor,
                 builder_min_bid: 0,
             };
