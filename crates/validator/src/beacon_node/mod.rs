@@ -875,6 +875,20 @@ pub trait BeaconNodeApi: Send + Sync {
     /// `Err(BeaconNodeSyncing)` when that leaves no node to ask.
     async fn head_block_root(&self) -> Result<Root>;
 
+    /// The root of the block at `slot` on the node's canonical chain, or
+    /// `None` when that chain has no block there (the endpoint's 404, or a
+    /// node answering with the last block before the slot).
+    /// `GET /eth/v1/beacon/headers/{slot}`, which the proposal check in
+    /// [`crate::performance`] reads a few slots after a block is published.
+    ///
+    /// # Contract: the answer is about `slot`, or it is an `Err`
+    ///
+    /// The header names its own slot. One at an earlier slot says the slot
+    /// is empty; one at a later slot is
+    /// [`crate::error::Error::InconsistentResponse`] rather than a root to
+    /// compare: a block after this slot says nothing about it.
+    async fn canonical_block_root(&self, slot: Slot) -> Result<Option<Root>>;
+
     /// Submit signed sync committee messages to the node's pool. Returns how
     /// many it accepted, with the same partial-success reading as
     /// [`Self::submit_attestations`].

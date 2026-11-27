@@ -72,7 +72,9 @@ use crate::beacon_node::{
     AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis, Liveness,
     ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
 };
-use crate::chain_check::{ChainId, Served, first_chain_difference};
+use crate::chain_check::{
+    ChainId, ExpectedNetwork, Served, first_chain_difference, first_identity_difference,
+};
 use crate::error::{Error, Result};
 
 /// The boxed future `#[async_trait]` desugars a trait method call into,
@@ -574,39 +576,81 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         &self,
         with_reference: impl FnOnce(&ChainId) -> Result<u64>,
     ) -> Result<ChainId> {
+        self.establish_on(None, with_reference).await
+    }
+
+    /// [`Self::establish`], with the chain held to the `network` the operator
+    /// named (`--network`) when there is one.
+    ///
+    /// The reference is then the first node that answers *on that network*:
+    /// no [`first_identity_difference`] from it (preset, genesis, slot
+    /// duration, genesis fork version). A node that answers on another one is
+    /// never the reference, so `with_reference` never sees its chain or
+    /// adopts its preset, and is judged against the reference like any other
+    /// node, which leaves it unusable. Its answer is as final as an
+    /// unreadable spec: when every node has answered with one or the other,
+    /// startup fails naming each, rather than waiting for a node that will
+    /// not move to another network on its own.
+    ///
+    /// The fork schedule is not held to the network's: it may differ while a
+    /// change rolls out, and is followed from the nodes as without a network
+    /// (see [`crate::chain_check::warn_if_schedule_differs`]). Nor does it
+    /// pick the reference among nodes on the network that disagree on a fork:
+    /// the network's config may be the stale side (a binary built before a
+    /// reschedule), and preferring the node that matches it would follow the
+    /// stale schedule and drop the upgraded node at the old epoch. List order
+    /// decides, as without a network, and the warning names the difference.
+    pub async fn establish_on(
+        &self,
+        network: Option<&ExpectedNetwork>,
+        with_reference: impl FnOnce(&ChainId) -> Result<u64>,
+    ) -> Result<ChainId> {
+        // Why an answer cannot be the reference: `None` when it can.
+        let off_network = |chain: &ChainId| {
+            let network = network?;
+            first_identity_difference(&network.chain, chain)
+                .map(|difference| format!("not on {}: {difference}", network.name))
+        };
         let (reference_at, asked) = loop {
             let asked = futures_util::future::join_all(self.nodes.iter().map(ask)).await;
-            if let Some(reference_at) = asked.iter().position(|answer| answer.is_ok()) {
+            if let Some(reference_at) = asked.iter().position(|answer| {
+                answer
+                    .as_ref()
+                    .is_ok_and(|chain| off_network(chain).is_none())
+            }) {
                 break (reference_at, asked);
             }
             let detail = asked
                 .iter()
                 .enumerate()
-                .filter_map(|(position, answer)| {
-                    answer
-                        .as_ref()
-                        .err()
-                        .map(|err| format!("node {position}: {err}"))
+                .filter_map(|(position, answer)| match answer {
+                    Ok(chain) => off_network(chain).map(|why| format!("node {position}: {why}")),
+                    Err(err) => Some(format!("node {position}: {err}")),
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            // A node that answered with a preset this client cannot run on, or
-            // a spec it cannot read (a required key absent, say), answered:
-            // asking it again gives the same answer. Waiting is for a node
-            // that has not answered yet, and for one whose answer was not the
-            // node's at all: a body that is not JSON (`Error::Decode`), such
-            // as a proxy's maintenance page while the node boots.
-            if asked
-                .iter()
-                .all(|answer| matches!(answer, Err(Error::Preset(_) | Error::UnreadableSpec(_))))
-            {
+            // A node that answered with a preset this client cannot run on, a
+            // spec it cannot read (a required key absent, say), or a chain
+            // off the named network, answered: asking it again gives the
+            // same answer. Waiting is for a node that has not answered yet,
+            // and for one whose answer was not the node's at all: a body that
+            // is not JSON (`Error::Decode`), such as a proxy's maintenance
+            // page while the node boots. Every `Ok` here is off the network,
+            // or it would have been the reference.
+            if asked.iter().all(|answer| {
+                matches!(
+                    answer,
+                    Ok(_) | Err(Error::Preset(_) | Error::UnreadableSpec(_))
+                )
+            }) {
                 warn!(%detail, "No configured beacon node serves a chain this client can run on");
                 return Err(Error::AllBeaconNodesFailed(detail));
             }
             warn!(
                 %detail,
                 retry_in_secs = STARTUP_RETRY.as_secs(),
-                "No configured beacon node answered; waiting for one"
+                "No configured beacon node answered on a chain this client can run on; waiting \
+                 for one"
             );
             tokio::time::sleep(STARTUP_RETRY).await;
         };
@@ -1767,9 +1811,52 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     /// tracking an unvalidated head is walked past rather than signed over. A
     /// node whose last sync probe reported syncing or optimistic is not asked
     /// at all: see the trait's contract.
+    ///
+    /// Not a plain [`Self::try_each_synced`], whose `AllBeaconNodesFailed`
+    /// would hide every node asked answering `BeaconNodeSyncing` (optimistic
+    /// since its last probe), and the sync committee service would then count
+    /// a head nothing may be signed over as a missed duty. The rule is
+    /// [`Self::is_optimistic_or_syncing`]'s: the first root wins, and when no
+    /// node gives one but at least one said it is optimistic or syncing, the
+    /// answer is `BeaconNodeSyncing`, even if the others failed outright.
+    /// Still the same walk, so it asks the nodes `try_each_synced` asks.
     async fn head_block_root(&self) -> Result<Root> {
-        self.try_each_synced("head_block_root", |node| node.head_block_root())
+        let syncing = std::sync::atomic::AtomicBool::new(false);
+        let answer = self
+            .try_each_at_inner("head_block_root", false, Reach::SkipUnsynced, |node| {
+                let syncing = &syncing;
+                Box::pin(async move {
+                    node.head_block_root().await.inspect_err(|err| {
+                        if matches!(err, Error::BeaconNodeSyncing) {
+                            syncing.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    })
+                })
+            })
             .await
+            .map(|(_, root)| root);
+        match answer {
+            // The caller says so itself, without calling it a missed duty.
+            Err(_) if syncing.into_inner() => Err(Error::BeaconNodeSyncing),
+            Err(Error::AllBeaconNodesFailed(detail)) => {
+                warn!(
+                    what = "head_block_root",
+                    %detail, "All configured beacon nodes failed; duty likely missed"
+                );
+                Err(Error::AllBeaconNodesFailed(detail))
+            }
+            // A root, or `BeaconNodeSyncing` for no node left to ask.
+            other => other,
+        }
+    }
+
+    // Quiet: the proposal check is no duty, and it logs and counts a failure
+    // as `unknown` itself.
+    async fn canonical_block_root(&self, slot: Slot) -> Result<Option<Root>> {
+        self.try_each_quiet("canonical_block_root", |node| {
+            node.canonical_block_root(slot)
+        })
+        .await
     }
 
     /// To every node with `--broadcast sync-committee`, the most any accepted.
@@ -2442,6 +2529,32 @@ mod tests {
             fallback.head_block_root().await.expect("second answers"),
             Root::repeat_byte(2)
         );
+    }
+
+    /// No root anywhere, and a node said why: that is the answer, whatever
+    /// the rest did, so the caller can tell it from every node being down.
+    #[tokio::test]
+    async fn an_optimistic_head_with_no_root_elsewhere_is_syncing_not_a_failure() {
+        let optimistic = || {
+            let mut node = MockBeaconNode::new().with_head_root(Root::repeat_byte(1));
+            node.head_optimistic = true;
+            node
+        };
+        let down = || MockBeaconNode::new().failing_call("head_block_root", "node down");
+
+        for nodes in [vec![optimistic(), optimistic()], vec![down(), optimistic()]] {
+            let err = FallbackBeaconNode::new(nodes)
+                .head_block_root()
+                .await
+                .expect_err("no root");
+            assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+        }
+
+        let err = FallbackBeaconNode::new(vec![down(), down()])
+            .head_block_root()
+            .await
+            .expect_err("no root");
+        assert!(matches!(err, Error::AllBeaconNodesFailed(_)), "got {err:?}");
     }
 
     #[tokio::test]

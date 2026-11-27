@@ -1,12 +1,16 @@
 //! `ethlambda validator`: the beacon-chain validator client.
 //!
-//! It talks to a beacon node over the standard REST Beacon API and depends on
-//! nothing else in this binary, so it runs against any conformant node.
+//! It talks to a beacon node over the standard REST Beacon API, so it runs
+//! against any conformant node. The one thing it takes from the rest of this
+//! binary is `--network`'s resolution, the same `network` module `ethlambda
+//! beacon` resolves its own `--network` with.
 
 use std::path::PathBuf;
 
 use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
+use ethlambda_validator::beacon_node::Genesis;
 use ethlambda_validator::beacon_node::fallback::BroadcastTopic;
+use ethlambda_validator::chain_check::{ChainId, ExpectedNetwork};
 use ethlambda_validator::graffiti_file::GraffitiFile;
 use ethlambda_validator::proposer_settings::{
     DEFAULT_GAS_LIMIT, GRAFFITI_BYTES, graffiti_from_text,
@@ -16,6 +20,7 @@ use eyre::WrapErr as _;
 use tokio::sync::oneshot;
 use tracing::info;
 
+use crate::network::{NetworkSource, NetworkSpec};
 use crate::shutdown::ShutdownSignals;
 
 /// An execution address is exactly this wide.
@@ -33,6 +38,27 @@ pub(crate) struct ValidatorOptions {
     /// preference, not a load-balancing policy.
     #[arg(long, value_delimiter = ',', required = true)]
     pub(crate) beacon_nodes: Vec<String>,
+
+    /// The network every beacon node must be on: a built-in name (`mainnet`,
+    /// `sepolia`, `hoodi`, `plataberget`) or a path to a directory of
+    /// published network files, as `ethlambda beacon --network` takes.
+    ///
+    /// Optional, with no default. Without it the client runs on the chain of
+    /// the first beacon node that answers. With it, a node whose preset,
+    /// genesis, slot duration or genesis fork version differs from the
+    /// network's is never used. Startup fails once every configured node has
+    /// answered and none is on the network, and waits while one has not
+    /// answered. A directory is resolved whole, as for `beacon`: its
+    /// `genesis.ssz` is decoded and its bootnodes file read.
+    ///
+    /// The fork schedule still comes from the beacon nodes. One that differs
+    /// from this network's config is warned about once an epoch, never
+    /// refused, so a fork the network schedules or moves needs the beacon
+    /// nodes upgraded for the client to follow it. Nor does it pick which
+    /// node the client starts from: this binary's copy of the network's
+    /// config may be the stale side.
+    #[arg(long)]
+    pub(crate) network: Option<String>,
 
     /// Signed messages to send to every beacon node at once rather than to
     /// the first that accepts them, comma-separated: `attestations`
@@ -316,6 +342,38 @@ impl ValidatorOptions {
         }
     }
 
+    /// Resolve `--network`, or `None` when it is absent.
+    ///
+    /// Must run before anything reads a preset value: resolving selects the
+    /// network's preset, as it does for `ethlambda beacon`, and the client
+    /// later refuses to start if a read froze one first
+    /// (`require_unread_preset`).
+    pub(crate) fn network(&self) -> eyre::Result<Option<ExpectedNetwork>> {
+        let Some(value) = &self.network else {
+            return Ok(None);
+        };
+        let spec = NetworkSpec::parse(value)?;
+        let source = NetworkSource::resolve(&spec)
+            .wrap_err_with(|| format!("failed to resolve --network {value}"))?;
+        let genesis = source.genesis();
+        // A directory's `config.yaml` may omit `CONFIG_NAME`; the flag's value
+        // then names the network in logs and errors instead of nothing.
+        let name = match source.name() {
+            "" => value.clone(),
+            name => name.to_string(),
+        };
+        Ok(Some(ExpectedNetwork {
+            name,
+            chain: ChainId {
+                genesis: Genesis {
+                    genesis_time: genesis.genesis_time,
+                    genesis_validators_root: genesis.genesis_validators_root,
+                },
+                config: source.config().clone(),
+            },
+        }))
+    }
+
     /// Reject a port clash before anything binds, the way the node's own
     /// options do.
     pub(crate) fn validate_ports(&self) -> eyre::Result<()> {
@@ -380,6 +438,7 @@ async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
     // with `EMFILE` once several signers are busy at once, and every
     // signature those requests were for fails with it.
     crate::fd_limit::raise_fd_limit().wrap_err("failed to raise RLIMIT_NOFILE")?;
+    let network = options.network()?;
     let graffiti = options.graffiti()?;
     // Read once here, so a file every proposal would skip refuses startup,
     // and one read more slowly than a proposal waits for is warned about.
@@ -411,6 +470,7 @@ async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
         self_build_only: options.self_build_only,
         init_slashing_protection: options.init_slashing_protection,
         doppelganger_protection: options.enable_doppelganger_protection,
+        network,
         broadcast: options.broadcast.into_iter().collect(),
         event_stream: !options.disable_event_stream,
     };
@@ -541,6 +601,7 @@ mod tests {
     fn options(graffiti: &str) -> ValidatorOptions {
         ValidatorOptions {
             beacon_nodes: vec!["http://localhost:5052".to_string()],
+            network: None,
             broadcast: Vec::new(),
             validators_dir: PathBuf::from("/tmp/validators"),
             secrets_dir: PathBuf::from("/tmp/secrets"),
@@ -639,6 +700,98 @@ mod tests {
     #[test]
     fn the_gas_limit_does_not_need_builder_proposals() {
         parse(&["--gas-limit", "30000000"]).expect("parses alone");
+    }
+
+    /// Absent, the client takes its chain from the beacon nodes alone, as it
+    /// did before the flag existed.
+    #[test]
+    fn the_network_is_optional() {
+        let options = parse(&[]).expect("parses");
+        assert_eq!(options.network, None);
+        assert_eq!(options.network().expect("nothing to resolve"), None);
+
+        let options = parse(&["--network", "hoodi"]).expect("parses");
+        assert_eq!(options.network.as_deref(), Some("hoodi"));
+    }
+
+    /// A built-in network resolves to the genesis values and config the
+    /// beacon node runs it on, so the two are compared like for like.
+    #[test]
+    fn a_built_in_network_resolves_to_its_genesis_and_config() {
+        let mut options = options("");
+        options.network = Some("hoodi".to_string());
+        let network = options
+            .network()
+            .expect("hoodi resolves")
+            .expect("a network was named");
+
+        assert_eq!(network.name, "hoodi");
+        assert_eq!(network.chain.genesis.genesis_time, 1_742_213_400);
+        assert_eq!(
+            hex::encode(network.chain.genesis.genesis_validators_root.0),
+            "212f13fc4df078b6cb7db228f1c8307566dcecf900867401a92023d7ba99cb5f"
+        );
+        assert_eq!(network.chain.config.preset_base.as_str(), "mainnet");
+        assert_eq!(network.chain.config.slot_duration_ms, 12_000);
+        assert_eq!(
+            network.chain.config.genesis_fork_version,
+            [0x10, 0, 0x09, 0x10]
+        );
+    }
+
+    /// A network directory resolves to its own genesis state and config, and
+    /// is named by its `CONFIG_NAME`.
+    #[test]
+    fn a_network_directory_resolves_to_its_genesis_and_config() {
+        let dir = crate::network::dir::tests::complete_dir();
+        let mut options = options("");
+        options.network = Some(dir.path().display().to_string());
+        let network = options
+            .network()
+            .expect("the directory resolves")
+            .expect("a network was named");
+
+        let state = crate::beacon::mainnet_genesis_state().expect("fixture state");
+        assert_eq!(network.name, "ethlambda-devnet");
+        assert_eq!(network.chain.genesis.genesis_time, state.genesis_time());
+        assert_eq!(
+            network.chain.genesis.genesis_validators_root,
+            state.genesis_validators_root()
+        );
+        assert_eq!(network.chain.config.preset_base.as_str(), "mainnet");
+    }
+
+    /// A directory whose `config.yaml` has no `CONFIG_NAME` is named by the
+    /// flag's value, so logs and errors still say which network it is.
+    #[test]
+    fn a_network_directory_without_a_config_name_is_named_by_its_path() {
+        let dir = crate::network::dir::tests::complete_dir();
+        let config = dir.path().join("config.yaml");
+        let text = std::fs::read_to_string(&config).expect("fixture config");
+        let unnamed: String = text
+            .lines()
+            .filter(|line| !line.starts_with("CONFIG_NAME:"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(unnamed.len(), text.len(), "the fixture names itself");
+        std::fs::write(&config, unnamed).expect("rewrite config");
+
+        let value = dir.path().display().to_string();
+        let mut options = options("");
+        options.network = Some(value.clone());
+        let network = options
+            .network()
+            .expect("the directory resolves")
+            .expect("a network was named");
+        assert_eq!(network.name, value);
+    }
+
+    #[test]
+    fn an_unknown_network_name_is_refused_at_startup() {
+        let mut options = options("");
+        options.network = Some("hodi".to_string());
+        let err = options.network().expect_err("no such network");
+        assert!(err.to_string().contains("unknown network"), "{err}");
     }
 
     /// Without the flag the token stays in `--validators-dir`. With it the path

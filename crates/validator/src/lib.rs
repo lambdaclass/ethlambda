@@ -42,6 +42,7 @@ pub(crate) mod in_flight;
 pub mod keys;
 pub mod metrics;
 pub mod payload_attestation;
+pub mod performance;
 pub mod preferences;
 pub mod proposal;
 pub mod proposer_settings;
@@ -63,9 +64,11 @@ pub use error::{Error, Result};
 /// Run this process on the preset the beacon node reports, before anything
 /// reads one.
 ///
-/// A validator client has no network config of its own: the node's
-/// `/eth/v1/config/spec` is where it learns the chain, `PRESET_BASE`
-/// included. Every container this client decodes, builds or signs is bounded
+/// A validator client runs on the node's `/eth/v1/config/spec`, `PRESET_BASE`
+/// included, even with `--network`: the network it names is only compared
+/// against (see [`chain_check::ExpectedNetwork`]). Resolving that network
+/// selects its preset first, and the reference node is then one on it, so
+/// this selects the same preset again. Every container this client decodes, builds or signs is bounded
 /// by that preset (a sync committee's bits, an attestation's committee bits,
 /// the slots in an epoch), so it is selected here, right after the spec is
 /// fetched and before any duty runs.
@@ -187,6 +190,9 @@ pub struct ValidatorConfig {
     /// has seen it stay silent for a full epoch, and stop if it does not. See
     /// [`doppelganger`].
     pub doppelganger_protection: bool,
+    /// The network `--network` names, or `None` to run on whichever chain the
+    /// first beacon node to answer is on. See [`chain_check::ExpectedNetwork`].
+    pub network: Option<chain_check::ExpectedNetwork>,
     /// `--broadcast`: the signed messages sent to every beacon node rather
     /// than the first that accepts them. See [`beacon_node::fallback`].
     pub broadcast: beacon_node::fallback::Broadcast,
@@ -340,14 +346,15 @@ where
 
     // The chain the client runs on is the first node's that answers, waiting
     // for one while none does; every other node is checked against it, and a
-    // node on another chain is not used. The schedule is the reference's: a
-    // fork another node schedules is taken by the background check once every
+    // node on another chain is not used. With `--network`, only a node on
+    // that network can be the first. The schedule is the reference's: a fork
+    // another node schedules is taken by the background check once every
     // node answering schedules it alike. See `chain_check`.
     let ChainId {
         genesis,
         config: spec,
     } = beacon_node
-        .establish(|reference| {
+        .establish_on(config.network.as_ref(), |reference| {
             // Right after the reference is chosen and before anything reads a
             // preset value, which the epoch below does.
             require_unread_preset()?;
@@ -355,7 +362,9 @@ where
             Ok(chain_check::current_epoch_of(reference))
         })
         .await?;
+    let network = config.network.as_ref().map(|network| network.name.as_str());
     info!(
+        network = network.unwrap_or("any, taken from the beacon nodes"),
         preset = spec.preset_base.as_str(),
         genesis_time = genesis.genesis_time,
         slot_duration_ms = spec.slot_duration_ms,
@@ -428,16 +437,23 @@ where
     }
     let context = Arc::new(context);
 
+    // Each validator's duty outcomes, counted by the services that serve them.
+    let performance = Arc::new(performance::Performance::new(
+        performance::LABELLED_VALIDATORS,
+    ));
     // Every node's stream, read until `run` returns and `_monitor` with it.
     let (_monitor, triggers) =
         head_monitor::start(&config.beacon_nodes, &context, config.event_stream)?;
 
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =
-        AttestationService::new(beacon_node.clone(), context.clone(), protection.clone());
+        AttestationService::new(beacon_node.clone(), context.clone(), protection.clone())
+            .with_performance(performance.clone());
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
-    let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
-    let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());
+    let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone())
+        .with_performance(performance.clone());
+    let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone())
+        .with_performance(performance.clone());
 
     // Unconditional, as Lighthouse does: from gloas the preferences carry the
     // fee recipient of every proposal, builders or not. See the module doc.
@@ -461,7 +477,8 @@ where
     .with_gloas_boost_factor(config.gloas_boost_factor)
     .with_self_build_only(config.self_build_only)
     .with_preferences(preferences.clone())
-    .with_tasks(tasks.clone());
+    .with_tasks(tasks.clone())
+    .with_performance(performance);
     // The proposer preparations' per-slot re-send. The epoch's own send is
     // `refresh_epoch`'s.
     let preparations = Arc::new(Preparations::new(beacon_node.clone(), settings.clone()));
@@ -531,6 +548,7 @@ where
         genesis,
         clock.clone(),
         context.clone(),
+        config.network.clone(),
         shutdown.clone(),
     ));
     let mut keymanager = None;
