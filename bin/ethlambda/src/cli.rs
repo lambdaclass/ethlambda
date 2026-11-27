@@ -410,8 +410,13 @@ pub(crate) struct MainnetOptions {
     ///
     /// For an external block builder reading this node's event stream (the
     /// way ethereum-package's buildoor does), which builds for every
-    /// proposer. Lighthouse's `--always-prepare-payload`. The attributes
-    /// are computed only while something is subscribed to `/eth/v1/events`.
+    /// proposer. Lighthouse's `--always-prepare-payload`. With
+    /// `--execution-endpoint`, it also has the execution client start a
+    /// payload build for every slot, a third of a slot ahead, whether or not
+    /// anything is subscribed to `/eth/v1/events`. For a proposer no
+    /// validator client registered, that build pays the fee recipient of the
+    /// proposer's signed preferences on gloas, else `--fallback-fee-recipient`,
+    /// else the zero address.
     #[arg(long)]
     pub(crate) always_prepare_payload: bool,
 

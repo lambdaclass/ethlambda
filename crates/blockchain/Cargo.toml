@@ -26,7 +26,7 @@ libssz.workspace = true
 
 spawned-concurrency.workspace = true
 
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 
 serde.workspace = true
@@ -37,7 +37,8 @@ hex.workspace = true
 
 [dev-dependencies]
 # `test_state`'s validator keys, so a test can sign a block that has to pass
-# the proposer-signature precheck before its blobs are asked for.
+# the proposer-signature precheck before it may wait or have its blobs asked
+# for.
 ethlambda-state-transition = { workspace = true, features = ["test-utils"] }
 hex = { workspace = true }
 libssz.workspace = true
