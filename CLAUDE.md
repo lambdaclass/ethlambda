@@ -1090,7 +1090,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   (every fork's cases for topics it has no validator for, cases from forks a
   validated topic's rules do not cover per `validated_forks`, gloas's
   operation vectors among them, and the vectors in `SKIPPED`, which assume a
-  bad-block cache), and the `heze` fixture tree. `heze` does
+  bad-block cache), cases generated with BLS ignored (`bls_setting: 2`, every
+  `fast_confirmation` case at v1.7.0-beta.5; see the signature-checks bullet
+  above), and the `heze` fixture tree. `heze` does
   not parse as a `ForkName`, so `collect` would skip it silently;
   `UNMODELED_FORKS` names it and
   `fixture_forks/every_directory_is_accounted_for` fails on any fork directory

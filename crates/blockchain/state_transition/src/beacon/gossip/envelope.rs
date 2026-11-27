@@ -123,9 +123,11 @@ pub fn cheap_checks(
 /// ancestor in the store is full. A pre-gloas ancestor counts as full (the
 /// fulu-to-gloas boundary rule), its payload the one in its own body.
 ///
-/// Reads each block's recorded payload link where `on_block` left one, so the
-/// ordinary walk (a full parent, or one empty step before a full one) decodes
-/// only the full ancestor whose payload it needs.
+/// Reads each block's recorded payload link where `on_block` left one, so
+/// which parent is full is known without a decode. A full parent costs one
+/// decode (the parent, for a pre-gloas payload) and one envelope read; each
+/// empty step before it costs one more, since `Store::block_entry` decodes
+/// the whole beacon block to name its parent.
 fn parent_payload_gas_limit(
     store: &Store,
     block_root: Root,
