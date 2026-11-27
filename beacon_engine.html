@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-81a3a205.js";
+            window.path_to_searchindex_js = "searchindex-995fa435.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -277,7 +277,10 @@ builds the request on the actor (copying only the payload, never the block),
 sends it from a spawned task so the HTTP exchange keeps progressing, and runs
 <code>fork_choice::speculate_transition</code> on the actor meanwhile: the block’s state
 transition against its parent’s post-state, with the engine assumed valid. The
-import then costs <code>max(engine wait, transition)</code> instead of their sum.</p>
+import then costs <code>max(engine wait, transition)</code> instead of their sum. Every
+block’s transition is computed this way, ahead of <code>on_block</code>: one with no
+request to send (no execution client, pre-merge, gloas) runs it on its own,
+and its <code>PayloadValidity::NotRequired</code> verdict always lets it stand in.</p>
 <p>That needs the spawned task to run on another thread while the actor computes,
 and in the node it does: the chain actor runs on <code>Backend::Thread</code>, whose thread
 blocks on a multi-thread tokio runtime of its own, and the task runs on that
@@ -291,22 +294,26 @@ transition reads nothing else off the store except content-keyed caches. What
 keeps it harmless:</p>
 <ul>
 <li>A block <code>on_block</code> would refuse before its own transition gets no
-speculation: one already imported, one from the future, one at or before the
-finalized epoch’s first slot, or one whose parent is off the finalized chain.
-<code>speculate_transition</code> runs the same guard function <code>on_block</code> does
-(<code>check_timely_and_on_the_finalized_chain</code>) before transitioning anything. A
-block fetched over req/resp carries no gossip-checked signature, and the
-transition checks the signature only after advancing the parent’s state to
-the block’s slot, so without this such a block could make the actor run that
-advance where <code>on_block</code> would have refused it for free.</li>
+speculation: one already imported, a gloas block whose parent’s full payload
+is not verified, one from the future, one at or before the finalized epoch’s
+first slot, or one whose parent is off the finalized chain.
+<code>speculate_transition</code> runs the same guard functions <code>on_block</code> does
+(<code>check_parent_payload</code>, <code>check_timely_and_on_the_finalized_chain</code>) before
+transitioning anything. A block fetched over req/resp carries no
+gossip-checked signature, and the transition checks the signature only after
+advancing the parent’s state to the block’s slot, so without this such a
+block could make the actor run that advance where <code>on_block</code> would have
+refused it for free.</li>
 <li>The result is a local value (<code>SpeculativeTransition</code>). The block, its
 post-state and its fork choice records reach neither the store nor the network
 until <code>on_block_speculative</code> accepts it, and that runs every check <code>on_block</code>
-makes, unchanged and in the same order. The one write computing it can make is
-an epoch-crossing block’s boundary balances, a cache entry keyed by the
-checkpoint and built from the parent’s state alone, so it is the entry
-<code>on_block</code>’s own transition would write and is right whatever becomes of the
-block.</li>
+makes, unchanged and in the same order. Computing it can write two cache
+entries, both keyed by a checkpoint: an epoch-crossing block’s boundary
+balances, built from the parent’s state alone, and an epoch’s first block’s
+own checkpoint balances, built from its post-state. Both are entries
+<code>on_block</code> would write, and right whatever becomes of the block; for one that
+never imports (an <code>INVALID</code> verdict) the second is an entry nothing reads, in
+a bounded cache.</li>
 <li>The argument above rests on the actor handling one message at a time, which
 no type enforces. Builds with debug assertions (the test suite’s
 <code>release-fast</code> among them) therefore run the transition again whenever a
@@ -333,12 +340,14 @@ storage error there skips the speculation, and <code>on_block</code> meets the s
 on its own lookup.</li>
 </ul>
 <p>The overlap shows in the import timing tree: the transition that ran during the
-round trip is reported under <code>stf</code> (used or discarded), and <code>engine</code> reports only
-what the question cost beyond it: building the request (a copy of the
-payload) and the wait that was left once the transition finished, the request’s
-construction alone when the answer was already in. Without an execution client,
-and for forks that have no request to send (pre-merge, gloas), nothing overlaps,
-<code>engine</code> is zero, and the path is the old one. How long the execution client itself took to answer is
+round trip is reported under <code>cl</code> (used or discarded), <code>on_block</code> after the
+verdict under <code>store</code>, and <code>el_wait</code> reports only what the question cost beyond
+the transition: building the request (a copy of the payload) and the wait that
+was left once the transition finished, the request’s construction alone when
+the answer was already in. Without an execution client, and for forks that have
+no request to send (pre-merge, gloas), the transition still runs ahead of
+<code>on_block</code>, on its own, and is reported under <code>cl</code>; nothing overlaps, and
+<code>el_wait</code> is zero. How long the execution client itself took to answer is
 <code>lean_engine_new_payload_seconds{outcome}</code>, timed around every <code>engine_newPayload*</code>
 request this module sends (<code>timed_new_payload</code>), a gloas envelope’s included.</p>
 <h2 id="the-verdicts"><a class="header" href="#the-verdicts">The verdicts</a></h2>

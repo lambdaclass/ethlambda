@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-81a3a205.js";
+            window.path_to_searchindex_js = "searchindex-995fa435.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -436,26 +436,29 @@ workload reads its own histogram. A replayed block reports under
 <code>source="replay"</code>, a label no node ever writes, so it reaches the histogram
 without passing for a gossip or sync arrival. The phases are the
 <code>BLOCK_IMPORT_PHASES</code> labels: <code>decode</code>, <code>queue</code>, <code>defer</code>, <code>admit</code>, <code>guards</code>,
-<code>preamble</code>, <code>parent_wait</code>, <code>cascade_wait</code>, <code>da_check</code>, <code>columns_wait</code>, <code>engine</code>,
-<code>verify_struct</code>, <code>verify_crypto</code>, <code>stf</code>, <code>writer_wait</code>, <code>db_write</code>, <code>fc_head</code>,
-<code>block_atts</code>; plus the per-arrival sections that are not spans around the others, <code>prune</code>,
+<code>preamble</code>, <code>parent_wait</code>, <code>cascade_wait</code>, <code>da_check</code>, <code>columns_wait</code>, <code>cl</code>,
+<code>el_wait</code>, <code>verify_struct</code>, <code>verify_crypto</code>, <code>stf</code>, <code>store</code>, <code>writer_wait</code>,
+<code>db_write</code>, <code>fc_head</code>, <code>block_atts</code>; plus the per-arrival sections that are not spans around the others, <code>prune</code>,
 <code>get_head</code> and <code>fcu</code>, since each <code>import_block</code> call is one arrival. <code>get_head</code>
 is where the head recomputation after every import is charged.</p>
-<p>On beacon, <code>writer_wait</code> is the importer’s blocking hand-off of the post-state
-to the storage crate’s background writer, which waits while the writer’s queue
-is full. It happens inside <code>fork_choice::on_block</code>, so <code>stf</code> excludes it: <code>stf</code>
-is state-transition work and the two phases do not overlap. When blocks import
-faster than the writer persists them, the wait shows up here rather than in
-<code>stf</code>.</p>
-<p>With an execution client the beacon <code>stf</code> row also includes a state
-transition that ran while <code>engine_newPayload</code> was in flight, and <code>engine</code> then
-reports only what the request cost beyond it: building it, and the wait left
-after the transition, which is nothing when the answer was already in. The
-execution client’s own time is <code>lean_engine_new_payload_seconds</code>. A replay has
-no client, so none of this applies to its numbers.</p>
-<h3 id="where-stf-goes-the-reports-stf_phases-class-and-resource-fields"><a class="header" href="#where-stf-goes-the-reports-stf_phases-class-and-resource-fields">Where <code>stf</code> goes: the report’s <code>stf_phases</code>, <code>class</code> and resource fields</a></h3>
-<p><code>stf</code> is one number for a block’s whole state transition, and on a mainnet
-block it is most of the import. Each sample therefore also carries what it was
+<p>A beacon block’s state transition is two phases: <code>cl</code>, the transition,
+computed ahead of <code>fork_choice::on_block</code>, and <code>store</code>, that call, which writes
+the block and its post-state and does the fork-choice bookkeeping. (Before
+lambdaclass/ethlambda#917 the two were one <code>stf</code> phase; lean’s <code>stf</code> is its own
+transition.) <code>writer_wait</code> is the importer’s blocking hand-off of the
+post-state to the storage crate’s background writer, which waits while the
+writer’s queue is full. It happens inside <code>fork_choice::on_block</code>, so <code>store</code>
+excludes it and the two phases do not overlap. When blocks import faster than
+the writer persists them, the wait shows up here rather than in <code>store</code>.</p>
+<p>With an execution client <code>cl</code> runs while <code>engine_newPayload</code> is in flight, and
+<code>el_wait</code> then reports only what the request cost beyond it: building it, and
+the wait left after the transition, which is nothing when the answer was
+already in. The execution client’s own time is
+<code>lean_engine_new_payload_seconds</code>. A replay has no client, so none of this
+applies to its numbers, and its <code>el_wait</code> is zero.</p>
+<h3 id="where-the-transition-goes-the-reports-stf_phases-class-and-resource-fields"><a class="header" href="#where-the-transition-goes-the-reports-stf_phases-class-and-resource-fields">Where the transition goes: the report’s <code>stf_phases</code>, <code>class</code> and resource fields</a></h3>
+<p><code>cl</code> plus <code>store</code> is a block’s whole state transition, and on a mainnet block
+it is most of the import. Each sample therefore also carries what it was
 made of, so a baseline says which step to attack and for which kind of block.
 The report’s <code>schema_version</code> is 2; version 1 had none of what follows, and every
 field below that a sample or the summary can lack is <strong>absent, not zero</strong>.</p>
@@ -482,9 +485,12 @@ same reading honest on any binary that does.</p>
 <code>process_epoch</code> inline: nothing has precomputed it (the report’s
 <code>caches.epoch_precompute</code> shows the misses). On a live follower a precompute hit
 takes that cost off the import path, so the replay is the upper bound.</p>
-<p><strong><code>stf_unattributed_seconds</code></strong> is <code>stf</code> minus the sum of <code>stf_phases</code>: the part
-of the transition no step covers, such as cloning the parent’s state and
-building the epoch-boundary balances. Absent when <code>stf</code> did not run.</p>
+<p><strong><code>stf_unattributed_seconds</code></strong> is <code>cl</code> plus <code>store</code> minus the sum of
+<code>stf_phases</code>: the part of the transition no step covers, such as cloning the
+parent’s state, building the checkpoint balances, the target-balance scan and
+<code>on_block</code>’s store writes. Absent when neither ran. A debug-assertions build
+runs the transition a second time inside <code>store</code>, as a check, and its steps
+are counted too.</p>
 <p><strong><code>class</code></strong> is what the block’s <code>process_slots</code> had to do, decided from the
 block’s slot and its parent’s (<code>parent_slot</code>, also in the sample):</p>
 <div class="table-wrapper">
@@ -535,7 +541,7 @@ since close to twenty more columns would not fit a terminal.</p>
 <h3 id="what-is-excluded-and-why"><a class="header" href="#what-is-excluded-and-why">What is excluded, and why</a></h3>
 <p>Replay runs nothing that a corpus already answers for:</p>
 <ul>
-<li><strong>No execution client</strong>, so <code>engine</code> reports a zero section with nothing to
+<li><strong>No execution client</strong>, so <code>el_wait</code> reports a zero section with nothing to
 call and <code>fcu</code> never runs. On a live follower paired with one, the
 <code>engine_newPayload</code> round trip was 31ms p50, about 0.5% of an import, before
 the state transition was overlapped with it; a replay’s numbers are complete

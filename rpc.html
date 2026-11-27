@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-81a3a205.js";
+            window.path_to_searchindex_js = "searchindex-995fa435.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -925,8 +925,15 @@ which is before the chain actor has imported it; a block still unknown after
 that is a <code>400</code> (<code>unknown block</code>). The envelope must fulfill the block’s bid
 (builder index and block hash), the blobs must match the bid’s commitments, the
 signature must verify under <code>DOMAIN_BEACON_BUILDER</code> against the block’s
-post-state, and every data column built from the blobs must verify against the
-commitments and cell proofs; any failure is a <code>400</code>. A success is <code>200</code> once the
+post-state, and every data column built from the blobs must carry one cell and
+one proof per commitment; when the blobs came in the body, its cell proofs must
+also verify against the commitments. Any failure is a <code>400</code>. The cached blobs’
+proofs are not verified here: they came from this node’s own execution client
+(<code>engine_getPayload</code>’s blobs bundle), which checked them when it admitted their
+blob transactions, and Lighthouse and Prysm publish their own columns unverified
+too. They are verified once, after gossip: this node’s own copy of each column
+goes through p2p’s chain checks, KZG proofs included, before it is stored
+(<code>column_checks.rs</code>). A success is <code>200</code> once the
 envelope and all <code>NUMBER_OF_COLUMNS</code> gloas data column sidecars are handed to
 P2P, which gossips them together. A node that does not subscribe to a column’s
 subnet publishes through gossipsub fanout.</p>
