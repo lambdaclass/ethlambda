@@ -17,6 +17,7 @@ use crate::error::Result;
 use crate::keys::ValidatorStore;
 use crate::signing::{SigningContext, sign_all};
 use crate::slashing_protection::SharedProtection;
+use crate::slot_clock::SlotClock;
 
 /// What one slot's attestation duty produced.
 ///
@@ -55,6 +56,9 @@ pub struct AttestationService<B> {
     /// What every validator has signed, shared with the proposal service and
     /// the keymanager. See [`crate::slashing_protection`].
     protection: SharedProtection,
+    /// The slot clock each accepted vote's delay is measured from, when the
+    /// client gave one (see [`Self::with_clock`]).
+    clock: Option<SlotClock>,
 }
 
 impl<B: BeaconNodeApi> AttestationService<B> {
@@ -67,7 +71,15 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             beacon_node,
             context,
             protection,
+            clock: None,
         }
+    }
+
+    /// Measure each accepted vote's delay from the start of its slot
+    /// (`ethlambda_validator_attestation_vote_delay_seconds`).
+    pub fn with_clock(mut self, clock: SlotClock) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     /// Sign and publish every duty held for `slot`.
@@ -75,7 +87,9 @@ impl<B: BeaconNodeApi> AttestationService<B> {
     /// One `attestation_data` fetch is shared by every validator attesting at
     /// this slot, and every signature goes out in one submission: the data does
     /// not depend on the validator, and the beacon node's pool endpoint takes a
-    /// list.
+    /// list. From PQ the votes go out in several submissions instead, each as
+    /// soon as it is signed, since a leanXMSS signature is far too slow to hold
+    /// the batch for (see `publish_pq_as_signed`).
     ///
     /// Returns how many attestations were published, and the data they were
     /// signed over, which this slot's aggregation duty needs.
@@ -353,6 +367,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         }
         info!(%slot, count = published, "Published attestations");
         crate::metrics::inc_attestations_published(published as u64);
+        self.observe_vote_delays(slot, published);
         Ok(Attested {
             published,
             refused,
@@ -446,7 +461,10 @@ impl<B: BeaconNodeApi> AttestationService<B> {
                     });
                 }
                 Some(answer) = requests_out.next(), if !requests_out.is_empty() => match answer {
-                    Ok(count) => published += count,
+                    Ok(count) => {
+                        published += count;
+                        self.observe_vote_delays(slot, count);
+                    }
                     Err(err) => {
                         warn!(%slot, %err, "Failed to publish some of this slot's attestations");
                         failure = Some(err);
@@ -488,6 +506,18 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             refused,
             data: Some(data),
         })
+    }
+
+    /// One delay observation per vote the node accepted just now, from the
+    /// start of `slot`, when the service has a clock.
+    fn observe_vote_delays(&self, slot: Slot, votes: usize) {
+        let Some(clock) = &self.clock else {
+            return;
+        };
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(clock.start_of(slot))
+            .unwrap_or_default();
+        crate::metrics::observe_vote_publication_delay(elapsed.as_secs_f64(), votes);
     }
 }
 
@@ -729,6 +759,7 @@ mod tests {
             beacon_node: node_again.clone(),
             context: context(),
             protection: service.protection,
+            clock: None,
         };
         let second = service
             .attest(101, &[duty(&pubkey_hex, 1337, 101, 3)], &store)

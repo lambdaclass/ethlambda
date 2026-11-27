@@ -435,16 +435,24 @@ asks for again.
 - **Proposing**: the client sends its VRF proof for the slot (the RANDAO
   reveal) to `POST /eth/v1/validator/pq_blocks/{slot}`, signs the block and
   the envelope revealing its self-built payload at their leaves, and publishes
-  both. The beacon node builds the block while the execution client builds
-  the payload, and meanwhile packs attestations: it picks, from the
-  aggregates it validated, what `process_attestation` accepts at the slot and
-  credits someone new, as `compute_on_chain_aggregate` shapes them, and merges
-  their proofs in `process_stark`'s order with leanVM. A merge must end
-  three quarters of the way to the attestation deadline (Lighthouse's bound).
-  One child needs no merge; when more do not finish in time, the block packs
-  the most valuable single-committee attestation alone, whose proof is the
-  block's as it is. On the devnet's VM a two-child merge takes about four
-  seconds, for Lighthouse too, so blocks there carry one attestation each.
+  both. The block's attestations are packed a third of a slot ahead, when
+  the chain actor starts the slot's payload build for a proposer a validator
+  client registered here (`ethlambda_blockchain::pq_attestation_packing`):
+  it picks, from the aggregates it validated, what `process_attestation`
+  accepts at the slot and credits someone new, as `compute_on_chain_aggregate`
+  shapes them, and merges their proofs in `process_stark`'s order with
+  leanVM. A block at `N` packs aggregates from `N - 2` and earlier, all held
+  by then. Production takes that result when it is for the head it builds on
+  and the pool still holds what it was packed from, and otherwise packs
+  while the execution client builds the payload, as it always did. A merge
+  must end three quarters of the way to the attestation deadline
+  (Lighthouse's bound). One child needs no merge; when more do not finish in
+  time, the block packs the most valuable single-committee attestation
+  alone, whose proof is the block's as it is. A two-child merge took about
+  0.6 s on pq-devnet-0's sidecar and up to about 2 s in process in
+  pq-devnet-1's first hours (about four seconds on the local devnet's VM,
+  for Lighthouse too), which is what packing ahead takes off every block's
+  path.
   A payload with blobs keeps them on the node that built it, and the
   envelope's publication builds the data columns from them and gossips them
   with it (PQ keeps gloas's sidecar).
@@ -659,10 +667,6 @@ generated.
 - The ENR's `attnets` keeps the pre-PQ backbone across the PQ boundary: ethrex's
   `DiscoveryServer` cannot replace the served record at runtime (the same gap
   as its `eth2` entry, see `CLAUDE.md`).
-- Merging ahead of a proposal: the aggregates a slot-`N` block may pack are
-  all known a slot earlier, so a node could merge during slot `N - 1` for a
-  proposer it serves, where today a slow merge costs every attestation but
-  one.
 - Interop at pq-devnet-1's spec (`4c296784`): its genesis and key
   derivation are still TBD in the devnet notes, and until ethPandaOps'
   generator and the other clients follow `b5d422b2`'s VRF rule and

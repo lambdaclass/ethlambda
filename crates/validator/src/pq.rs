@@ -955,8 +955,21 @@ pub struct SignRequest {
 /// Every leaf the batch spends is recorded with one write and one flush
 /// before any of its signatures exists, then the keys sign in parallel on
 /// rayon's global pool (leanVM signs on one thread, and different keys share
-/// nothing). One signature recomputes a `2^8`-leaf subtree of its bottom
-/// tree, a 256th of building the tree: roughly 10 ms on a core.
+/// nothing).
+///
+/// # What a signature costs
+///
+/// About 0.3 s of one core on the devnet's 8-vCPU hosts, and it varies a lot
+/// from one signature to the next. Most of it is not the Merkle path (a
+/// `2^8`-leaf subtree, a 256th of building the bottom tree): leanVM grinds the
+/// one-time signature's randomizer until the message digest is a codeword,
+/// which takes about a million Keccak permutations on average (a digest is a
+/// codeword with probability `2^-12` times that of 58 two-bit digits summing
+/// to 106, about `9.5e-7`). The number of trials is geometric, so one
+/// signature in ten takes more than 2.3 times the mean and one in a hundred
+/// more than 4.6 times. A batch is as slow as its slowest signature: a duty
+/// whose messages are due early hands them on one by one with [`sign_each`]
+/// rather than waiting for this.
 ///
 /// Blocking, for the batch's slowest signature: [`sign_all`] runs it off
 /// the async runtime.

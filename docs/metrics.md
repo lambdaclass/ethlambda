@@ -417,6 +417,8 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.
 | `lean_beacon_gossip_validation_total` | Counter | Verdicts, by topic kind, outcome and reason | On every verdict reported to gossipsub | kind, outcome=accept,queue,ignore,reject, reason | |
 | `lean_beacon_gossip_validation_seconds` | Histogram | Time from a message's arrival to its verdict | On every verdict reported to gossipsub | kind | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8 |
 | `lean_beacon_gossip_verdict_expired_total` | Counter | Verdicts that arrived after gossipsub evicted the message, so an Accept propagated nothing | When `report_message_validation_result` returns `false` | kind | |
+| `lean_beacon_gossip_parked_votes_total` | Counter | Subnet attestations and aggregates whose verdict waited for their block's post-state, by what happened to them | When a vote is parked, refused by the full queue, checked again, or past its deadline | kind, result=parked,full,rechecked,expired | |
+| `lean_beacon_gossip_parked_votes` | Gauge | Votes parked right now | On every park, release and sweep | | |
 
 `kind` is the topic kind, with every `data_column_sidecar_{subnet}` sharing the
 label `data_column_sidecar`, every `beacon_attestation_{subnet_id}` sharing
@@ -439,10 +441,18 @@ envelope verifies. When the execution client has found that parent's payload
 invalid, nothing will verify it, and the block is ignored instead
 (`parent_payload_invalid`). The aggregate, attestation,
 `payload_attestation_message`, `execution_payload_bid` and `proposer_preferences`
-topics never answer `queue`, since the vote
-block's post-state is either cached or it is not
-(`IgnoreReason::UnknownBlock`/`StateUnavailable`), with nothing to hold the
-message for. **`verdict_expired_total` should stay at
+topics never answer `queue`. An aggregate or a subnet attestation whose vote
+block is not stored yet, or has no cached post-state yet
+(`IgnoreReason::UnknownBlock`/`StateUnavailable`), is held anyway, though not
+as `queue`: its verdict is withheld while it waits for the block's import, then
+its checks run again, on a permit pool of their own (`pool="recheck"`)
+(`lean_beacon_gossip_parked_votes_total`, and
+`crates/net/p2p/src/beacon/parked_votes.rs`). A vote whose block was imported
+but whose state has left the cache is checked once more at once and not held. Only a vote still waiting at its
+deadline, 2.5 s after it arrived, or one the full queue refused, is counted
+under those two reasons. Its time to verdict includes the wait, so
+`lean_beacon_gossip_validation_seconds` for these two kinds reads up to that
+deadline. **`verdict_expired_total` should stay at
 zero**: a rising count means validation is too slow for gossipsub's message
 cache.
 
@@ -501,7 +511,7 @@ ethlambda-specific, not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
-| `lean_beacon_validation_permits_in_use` | Gauge | Permits held per pool: blocking tasks queued or running | A permit is acquired / released | pool=gossip,attestation,builder,sync,column_check | |
+| `lean_beacon_validation_permits_in_use` | Gauge | Permits held per pool: blocking tasks queued or running | A permit is acquired / released | pool=gossip,attestation,builder,sync,column_check,recheck | |
 | `lean_beacon_validation_permit_exhausted_total` | Counter | Objects reported `Ignore(Overloaded)` because their pool had no free permit | On each failed `try_acquire` | pool=gossip,attestation,builder,sync | |
 | `lean_beacon_validation_queue_seconds` | Histogram | Time from `spawn_blocking` being called to the closure starting (tokio blocking-pool queueing) | When the closure starts | kind | 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 |
 | `lean_beacon_validation_run_seconds` | Histogram | Run time of the closure itself | When the closure ends (panic included) | kind | same as above |
@@ -946,7 +956,8 @@ and absent is not the same as zero.
 | `ethlambda_validator_remote_signer_request_duration_seconds` | Histogram | Time one signing request to a remote signer took, from sending it to its answer or failure, not counting the wait for one of the signer's 64 request slots. The number to watch for a slow signer; empty when every key is local |
 | `ethlambda_validator_slashing_protection_write_seconds` | Histogram | Time to durably write the slashing-protection record, once per slot's attestation batch and once per block, before signing. Milliseconds on a local disk; worth an alert above about a second, since the duty waits for it and a write held past 3 s is refused |
 | `ethlambda_validator_slashing_protection_write_failures_total` | Counter | Slashing-protection writes that failed, each leaving its messages unsigned. Should read zero; anything else points at the disk under `--validators-dir` |
-| `ethlambda_validator_publication_delay_seconds` | Histogram | Slot start to attestations accepted. The headline health number: it should sit shortly after the slot's block arrives, and no later than just past the one-third-slot duty offset, where it sits for a slot whose block came late or not at all, or with `--disable-event-stream` |
+| `ethlambda_validator_publication_delay_seconds` | Histogram | Slot start to attestations accepted. The headline health number: it should sit shortly after the slot's block arrives, and no later than just past the one-third-slot duty offset, where it sits for a slot whose block came late or not at all, or with `--disable-event-stream`. From PQ, where a slot's votes go out as each is signed, it is the last vote's |
+| `ethlambda_validator_attestation_vote_delay_seconds` | Histogram | Slot start to each attestation accepted, one observation per vote. Before PQ every vote of a slot goes out together, so it matches `publication_delay_seconds` weighted by votes. From PQ a leanXMSS signature costs about 0.3 s of a core and votes go out as they are signed, spread over a second or more, and this one's median is the median vote's, the number Dora's attester view compares clients by |
 | `ethlambda_validator_duty_triggers_total` | Counter | What started each slot's duty, once per duty per slot. `duty`: `attestation`, `sync_committee_message`, `payload_attestation`. `trigger`: `event` (a beacon node's `head` for the slot, or its `execution_payload_available` for the vote, borne out by the node's answer), `deadline` (no event for the slot before the offset: every slot with `--disable-event-stream` or the streams down) or `mismatch` (an event the node's answer did not bear out, or had not answered by the offset, so the duty waited for its offset after all). A steady `mismatch` share points at beacon nodes that disagree with each other, or payloads announced and not seen present |
 | `ethlambda_validator_event_streams_open` | Gauge | Beacon node event streams open: one per node for `head`, and one more per node for `execution_payload_available` on a network that schedules gloas. A stream missing from that count costs its node's early starts, not a duty |
 

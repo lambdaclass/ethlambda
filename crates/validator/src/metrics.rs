@@ -379,7 +379,20 @@ static SLASHING_PROTECTION_WRITE_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock
 static PUBLICATION_DELAY_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "ethlambda_validator_publication_delay_seconds",
-        "Time from slot start to this slot's attestations being accepted by a beacon node",
+        "Time from slot start to this slot's attestations being accepted by a beacon node (the last of them, from PQ on)",
+        vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0, 8.0, 12.0]
+    )
+    .unwrap()
+});
+
+/// One observation per vote, where [`PUBLICATION_DELAY_SECONDS`] has one per
+/// slot. The two differ from PQ on, where a slot's votes go out over a second
+/// or more as each is signed: this one's median is the slot's median vote,
+/// the number block explorers compare clients by.
+static VOTE_PUBLICATION_DELAY_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "ethlambda_validator_attestation_vote_delay_seconds",
+        "Time from slot start to each attestation being accepted by a beacon node, one observation per vote",
         vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0, 8.0, 12.0]
     )
     .unwrap()
@@ -524,6 +537,7 @@ pub fn init() {
     LazyLock::force(&SIGNING_DURATION_SECONDS);
     LazyLock::force(&REMOTE_SIGNER_REQUEST_DURATION_SECONDS);
     LazyLock::force(&PUBLICATION_DELAY_SECONDS);
+    LazyLock::force(&VOTE_PUBLICATION_DELAY_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_SECONDS);
     LazyLock::force(&SLASHING_PROTECTION_WRITE_FAILURES_TOTAL);
     // A labelled series exists only once a label pair is touched.
@@ -734,9 +748,17 @@ impl Drop for OpenEventStream {
     }
 }
 
-/// Record how long after a slot's start its attestations were accepted.
+/// Record how long after a slot's start its attestations were accepted: the
+/// last of them, from PQ on, where they go out as they are signed.
 pub fn observe_publication_delay(seconds: f64) {
     PUBLICATION_DELAY_SECONDS.observe(seconds);
+}
+
+/// Record `votes` attestations accepted `seconds` after their slot started.
+pub fn observe_vote_publication_delay(seconds: f64, votes: usize) {
+    for _ in 0..votes {
+        VOTE_PUBLICATION_DELAY_SECONDS.observe(seconds);
+    }
 }
 
 /// A Prometheus endpoint for this process.

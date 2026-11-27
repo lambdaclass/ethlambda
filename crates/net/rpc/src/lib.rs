@@ -293,6 +293,9 @@ pub struct BeaconApiHandles {
     /// The payload builds the chain actor started ahead of their slots, which
     /// block production collects instead of starting its own.
     pub prepared_payloads: ethlambda_blockchain::PreparedPayloads,
+    /// The attestations of the next PQ block, which the chain actor packs and
+    /// merges ahead of the slot and PQ block production collects.
+    pub prepared_pq_attestations: ethlambda_blockchain::PreparedPqAttestations,
     /// The columns this node custodies: what `payload_attestation_data` checks
     /// a block's blob availability against, and what block production tells
     /// the execution client it samples for when asking it to build a gloas
@@ -352,6 +355,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.custody_columns))
         .layer(Extension(handles.fee_recipients))
         .layer(Extension(handles.prepared_payloads))
+        .layer(Extension(handles.prepared_pq_attestations))
         .layer(Extension(handles.engine))
         .layer(Extension(handles.events))
         .layer(Extension(handles.identity))

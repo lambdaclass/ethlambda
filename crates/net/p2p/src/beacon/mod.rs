@@ -22,6 +22,7 @@ pub mod envelope_checks;
 pub mod fork_schedule;
 pub mod handler;
 pub mod messages;
+pub mod parked_votes;
 pub mod pq;
 pub mod protocols;
 pub mod scoring;

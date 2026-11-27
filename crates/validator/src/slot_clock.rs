@@ -665,6 +665,22 @@ mod tests {
         assert_eq!(now + delay, clock.start_of(0));
     }
 
+    /// A PQ slot is one from the PQ fork epoch on, and gloas too.
+    #[test]
+    fn pq_starts_at_its_fork_epoch() {
+        let config = Config::mainnet()
+            .with_fork_epoch(ForkName::Gloas, 0)
+            .with_fork_epoch(ForkName::Eip8483, 0)
+            .with_fork_epoch(ForkName::Pq, 2);
+        let clock = SlotClock::from_config(GENESIS, &config);
+        let first_pq = 2 * slots_per_epoch();
+        assert!(!clock.is_pq(first_pq - 1));
+        assert!(clock.is_pq(first_pq));
+        assert!(clock.is_gloas(first_pq));
+        let without_pq = SlotClock::from_config(GENESIS, &Config::mainnet());
+        assert!(!without_pq.is_pq(first_pq));
+    }
+
     /// Slots before the gloas epoch keep the pre-gloas offsets and slots from
     /// it on take the gloas ones, on both sides of the boundary.
     #[test]
