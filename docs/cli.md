@@ -194,9 +194,12 @@ numbers are accepted quoted or bare, and unrecognised keys (on a current
 config, the heze schedule this build does not claim) are dropped
 with one warning line naming each. Its `PRESET_BASE` (`mainnet` or `minimal`)
 selects the preset the process runs, before anything is decoded against it; a
-missing or unknown one is a hard startup error. The validator client has no
-`--network` and adopts the preset its beacon node's `/eth/v1/config/spec`
-reports. Sepolia's config schedules gloas, which this build follows, so
+missing or unknown one is a hard startup error. The validator client adopts
+the preset its beacon node's `/eth/v1/config/spec` reports. With its optional
+`--network`, resolving the network selects that network's `PRESET_BASE`
+first, and only a node reporting the same preset can be the one the client
+adopts it from (see [the chain check](#several-beacon-nodes-the-chain-check)).
+Sepolia's config schedules gloas, which this build follows, so
 it parses and runs like any other fork. A scheduled fork the build claims but
 does not follow gets a separate, explicit warning at startup, since the chain
 follower would stop tracking the chain there regardless of what parsed
@@ -383,8 +386,27 @@ said, and asks them all again every 2 seconds, as Lighthouse's validator client
 does, rather than exiting: a client started beside its beacon node otherwise
 exits before the node's API is up. Only when every node answered, each with a
 preset this client cannot run on or a spec it cannot read, does startup fail; a
-body that is not JSON at all (a proxy's page while the node boots) is waited out. A
-response without the slot
+body that is not JSON at all (a proxy's page while the node boots) is waited out.
+
+With `--network`, the reference must also be on the network it names, compared
+on the fields that never move over a network's life: `PRESET_BASE`,
+`genesis_time`, `genesis_validators_root`, the slot duration and
+`GENESIS_FORK_VERSION`. A node that differs in one is never the reference and is
+not used, and a node on another network counts as a final answer: when every
+node answered, each on another network, on a preset this client cannot run on,
+or with a spec it cannot read, startup fails naming why each is off; otherwise it
+waits for one on the network. The fork schedule is not held to the network's,
+since the beacon nodes or the network's config (this binary's, for a built-in
+network; the directory's `config.yaml` otherwise) may predate a change to it:
+the client still follows the nodes' schedule (below), and warns once an epoch,
+naming both values, when it differs from the network's config. Nor does the
+network's schedule pick the reference among nodes on the network that disagree
+on a fork: list order does, as without `--network`, since preferring the node
+that matches a stale config would follow the stale schedule and drop the
+upgraded node at the old epoch. Without `--network` the first
+node to answer sets the chain, whatever it is.
+
+A response without the slot
 duration, `GENESIS_FORK_VERSION`, or the epoch and version of any fork from
 altair to fulu is refused rather than filled in from mainnet; only gloas may be
 absent, meaning unscheduled.
@@ -447,6 +469,7 @@ slot's end, so a node serving a wrong one cannot park a duty past its slot.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Every node on this client's chain is asked `/eth/v1/node/syncing` once a slot and ranked by the answer, list order breaking ties. The first that answers serves the request, so the order is a preference, not load balancing. A node on another chain, or not checked yet, is skipped: see [the chain check](#several-beacon-nodes-the-chain-check), [The per-slot sync check](#the-per-slot-sync-check) and [Ranking and broadcast](#ranking-and-broadcast) |
+| `--network` | none | The network every beacon node must be on: a built-in name (`mainnet`, `sepolia`, `hoodi`, `plataberget`) or a directory of published network files, resolved as `beacon --network` resolves it (a directory's `genesis.ssz` is decoded and its bootnodes file read, at startup). A node on another network (preset, genesis, slot duration or genesis fork version) is not used. Startup fails once every configured node has answered and none is on it, and waits while one has not answered. The fork schedule still comes from the beacon nodes and is only warned about when it differs from the network's, so a rescheduled fork needs the beacon nodes upgraded for the client to follow it. Nor does it pick which node the client starts from, since the network's config may be the stale side. Without it the client runs on the first answering node's chain. See [the chain check](#several-beacon-nodes-the-chain-check) |
 | `--broadcast` | none | Signed messages to send to every beacon node on this client's chain at once instead of the first that accepts them, comma-separated: `attestations` (attestations, aggregates, payload attestations), `blocks` (blocks and envelopes, never a blinded block), `sync-committee` (messages and contributions). `subscriptions` and `none` are accepted, as Lighthouse takes them, and change nothing, since subscriptions, fee recipients, builder registrations and proposer preferences always go to every node. See [Ranking and broadcast](#ranking-and-broadcast) |
 | `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml`, which also lists the keys a remote signer holds (see [Remote signing](#remote-signing-web3signer)). Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`, password in `--secrets-dir/<0xpubkey>`) are discovered and the file is written |
 | `--secrets-dir` | required | Directory holding one password file per keystore, named after the validator's public key |
@@ -455,7 +478,8 @@ slot's end, so a node serving a wrong one cannot park a duty past its slot.
 | `--keymanager-port` | `5062` | Keymanager API port. Only bound with `--enable-keymanager` |
 | `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node pays its own fallback address (on ethlambda, `beacon --fallback-fee-recipient`), which is the zero address unless its operator set one, and may not be yours. The addresses reach each beacon node as one `prepare_beacon_proposer` request every slot, listing each validator that has an index on chain and an address, as Lighthouse's validator client sends it. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay |
 | `--gas-limit` | `60000000` | The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with `--builder-proposals`). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client's own payloads toward it as well, so a network whose gas limit is not 60M needs it set, or every proposal pulls the limit toward 60M. **Sepolia and Platåberget schedule `200000000`** (their `config.yaml`'s `GAS_LIMIT_SCHEDULE`, which this client does not read yet, [#795](https://github.com/lambdaclass/ethlambda/issues/795)), so on either pass `--gas-limit 200000000`. Must be positive |
-| `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
+| `--graffiti` | none | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. Conflicts with `--graffiti-file`, as in Lighthouse. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. Without it a block request carries no graffiti and the beacon node applies its own default; an ethlambda beacon node appends both clients' versions to whatever the graffiti is (see [`rpc.md`](rpc.md#validator-endpoints)). See [Graffiti](#graffiti) |
+| `--graffiti-file` | none | A file of per-validator graffiti in Lighthouse's format (`default: <text>`, `<0xpubkey>: <text>`), read again before every proposal and ahead of the keymanager API's per-validator graffiti. Conflicts with `--graffiti`, as in Lighthouse. A file that does not parse refuses startup; once running, a bad read logs a warning and the validator's own graffiti applies, else none. See [Graffiti](#graffiti) |
 | `--enable-keymanager` | off | Serve the keymanager API: keystores, remote keys, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
 | `--keymanager-token-file` | `api-token.txt` in `--validators-dir` | File to read the keymanager API's bearer token from instead, for a token shared with other tooling, such as the one ethereum-package gives every validator client. Never written or created, so a missing file, or one shorter than 16 characters once trimmed or holding a character an `Authorization` header cannot carry (anything but visible ASCII, spaces and tabs), is a startup error. Only read with `--enable-keymanager`; set without it, startup warns. See [The keymanager API](#the-keymanager-api) |
 | `--web3signer-url` | none | Base URL of a Web3Signer (`https://signer:9000`): the signer a remote key imported through `POST /eth/v1/remotekeys` without a `url` of its own is assigned to. Checked for shape at startup. Keys whose definitions entry names a signer need no default |
@@ -1100,7 +1124,7 @@ give one validator its own value in place of the command line's default:
 | Setting | Default | Takes effect |
 |---|---|---|
 | `feerecipient` | `--suggested-fee-recipient` | Once the duties of the slot it is set in are done, when the fee recipients are sent to the beacon node again, as they are after every slot's duties (the next slot's while a slow beacon node still holds the last send). A validator imported since the last epoch boundary, or with no index on chain yet, is first sent once an epoch boundary resolves its index. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch. With `--builder-proposals`, the next builder registration carries it too, usually at the next slot (later while the epoch's full registration send is still running) and again every slot until a node accepts it or the epoch's full send carries it, and an ethlambda beacon node takes it from there. A `DELETE` that leaves a validator with no address at all (no `--suggested-fee-recipient` either) sends no fee recipient and no registration, so the beacon node and the builder keep paying the address they were last given. From gloas, the proposer preferences carry it, from the next dependent root on |
-| `graffiti` | `--graffiti` | The next proposal |
+| `graffiti` | `--graffiti` | The next proposal, unless `--graffiti-file` names the key or has a `default` line (see [Graffiti](#graffiti)) |
 | `gas_limit` | `--gas-limit` | Before gloas, the next builder registration with `--builder-proposals` (usually at the next slot, later while the epoch's full registration send is still running, and again every slot until a node accepts it or the epoch's full send carries it), and stored and served only without it. From gloas, the proposer preferences' target gas limit, from the next dependent root on, flag or not |
 
 **These persist.** Each is written onto the validator's entry in
@@ -1133,7 +1157,9 @@ nothing is written.
 A few answers worth knowing: `GET feerecipient` is a `500` when the validator
 has no address and there is no `--suggested-fee-recipient` default, as
 Lighthouse answers it; `POST feerecipient` refuses the zero address, as the
-specification requires; `POST graffiti` refuses text over 32 bytes rather than
+specification requires; `GET graffiti` answers what the next proposal would
+carry, `--graffiti-file` included, and an empty string when no graffiti is set
+anywhere; `POST graffiti` refuses text over 32 bytes rather than
 truncating it; `POST gas_limit` refuses `0`, as `--gas-limit` does; and every
 route answers `404` for a key this client does not hold.
 
@@ -1147,6 +1173,91 @@ returns the deleted keys' records as a minimal EIP-3076 interchange, answering
 
 The specification requires TLS. This binds to `--http-address`, loopback by
 default; exposing it further means putting a TLS terminator in front.
+
+### Graffiti
+
+A block's graffiti comes from the first of these that has one for the
+proposing validator, Lighthouse's order:
+
+1. `--graffiti-file`'s line for the validator's public key;
+2. `--graffiti-file`'s `default` line;
+3. the validator's own graffiti, set through the keymanager API or written by
+   hand into `validator_definitions.yml`;
+4. `--graffiti`.
+
+`--graffiti-file` and `--graffiti` cannot be given together, as in
+Lighthouse, so the file and the last step never both apply. With a file, a
+validator it has no line for and no `default` line covers, or a proposal whose
+read of it fails, takes the validator's own graffiti, else none.
+
+With none of them, the block request carries no `graffiti` parameter and the
+beacon node applies its own default. An ethlambda beacon node reads an absent
+graffiti as an empty one and appends both clients' codes and commits to it,
+as it does to any graffiti (see [`rpc.md`](rpc.md#validator-endpoints)).
+
+`--graffiti-file` takes Lighthouse's format, so a file written for
+Lighthouse's flag works unchanged:
+
+```text
+default: ethlambda
+0x87a580d31d7bc69069b55f5a01995a610dd391a26dc9e36e81057a17211983a79266800ab8531f21f1083d7d84085007: mr f was here
+```
+
+A line splits at its first `:`. The key before it is exactly `default` or a
+`0x`-prefixed public key, and the text after it, trimmed, is the graffiti, so
+the text may hold colons of its own (`graffitiwall:720:641:#ffff00`). An empty
+graffiti is a graffiti, 32 zero bytes, which a beacon node may treat apart
+from an absent one. Lines of whitespace alone are skipped; there is no comment
+syntax, so a `#` line is refused. A key named twice takes its last line.
+
+The file is read again before every proposal, and for every `GET graffiti`,
+and each read starts from nothing: an edited line applies from the next
+proposal, and a deleted one stops applying there. (Lighthouse merges each read
+into what it read at startup, so a deleted line stays in effect there until a
+restart.) A script can therefore rotate graffiti by rewriting the file; write
+it to a temporary path and rename it over the old one, so a proposal never
+reads it half-written.
+
+A file that cannot be read or does not parse, a graffiti over 32 bytes among
+them, refuses startup, as an over-long `--graffiti` does. So does a path that
+is not a regular file (a FIFO, a directory, a device), a file over 16 MiB, and
+one not read within 5 seconds, so a stalled mount refuses startup rather than
+hang it. A FIFO is refused at once, not after the 5 seconds: the file is
+opened without waiting for a writer (`O_NONBLOCK`), and what was opened is
+checked to be a regular file before it is read. One read within 5 seconds
+but in more than 250 ms starts with a warning, since a proposal gives up on a
+read that slow (see below); a cold cache can make one read that slow and the
+next ones fast, so it is not refused. Once the client is running,
+the same failure costs only the file: the proposal takes its graffiti from the
+next source in the list and logs a warning, and the client logs an info line
+once the file reads again. `GET graffiti` skips the file the same way, but
+warns only at the first of a run of failed reads, so a client polling it does
+not repeat the warning. A read that takes longer than 250 ms is given up on
+the same way, so a stalled mount cannot cost a proposal its slot; the read
+runs alongside the RANDAO signature, so it adds nothing when that takes as
+long. A UTF-8 byte-order mark at the start of the file is ignored.
+
+Each read runs on a thread of its own, and only one runs at a time: a
+proposal or `GET graffiti` that comes while one runs takes that read's answer
+rather than starting another. The 250 ms count from the read's start, so a
+caller that joins a running read waits only what is left of them, and one
+that finds the read running longer than that skips the file at once. So a
+stalled file holds one thread, never one slashing protection runs on, and
+costs a proposal at most 250 ms; and a caller that joins a read takes the
+file as it was at most 250 ms before it asked. The price of one read at a
+time: a read that never returns, as one of a hung network mount does, turns
+the file off until it returns or the client restarts. Every proposal
+meanwhile skips the file with a warning, even once the file is put right,
+since the stuck read is still the running one. A FIFO put in the file's place
+cannot cause this, since it is refused at once like a directory, and the next
+proposal reads the file again; only a filesystem that never answers an
+`open`, `fstat` or `read` can.
+
+One thing differs from Lighthouse besides the reload: the keymanager API's
+graffiti routes stay open while the file is set: a `POST graffiti` is written to `validator_definitions.yml` and
+applied as usual, and shows in proposals and in `GET graffiti` whenever the
+file names neither the key nor a `default`. Until then `GET graffiti` keeps
+answering the file's text, since that is what the next proposal carries.
 
 ### Stopping
 

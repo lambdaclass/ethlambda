@@ -987,7 +987,14 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   unguarded. The client checks every beacon node against the chain it runs on
   (`chain_check`, `FallbackBeaconNode::establish`/`check_nodes`): the reference is
   the first node that answers at startup (startup waits, retrying every 2 s,
-  while none does), and a node whose genesis, preset, slot
+  while none does). Optional `--network` (resolved by the binary's `network`
+  module, as `beacon --network` is, into a `chain_check::ExpectedNetwork`)
+  narrows that to the first node on the named network by
+  `first_identity_difference` (preset, genesis, slot duration, genesis fork
+  version; `establish_on`), failing when every node answered off it; the fork
+  schedule is never held to it, only compared once an epoch
+  (`warn_if_schedule_differs`), so a stale binary cannot go offline at a fork.
+  A node whose genesis, preset, slot
   duration or any active fork's epoch and version differs is skipped by every call
   until a later check finds it compatible again. A background task re-asks
   every node every slot, judging and merging each answer as it arrives, at the

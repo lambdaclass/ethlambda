@@ -778,10 +778,7 @@ mod tests {
 
         let settings = ProposerSettings::new(Bytes32::ZERO, None);
         assert_eq!(definitions.seed_overrides(&settings).expect("seeds"), 1);
-        assert_eq!(
-            settings.graffiti(&key),
-            graffiti_from_text("first enabled").expect("fits")
-        );
+        assert_eq!(settings.graffiti(&key), graffiti_from_text("first enabled"));
 
         let only_disabled = ValidatorDefinitions(vec![
             definition("0xaa", true),
