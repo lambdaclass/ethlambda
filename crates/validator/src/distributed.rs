@@ -1665,6 +1665,87 @@ mod tests {
         assert!(node.contribution_requests().is_empty());
     }
 
+    /// Let the tasks `after_proposal` spawned run to their end: on the paused
+    /// clock, a sleep returns once nothing else has work left.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    /// A clock with `genesis_time` and mainnet's slot and offsets.
+    fn clock_from(genesis_time: u64) -> SlotClock {
+        SlotClock::new(genesis_time, 12_000, 3_333, 6_667)
+    }
+
+    /// What the duty loop starts each slot: a retry for the slot's duties
+    /// still missing a proof, unless a round it just started covers them.
+    #[tokio::test(start_paused = true)]
+    async fn the_slots_retry_is_started_unless_a_round_covers_it() {
+        let (store, pubkey) = store();
+        let store = Arc::new(store);
+        let current = EPOCH_START + 5;
+        let node = Arc::new(MockBeaconNode::new().with_combined_selection(
+            1,
+            current,
+            attester_proof(true),
+        ));
+        let distributed = Arc::new(Distributed::new(node.clone(), distributed_context()));
+        let duties = vec![duty(&pubkey, 1, current)];
+        // Never read: with no sync duty, no contribution deadline is asked for.
+        let clock = clock_from(0);
+
+        distributed.after_proposal(current, true, duties.clone(), Vec::new(), &store, &clock);
+        settle().await;
+        assert!(
+            node.selection_requests().is_empty(),
+            "left to the round the loop started"
+        );
+
+        distributed.after_proposal(current, false, duties, Vec::new(), &store, &clock);
+        settle().await;
+        assert_eq!(node.selection_requests().len(), 1);
+        let subscriptions = node.subscriptions();
+        assert_eq!(subscriptions.len(), 1);
+        assert!(subscriptions[0].is_aggregator);
+    }
+
+    /// The slot's sync committee exchange is started for the time left to
+    /// the contribution deadline, where its proofs are read, and not at all
+    /// once a late proposal has run past it. A round changes nothing here.
+    #[tokio::test(start_paused = true)]
+    async fn the_slots_sync_exchange_is_started_only_ahead_of_the_contribution_deadline() {
+        let (store, pubkey) = store();
+        let store = Arc::new(store);
+        let slot = EPOCH_START;
+        let sync_duty = SyncDutyDto {
+            pubkey: encode_hex(&pubkey.0),
+            validator_index: 9,
+            validator_sync_committee_indices: vec![0],
+        };
+        let node = Arc::new(MockBeaconNode::new().with_combined_sync_selection(
+            9,
+            slot,
+            0,
+            sync_proof(true),
+        ));
+        let distributed = Arc::new(Distributed::new(node.clone(), distributed_context()));
+
+        // Genesis at the Unix epoch: the slot's deadline passed decades ago.
+        let passed = clock_from(0);
+        let sync_duties = vec![sync_duty.clone()];
+        distributed.after_proposal(slot, true, Vec::new(), sync_duties, &store, &passed);
+        settle().await;
+        assert!(node.sync_selection_requests().is_empty());
+
+        // Genesis now: the slot, and its deadline, are hours ahead.
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("after the epoch");
+        let ahead = clock_from(now.as_secs());
+        distributed.after_proposal(slot, true, Vec::new(), vec![sync_duty], &store, &ahead);
+        settle().await;
+        assert_eq!(node.sync_selection_requests().len(), 1);
+    }
+
     /// With the mode off the duty services never ask the middleware: the
     /// subscription, the aggregation tick and the contribution decide on
     /// this client's own proofs, and a combined proof cannot override one.

@@ -4194,4 +4194,79 @@ mod tests {
         );
         assert_eq!(before.elapsed(), std::time::Duration::ZERO);
     }
+
+    /// What `spawn_subscriptions` sent, from slot 3201, for a schedule of two
+    /// duties in epoch 100: one at slot 3200, which has passed, and one at
+    /// 3205. In distributed mode when `context` is.
+    async fn subscriptions_spawned_from_3201(context: SigningContext) -> Arc<MockBeaconNode> {
+        let mut store = ValidatorStore::new();
+        let secret: [u8; 32] =
+            hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes");
+        let key = store.insert_secret("test", &secret).expect("inserts");
+        let store = Arc::new(RwLock::new(store));
+
+        let ahead = beacon_node::dto::AttesterDutyDto {
+            slot: 3205,
+            ..attester_duty(&key, 22)
+        };
+        let schedule = vec![attester_duty(&key, 11), ahead];
+        let node = Arc::new(MockBeaconNode::new().with_duties(100, Root::repeat_byte(1), schedule));
+        let context = Arc::new(context);
+        let mut duties = DutiesService::new(node.clone(), vec![11, 22]);
+        duties
+            .refresh_around(100, &context.config())
+            .await
+            .expect("refreshes");
+        let distributed = context
+            .is_distributed()
+            .then(|| Arc::new(distributed::Distributed::new(node.clone(), context.clone())));
+
+        let distributed = distributed.as_ref();
+        spawn_subscriptions(3201, 100, &node, &duties, &store, &context, distributed);
+        // On the paused clock: back once the task it spawned has run.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        node
+    }
+
+    /// In distributed mode the subnet subscriptions go through the selection
+    /// round, for the duties from the slot given. The one before it is left
+    /// out, which a caller that runs after its slot's duties relies on when
+    /// it passes the next slot.
+    #[tokio::test(start_paused = true)]
+    async fn in_distributed_mode_the_subscriptions_go_through_the_selection_round() {
+        let node = subscriptions_spawned_from_3201(context().with_distributed()).await;
+
+        let asked: Vec<u64> = node
+            .selection_requests()
+            .iter()
+            .flatten()
+            .map(|entry| entry.slot)
+            .collect();
+        assert_eq!(asked, vec![3205], "the middleware is asked, from the slot");
+        let subscribed: Vec<u64> = node
+            .subscriptions()
+            .iter()
+            .map(|entry| entry.slot)
+            .collect();
+        assert_eq!(subscribed, vec![3205]);
+    }
+
+    /// With the mode off the whole schedule held is subscribed as it is, and
+    /// no middleware is asked for anything.
+    #[tokio::test(start_paused = true)]
+    async fn with_distributed_mode_off_the_schedule_is_subscribed_without_an_exchange() {
+        let node = subscriptions_spawned_from_3201(context()).await;
+
+        assert!(node.selection_requests().is_empty());
+        let mut subscribed: Vec<u64> = node
+            .subscriptions()
+            .iter()
+            .map(|entry| entry.slot)
+            .collect();
+        subscribed.sort_unstable();
+        assert_eq!(subscribed, vec![3200, 3205]);
+    }
 }
