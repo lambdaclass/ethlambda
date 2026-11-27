@@ -192,20 +192,20 @@ mod tests {
         let count = validators.len();
         let validators: Validators = validators.try_into().expect("far below the limit");
         let balances: Balances = vec![0; count].try_into().expect("far below the limit");
-        let roots: BlockRoots = vec![Root::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+        let roots: BlockRoots = vec![Root::ZERO; preset::slots_per_historical_root()]
             .try_into()
             .expect("built at exact length");
         let state_roots: StateRoots = roots.clone();
-        let randao: RandaoMixes = vec![Bytes32::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+        let randao: RandaoMixes = vec![Bytes32::ZERO; preset::epochs_per_historical_vector()]
             .try_into()
             .expect("built at exact length");
-        let slashings: Slashings = vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+        let slashings: Slashings = vec![0; preset::epochs_per_slashings_vector()]
             .try_into()
             .expect("built at exact length");
         BeaconState::Phase0(phase0::BeaconState {
             genesis_time: 0,
             genesis_validators_root: Root::ZERO,
-            slot: NOW_EPOCH * preset::SLOTS_PER_EPOCH,
+            slot: NOW_EPOCH * preset::slots_per_epoch(),
             fork: Default::default(),
             latest_block_header: Default::default(),
             block_roots: roots,

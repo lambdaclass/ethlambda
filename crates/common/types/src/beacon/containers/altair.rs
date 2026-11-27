@@ -29,7 +29,7 @@
 //! shape; do not go looking for altair-specific versions of them.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-use libssz_types::{SszBitvector, SszList, SszVector};
+use libssz_types::SszList;
 
 use super::phase0::{Attestation, AttesterSlashing};
 use super::shared::{
@@ -39,32 +39,50 @@ use super::shared::{
 use super::shared::{
     BeaconBlockHeader, Checkpoint, Deposit, Eth1Data, Fork, ProposerSlashing, SignedVoluntaryExit,
 };
+use crate::beacon::preset_sized::{PresetBitvector, PresetVector};
 use crate::beacon::primitives::{BlsPubkey, BlsSignature, Bytes32, Root, Slot, ValidatorIndex};
 use crate::beacon::{constants, preset};
 
 /// One bit per sync committee member, recording who contributed to a
 /// [`SyncAggregate`].
-pub type SyncCommitteeBits = SszBitvector<{ preset::SYNC_COMMITTEE_SIZE }>;
+pub type SyncCommitteeBits = PresetBitvector<preset::SyncCommitteeSize>;
 
 /// The public keys making up a sync committee, one per seat.
 ///
 /// May contain duplicates: `get_next_sync_committee_indices` draws seats with
 /// replacement weighted by effective balance, so one validator can hold more
 /// than one seat in the same committee.
-pub type SyncCommitteePubkeys = SszVector<BlsPubkey, { preset::SYNC_COMMITTEE_SIZE }>;
+pub type SyncCommitteePubkeys = PresetVector<BlsPubkey, preset::SyncCommitteeSize>;
 
 /// One bit per member of a single sync subcommittee (one
 /// `SYNC_COMMITTEE_SUBNET_COUNT`th of a full sync committee), recording who
 /// contributed to one [`SyncCommitteeContribution`].
-pub type SyncSubcommitteeBits = SszBitvector<SYNC_SUBCOMMITTEE_SIZE>;
+pub type SyncSubcommitteeBits = PresetBitvector<SyncSubcommitteeSize>;
 
 /// Members per sync subcommittee: `SYNC_COMMITTEE_SIZE // SYNC_COMMITTEE_SUBNET_COUNT`,
 /// the width of one [`SyncCommitteeContribution`]'s `aggregation_bits` and of
 /// one `sync_committee_{subnet_id}` subnet's share of the committee.
-pub const SYNC_SUBCOMMITTEE_SIZE: usize =
-    preset::SYNC_COMMITTEE_SIZE / constants::SYNC_COMMITTEE_SUBNET_COUNT;
-// Seen caches pack a subcommittee's bits into a `u128`.
-const _: () = assert!(SYNC_SUBCOMMITTEE_SIZE <= 128);
+#[inline]
+pub fn sync_subcommittee_size() -> usize {
+    preset::sync_committee_size() / constants::SYNC_COMMITTEE_SUBNET_COUNT
+}
+
+/// The [`Length`](preset::Length) [`sync_subcommittee_size`] returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SyncSubcommitteeSize;
+
+impl preset::Length for SyncSubcommitteeSize {
+    #[inline]
+    fn get() -> usize {
+        sync_subcommittee_size()
+    }
+}
+
+// Seen caches pack a subcommittee's bits into a `u128`, under either preset.
+const _: () = assert!(
+    preset::mainnet::SYNC_COMMITTEE_SIZE / constants::SYNC_COMMITTEE_SUBNET_COUNT <= 128
+        && preset::minimal::SYNC_COMMITTEE_SIZE / constants::SYNC_COMMITTEE_SUBNET_COUNT <= 128
+);
 
 // ---------------------------------------------------------------------------
 // Sync committees
@@ -461,7 +479,7 @@ mod tests {
         let mut aggregation_bits = SyncSubcommitteeBits::default();
         aggregation_bits.set(0, true).unwrap();
         aggregation_bits
-            .set(SYNC_SUBCOMMITTEE_SIZE - 1, true)
+            .set(sync_subcommittee_size() - 1, true)
             .unwrap();
         let contribution = SyncCommitteeContribution {
             slot: 7,
@@ -474,7 +492,7 @@ mod tests {
         assert_eq!(json["slot"], "7");
         assert_eq!(json["subcommittee_index"], "3");
         let bits = json["aggregation_bits"].as_str().unwrap();
-        assert_eq!(bits.len(), 2 + 2 * SYNC_SUBCOMMITTEE_SIZE / 8);
+        assert_eq!(bits.len(), 2 + 2 * sync_subcommittee_size() / 8);
 
         let message = SyncCommitteeMessage {
             slot: 9,
@@ -500,7 +518,7 @@ mod tests {
 
         let mut sync_committee_bits = SyncCommitteeBits::default();
         sync_committee_bits
-            .set(preset::SYNC_COMMITTEE_SIZE - 1, true)
+            .set(preset::sync_committee_size() - 1, true)
             .unwrap();
         json_round_trip(&SyncAggregate {
             sync_committee_bits,

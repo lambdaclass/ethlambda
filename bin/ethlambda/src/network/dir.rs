@@ -47,7 +47,7 @@ pub(crate) enum NetworkDirError {
     Preset {
         path: PathBuf,
         #[source]
-        source: super::PresetCheckError,
+        source: super::PresetSelectError,
     },
     #[error("{}: {source}", path.display())]
     Constants {
@@ -84,10 +84,10 @@ impl NetworkDir {
         parsed.warn_about_ignored_keys();
 
         // Before `genesis.ssz` is decoded: its container bounds are the
-        // compiled preset's, so a directory built for the other preset would
-        // otherwise fail as an SSZ error rather than naming the cargo feature
-        // that fixes it.
-        super::check_preset(parsed.config.preset_base.as_str()).map_err(|source| {
+        // preset's, so this is what makes a minimal directory's genesis
+        // decode as minimal, and what names an unusable PRESET_BASE instead
+        // of failing as an SSZ error.
+        super::select_preset(parsed.config.preset_base.as_str()).map_err(|source| {
             NetworkDirError::Preset {
                 path: config_path.clone(),
                 source,
@@ -142,9 +142,10 @@ impl NetworkDir {
 /// Read the first bootnode file present, preferring the YAML spelling.
 ///
 /// Both spellings appear: `eth-clients` publishes `bootstrap_nodes.yaml` and
-/// kurtosis ships that plus `bootstrap_nodes.txt`. The existing `--bootnodes`
-/// parser (`read_bootnode_strings`, in `main.rs`) already accepts either
-/// shape, so this only picks a file and reuses it rather than re-parsing.
+/// kurtosis ships that plus `bootstrap_nodes.txt`. The reader for `node`'s
+/// `--bootnodes` file (`read_bootnode_strings`, in `main.rs`) already accepts
+/// either shape, so this only picks a file and reuses it rather than
+/// re-parsing.
 fn read_bootnodes(base: &Path) -> Result<Vec<String>, NetworkDirError> {
     for name in [BOOTNODES_YAML, BOOTNODES_TXT] {
         let path = base.join(name);
@@ -345,16 +346,18 @@ mod tests {
         std::fs::write(path, replaced).unwrap();
     }
 
-    /// A directory built for the other preset must fail naming the preset,
-    /// not as an SSZ error from decoding its genesis state against this
-    /// build's container bounds.
+    /// A directory whose preset this process cannot run must fail naming the
+    /// preset, not as an SSZ error from decoding its genesis state. The tests
+    /// share one process, so the preset frozen first is the one in force and
+    /// the other stands in for an unusable one.
     #[test]
     fn a_preset_mismatch_is_reported_before_the_genesis_state_is_decoded() {
+        use ethlambda_types::beacon::preset::Preset;
+
         let dir = complete_dir();
-        let other = if super::super::compiled_preset() == "mainnet" {
-            "minimal"
-        } else {
-            "mainnet"
+        let other = match Preset::active() {
+            Preset::Mainnet => "minimal",
+            Preset::Minimal => "mainnet",
         };
         replace_config_line(
             &dir,
@@ -367,10 +370,7 @@ mod tests {
 
         let err = NetworkDir::load(dir.path()).unwrap_err();
         assert!(matches!(err, NetworkDirError::Preset { .. }), "got {err}");
-        assert!(
-            err.to_string().contains("Rebuild with --features"),
-            "got {err}"
-        );
+        assert!(err.to_string().contains(other), "got {err}");
     }
 
     #[test]

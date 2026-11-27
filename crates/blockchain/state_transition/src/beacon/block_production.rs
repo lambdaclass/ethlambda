@@ -75,15 +75,23 @@ pub struct PayloadInputs {
     pub withdrawals: Vec<Withdrawal>,
     /// The execution block the payload must extend.
     pub parent_hash: ExecutionBlockHash,
+    /// That block's number, which the `payload_attributes` event reports.
+    pub parent_block_number: u64,
 }
 
 /// The payload inputs for `state`'s slot: the conditions
 /// `process_execution_payload` and `process_withdrawals` will hold the payload
 /// to, computed from the same state.
 pub fn payload_inputs(state: &BeaconState, config: &Config) -> Result<PayloadInputs> {
-    let parent_hash = match state {
-        BeaconState::Electra(state) => state.latest_execution_payload_header.block_hash,
-        BeaconState::Fulu(state) => state.latest_execution_payload_header.block_hash,
+    let (parent_hash, parent_block_number) = match state {
+        BeaconState::Electra(state) => {
+            let header = &state.latest_execution_payload_header;
+            (header.block_hash, header.block_number)
+        }
+        BeaconState::Fulu(state) => {
+            let header = &state.latest_execution_payload_header;
+            (header.block_hash, header.block_number)
+        }
         BeaconState::Phase0(_)
         | BeaconState::Altair(_)
         | BeaconState::Bellatrix(_)
@@ -103,6 +111,7 @@ pub fn payload_inputs(state: &BeaconState, config: &Config) -> Result<PayloadInp
         prev_randao: get_randao_mix(state, get_current_epoch(state)),
         withdrawals: stf::electra::get_expected_withdrawals(state)?.0,
         parent_hash,
+        parent_block_number,
     })
 }
 
@@ -1364,7 +1373,7 @@ mod tests {
     ) -> (SyncAggregate, Root) {
         use crate::beacon::sync_committee_pool::SyncCommitteePool;
         use ethlambda_types::beacon::containers::altair::{
-            SYNC_SUBCOMMITTEE_SIZE, SyncCommitteeMessage,
+            SyncCommitteeMessage, sync_subcommittee_size,
         };
 
         let previous_slot = state.slot() - 1;
@@ -1390,8 +1399,8 @@ mod tests {
                 signature: sign_for(index as usize, signing_root),
             };
             let seats = [(
-                (position / SYNC_SUBCOMMITTEE_SIZE) as u64,
-                position % SYNC_SUBCOMMITTEE_SIZE,
+                (position / sync_subcommittee_size()) as u64,
+                position % sync_subcommittee_size(),
             )];
             pool.insert_message(&message, &seats);
         }

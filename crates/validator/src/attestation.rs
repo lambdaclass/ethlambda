@@ -111,15 +111,46 @@ impl<B: BeaconNodeApi> AttestationService<B> {
                 data: None,
             });
         }
+        let data = self.attestation_data(slot).await?;
+        self.attest_with(slot, duties, store, data).await
+    }
 
+    /// The beacon node's attestation data for `slot`, checked as [`Self::attest`]
+    /// checks it, with nothing recorded and nothing signed.
+    ///
+    /// For a caller that must look at the data before committing to it: the
+    /// duty loop's early trigger signs only data that names the block a head
+    /// event announced, and otherwise leaves the duty to its deadline (see
+    /// [`crate::head_monitor`]). Whatever it decides, it makes one call to
+    /// [`Self::attest_with`] or [`Self::attest`] for the slot, never both.
+    pub async fn attestation_data(&self, slot: Slot) -> Result<AttestationData> {
+        let slot_fork = self
+            .context
+            .config()
+            .fork_at_epoch(compute_epoch_at_slot(slot));
+        let data = self.beacon_node.attestation_data(slot, slot_fork).await?;
+        validate_attestation_data(slot, slot_fork, &data)?;
+        Ok(data)
+    }
+
+    /// [`Self::attest`], over `data` already fetched for `slot` with
+    /// [`Self::attestation_data`] instead of fetching it here.
+    ///
+    /// The same rule holds: one call of this or [`Self::attest`] per slot.
+    pub async fn attest_with(
+        &self,
+        slot: Slot,
+        duties: &[AttesterDutyDto],
+        store: &RwLock<ValidatorStore>,
+        data: AttestationData,
+    ) -> Result<Attested> {
         // The fork of the slot, by this client's own schedule, decides which
         // `index` the answer may carry: from gloas it is the payload signal.
         // It is signed as received, never reset to zero.
         let slot_fork = self
             .context
-            .config
+            .config()
             .fork_at_epoch(compute_epoch_at_slot(slot));
-        let data = self.beacon_node.attestation_data(slot, slot_fork).await?;
 
         // Checked again here, having already been checked by the
         // implementation this call went through (see the contract on
@@ -141,7 +172,7 @@ impl<B: BeaconNodeApi> AttestationService<B> {
         // attestation actually signs under.
         let fork_name = self
             .context
-            .config
+            .config()
             .fork_at_epoch(data.target.epoch)
             .as_str();
 
@@ -845,8 +876,8 @@ mod tests {
         let store = RwLock::new(store);
 
         let altair_fork_epoch = Config::mainnet().altair_fork_epoch;
-        let last_phase0_slot = altair_fork_epoch * preset::SLOTS_PER_EPOCH - 1;
-        let first_altair_slot = altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+        let last_phase0_slot = altair_fork_epoch * preset::slots_per_epoch() - 1;
+        let first_altair_slot = altair_fork_epoch * preset::slots_per_epoch();
 
         let phase0_node = Arc::new(MockBeaconNode::new().with_attestation_data(last_phase0_slot));
         AttestationService::new(
@@ -906,7 +937,7 @@ mod tests {
         let pubkey_hex = encode_hex(&pubkey.0);
         let store = RwLock::new(store);
 
-        let slot = 10 * preset::SLOTS_PER_EPOCH + 3;
+        let slot = 10 * preset::slots_per_epoch() + 3;
         let node = Arc::new(
             MockBeaconNode::new()
                 .with_attestation_data(slot)
@@ -970,7 +1001,7 @@ mod tests {
         let pubkey_hex = encode_hex(&pubkey.0);
         let store = RwLock::new(store);
 
-        let slot = 9 * preset::SLOTS_PER_EPOCH + 3;
+        let slot = 9 * preset::slots_per_epoch() + 3;
         let node = Arc::new(MockBeaconNode::new().with_attestation_data(slot));
         AttestationService::new(
             node.clone(),

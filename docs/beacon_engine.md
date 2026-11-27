@@ -14,7 +14,7 @@ The wire is
 
 ## Which methods, and why so few
 
-Six:
+Seven:
 
 | Method | Introduced | Why |
 |---|---|---|
@@ -24,27 +24,34 @@ Six:
 | `engine_forkchoiceUpdatedV4` | amsterdam | The same, from a gloas head on; also carries the node's custody columns |
 | `engine_exchangeCapabilities` | common | Startup handshake |
 | `engine_getClientVersionV1` | identification | Log what the execution client is |
+| `engine_getBlobsV2` | osaka | Rebuild a held fulu block's custody columns from the execution client's blob pool |
 
 Osaka introduces **no new `newPayload`**. Its own document adds only
-`engine_getPayloadV5` and `engine_getBlobsV2`/`V3`; `engine_newPayloadV5` belongs
+`engine_getPayloadV5` and `engine_getBlobsV2`/`V3`, of which this node calls
+`engine_getBlobsV2` (see [Blobs from the execution client](#blobs-from-the-execution-client)); `engine_newPayloadV5` belongs
 to Amsterdam, where gloas's envelope import uses it. So the Osaka-current call for a payload is prague's V4, and the
 Osaka-current fork choice notification is cancun's V3. Amsterdam's pair (newPayload V5, forkchoiceUpdated V4) is
 used from gloas on; the startup handshake warns when the execution client does not advertise either, but only on a network whose schedule includes gloas.
 
-Three method families a full client would have are deliberately absent:
+Two method families a full client would have are deliberately absent:
 
-- **`engine_getPayload*` outside the gloas path.** The follower itself never
-  asks an execution client to start building a block, so its own
-  `forkchoiceUpdated` calls carry `null` payload attributes. Block production for
-  a validator client (`produceBlockV3` for fulu, `produceBlockV4` for gloas) does:
+- **`engine_getPayload*` outside block production.** The follower asks an
+  execution client to build only for a proposal of a validator client it
+  serves (for every slot's proposer with `--always-prepare-payload`), so the
+  `forkchoiceUpdated` calls that follow its head carry `null` payload
+  attributes. Block production for a validator client
+  (`produceBlockV3` for fulu, `produceBlockV4` for gloas) does:
   `forkchoiceUpdatedV3` with `PayloadAttributesV3` then `engine_getPayloadV5`
   before gloas, and `forkchoiceUpdatedV4` with `PayloadAttributesV4` (V3's fields
   plus `slotNumber` and `targetGasLimit`, the parent bid's gas limit) then
   `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
   `slotNumber`) from gloas on. The handshake warns when a gloas network's
-  execution client does not advertise `engine_getPayloadV6`.
-- **`engine_getBlobs*`.** There is no blob-pool fetch path here; data columns come
-  from peers over the network.
+  execution client does not advertise `engine_getPayloadV6`. The chain actor
+  sends that `forkchoiceUpdated` with attributes a third of a slot ahead, for
+  a proposer a validator client registered (every proposer with
+  `--always-prepare-payload`), with the same safe and finalized hashes as the
+  head's own update, and block production collects the build with
+  `getPayload`; see the `payload_attributes` event in [`rpc.md`](rpc.md).
 - **`engine_getPayloadBodies*`.** Nothing consumes them.
 
 Blocks before electra are not asked about at all. This node checkpoint-syncs onto
@@ -315,6 +322,144 @@ costs one retry ladder per slot however many envelopes wait. This is the gloas
 counterpart of the limitation below, and unlike a block the envelope is not
 dropped.
 
+## Blobs from the execution client
+
+A fulu block is held until its custody data columns are stored. Gossip usually
+delivers them within a fraction of a second, but the execution client may
+already have every blob the block commits to, since the blob transactions went
+through its pool first. The fulu p2p spec ("Distributed blob publishing using
+blobs retrieved from local execution-layer client") says honest nodes SHOULD
+ask `engine_getBlobsV2` on receiving a valid `beacon_block` or
+`data_column_sidecar` from gossip, and turn a complete answer into data columns.
+The code is `crates/blockchain/src/beacon_blobs.rs`.
+
+**When it fires.** On the first data-availability hold of a block
+(`hold_block_for_columns`), when all of these hold: the block is fulu, it
+commits to at least one blob, `--execution-endpoint` is set, the block is at
+most `MAX_ASK_AGE_SLOTS` (4) slots behind the store's clock, and it passes
+`precheck_block` against its parent's post-state (expected proposer and
+proposer signature). Any source qualifies (gossip, or a by-root answer). A
+redelivery of a held root does not ask again.
+
+The age bound is what keeps range sync out. Every block it delivers is older
+than the slot it arrives in, and a catch-up holds them by the batch, so asking
+for each would be an unbounded fan-out of prechecks on the chain actor, engine
+calls and cell computations. Such a block's columns are asked of peers as soon
+as it is held, so it does not wait for a redrive either way. How often the
+execution client would still hold an older block's blobs is not measured.
+
+The age bound limits which slots qualify, not how many blocks: a peer answering
+by root can hand over any number of distinct roots for a recent slot. So an ask
+is also admitted against a budget, before the precheck runs:
+`MAX_ASKS_PER_SLOT` (4) per block slot, spent whether or not the precheck
+passes, and `MAX_ASKS_IN_FLIGHT` (4) at once, held from the engine call through
+the cell computation and the chain checks. That bounds the BLS verifications
+this ask adds on the chain actor and the blocking-pool work a flood of roots
+can buy. A root whose signature fails never gets that far: the import runs the
+same precheck before it holds a block (`precheck_before_waiting`) and refuses
+it instead. What reaches the budget was signed by the validator it names,
+which past the parent state's proposer lookahead need not be the slot's
+proposer (see below). The cost: such roots that arrive first can spend a
+slot's budget before the genuine block, which is then left to gossip and the
+peer asks, where a miss leaves it anyway. Skips are counted in
+`lean_engine_get_blobs_skipped_total{reason}`.
+
+The precheck is a filter, not the guard: the built columns go through every
+chain check before they are published (see the build below). Since the import
+ran it before the hold, it repeats a check the block has already passed, at one
+more BLS verification per first hold of a block that would be asked about. It
+cannot catch everything: past the parent state's proposer lookahead,
+`precheck_block` checks the signature against whichever validator the block
+names, not that this validator is the slot's proposer.
+
+**The call.** One attempt with a 1 s timeout (`ENGINE_GET_BLOBS_TIMEOUT`, the
+value `osaka.md` gives the method), outside the retry ladder. The call races
+gossip delivery of the same columns, and a retry after the ladder's first
+backoff would land after that race is decided. A miss leaves the block to
+gossip and the per-slot peer asks, which is where it was anyway. The answer is
+all-or-nothing: `null` means the execution client lacks at least one blob (or is
+syncing), and counts as a miss.
+
+**V2, not V3.** V3 answers partially, but a column holds one cell from every
+blob, so a partial blob set builds no complete column, and this node has no
+partial-column assembly.
+
+**The build.** On a full answer, a blocking task first re-checks that the block
+was not imported meanwhile and which custody columns are still missing from the
+store, then builds only those (cells and sidecars) off the async runtime and off
+the chain actor. Still in that task, the sidecars then go through the chain
+checks a fetched column gets (`ChainPrechecks`, then one `kzg_verdicts` batch):
+the signed header, including the expected proposer past the lookahead,
+finalized ancestry, the inclusion proof, and the KZG proofs. Only the ones that
+pass go on. The spec says a node SHOULD skip verifying blobs from its own
+execution client; this one does not (see `docs/spec_deviations.md`).
+
+**The hand-over.** The sidecars go to p2p through the existing
+`check_data_column_sidecars`, with `SidecarOrigin::ExecutionLayer`. p2p runs no
+checks of its own on that origin, since the chain actor's task ran them. p2p
+records each column in the gossip seen cache first (so a
+copy gossip delivers later is ignored, and a column gossip already accepted is
+not published twice), publishes the newly recorded ones on their subnet topics
+if and only if this node is subscribed to them, which here means its custody
+columns, and forwards one batch to the chain actor. The chain actor stores the
+columns and releases the held block through the usual completeness check.
+
+One copy gossip delivers is not ignored: the identical column, received just
+before and still in validation when the execution-layer copy is recorded.
+Gossipsub put its message id in the duplicate cache on arrival, so our publish
+of the same bytes was refused as a duplicate and sent nothing; ignoring the
+gossip copy too would relay the column to no one. p2p remembers the message ids
+it published (`engine_columns::PublishedColumns`), and a gossip verdict under
+one of them keeps its `Accept`.
+
+```
+hold (1st, recent) -> engine_getBlobsV2       1 s, one attempt
+                       |-- null / error  -> count; gossip and peer asks carry on
+                       '-- every blob    -> build missing custody columns
+                                            (block imported meanwhile? stop)
+                                            chain checks, KZG included
+                                            (refused -> count, drop)
+                                                  |
+                         check_data_column_sidecars(ExecutionLayer)
+                                                  |
+   p2p: seen cache -> publish on subscribed subnets -> forward one batch
+                                                  |
+   chain actor: store columns -> release the held block
+```
+
+**Trust.** Nothing the execution client returns is taken on trust. A blob that
+is not the one a commitment names, or a wrong proof, fails the KZG batch, and
+the columns built from it are counted in
+`lean_engine_blob_columns_refused_total` and dropped: never published, never
+recorded seen, never stored. That matters beyond peer score. A stored column
+keeps every other copy of it out (gossip and the fetch checks answer
+`AlreadyStored`), and block import trusts what is stored, so a column taken on
+trust would either stop its block for good or import it on data nobody
+verified. The block then waits for gossip and the peer asks, as on a miss. The
+price is one KZG batch over the custody columns per hit, on the blocking pool,
+before the columns are published.
+
+**Not done.**
+
+- No ask when a sidecar arrives, only on a block's first hold.
+- Gloas: data availability moves to the payload envelope, so a held gloas block
+  has no columns to fill this way.
+- Partial columns (see V3 above).
+
+**Metrics.**
+
+| Metric | Reads |
+|---|---|
+| `lean_engine_get_blobs_total{outcome}` | Attempts: `hit`, `miss`, `error` |
+| `lean_engine_get_blobs_skipped_total{reason}` | Holds not asked about, the ask budget spent: `slot_budget`, `in_flight` |
+| `lean_engine_get_blobs_duration_seconds` | One round trip, whatever the outcome |
+| `lean_engine_blobs_to_columns_seconds` | Cell computation plus sidecar build |
+| `lean_engine_blob_columns_refused_total{reason}` | Built columns the chain checks refused, by rule (`kzg`, `wrong_proposer`, ...); any of these points at the execution client or a forged block |
+| `lean_data_columns_from_execution_layer_total{result}` | What p2p did with each column: `published`, `no_digest`, `already_seen`, `not_custody` |
+
+A high `miss` rate means the execution client's pool does not have the blobs.
+That is normal while the execution client is syncing.
+
 ## `forkchoiceUpdated`
 
 Sent once after every head recompute, which is once per import cascade and once
@@ -322,14 +467,19 @@ per tick, not once per block. It is sent even when nothing moved: an execution
 client doing state sync needs to keep being fed a recent head or its sync cannot
 converge.
 
-Its three hashes come from the cached execution hash of the head, the justified
-checkpoint's root and the finalized checkpoint's root. A root with no cached hash
-contributes the zero hash, which is a meaningful value here rather than an
-absence: EIP-3675 requires `finalized_block_hash` to be zero before a
-post-transition block is finalized, and the specification's own
-`get_safe_execution_block_hash` returns zero when no payload is justified yet. A
-follower whose *head* has no cached hash is still sitting on its checkpoint
-anchor and sends nothing at all.
+Its three hashes come from the cached execution hash of the head, the root of
+the block the Fast Confirmation Rule last confirmed (see
+[`beacon_stf.md`](beacon_stf.md#fast-confirmation-rule)) and the finalized
+checkpoint's root. The rule's confirmed root starts at the finalized block and
+is updated once per slot, in the same tick, before this call. Between two runs
+an import can move the head off the confirmed block's chain, and the finalized
+block is sent as safe until the head is back on it (see `docs/spec_deviations.md`,
+"`forkchoiceUpdated` for a gloas head"; the rule applies on every fork). A root with no
+cached hash contributes the zero hash, which is a meaningful value here rather
+than an absence: EIP-3675 requires `finalized_block_hash` to be zero before a
+post-transition block is finalized, and a confirmed block before the merge has
+no payload. A follower whose *head* has no cached hash is still sitting on its
+checkpoint anchor and sends nothing at all.
 
 The cache is pruned to the unfinalized window on every tick and every import,
 with the finalized checkpoint's own root exempted by name. The slot bound alone
@@ -342,9 +492,9 @@ execution client advancing its own finalized block for the life of the process.
 For a gloas head the hashes come from bids rather than from a cached payload
 hash: the head node's `bid.block_hash` when it is FULL and its
 `bid.parent_block_hash` when it is EMPTY, the finalized block's
-`bid.parent_block_hash`, and the justified block's `bid.parent_block_hash` as
-the safe hash. The last is a fallback, since the specification builds the safe
-hash on fast confirmation, which the follower does not run. The call is V4 with
+`bid.parent_block_hash`, and the confirmed block's `bid.parent_block_hash` as
+the safe hash (the specification's gloas `get_safe_execution_block_hash`: only
+the parent payload of a confirmed beacon block is safe). The call is V4 with
 the node's custody columns. A head whose payload status has not been computed
 yet (the first moments after a restart) sends nothing.
 
@@ -373,6 +523,8 @@ The first two must be given **together**: an Engine API endpoint always requires
 authentication, so an endpoint without a secret is refused at startup, before
 anything binds or connects. Clap cannot express "both or neither" across two
 optional flags, so the pairing is checked once, in `From<BeaconOptions>`.
+
+Blob fetching has no flag of its own: it is on whenever `--execution-endpoint` is set.
 
 With **neither** flag, the follower contacts no execution client and every block
 gets `PayloadValidity::NotRequired`, which is exactly what it did before any of

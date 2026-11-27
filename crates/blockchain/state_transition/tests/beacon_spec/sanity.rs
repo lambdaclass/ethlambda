@@ -13,12 +13,13 @@
 //! Unlike the `operations` suite, these run the full [`state_transition`], so
 //! they check the proposer signature and the committed `state_root` too.
 
+use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{BeaconState, SignedBeaconBlock};
 use ethlambda_state_transition::beacon::stf::{self, ExecutionEngine, OwnedBlockCaches};
 use libtest_mimic::Trial;
 
-use super::{Case, PRESET, collect};
+use super::{Case, collect, preset};
 
 #[derive(serde::Deserialize)]
 struct BlocksMeta {
@@ -26,7 +27,17 @@ struct BlocksMeta {
 }
 
 /// Applies every block in the case, stopping at the first one rejected.
-fn apply_blocks(case: &Case, state: &mut BeaconState, config: &Config) -> Result<(), String> {
+///
+/// With `warm`, the shuffling's committee key sums are built before each block,
+/// from the state it applies to, the way the node's epoch precompute worker
+/// builds them ahead of the epoch's first block. A fresh cache would otherwise
+/// only ever run the attestation key builder's cold branch.
+fn apply_blocks(
+    case: &Case,
+    state: &mut BeaconState,
+    config: &Config,
+    warm: bool,
+) -> Result<(), String> {
     let meta: BlocksMeta = case.yaml("meta");
 
     // `sanity/blocks`, `finality`, and `random` ship no `execution.yaml`
@@ -57,6 +68,10 @@ fn apply_blocks(case: &Case, state: &mut BeaconState, config: &Config) -> Result
             state.latest_block_header_mut().state_root = root;
         }
 
+        if warm {
+            super::warm_key_sums_around(&caches.committees, state);
+        }
+
         stf::state_transition(state, &block, true, config, &engine, caches.caches())
             .map_err(|err| format!("block {index} rejected: {err:?}"))?;
 
@@ -77,7 +92,7 @@ fn apply_slots(case: &Case, state: &mut BeaconState, config: &Config) -> Result<
 
 /// Builds one runner and handler pair's trials, since all four share this shape.
 fn run(runner: &str, handler: &str, slots: bool) -> Vec<Trial> {
-    let cases = collect(PRESET, runner, handler);
+    let cases = collect(preset(), runner, handler);
     let mut trials = vec![super::discovery_trial(runner, cases.len())];
 
     for case in cases {
@@ -86,11 +101,29 @@ fn run(runner: &str, handler: &str, slots: bool) -> Vec<Trial> {
                 .map_err(|err| format!("the fixture's pre-state does not decode: {err:?}"))?;
             let config = super::case_config(case);
 
-            let outcome = if slots {
-                apply_slots(case, &mut state, &config)
-            } else {
-                apply_blocks(case, &mut state, &config)
-            };
+            if slots {
+                let outcome = apply_slots(case, &mut state, &config);
+                return super::check_transition(case, outcome, &state);
+            }
+
+            // Electra and later pick an attestation's aggregate key from
+            // warmed committee key sums when there are any, so those cases run
+            // a second time with the sums built. Both runs must reach the same
+            // verdict and the same post-state.
+            if case.fork >= ForkName::Electra {
+                let mut warm_state = state.clone();
+                let warm = apply_blocks(case, &mut warm_state, &config, true);
+                let cold = apply_blocks(case, &mut state, &config, false);
+                if warm != cold {
+                    return Err(format!(
+                        "the warm-sums run answered {warm:?} where the cold run answered {cold:?}"
+                    ));
+                }
+                super::check_transition(case, warm, &warm_state)
+                    .map_err(|err| format!("warm sums: {err}"))?;
+                return super::check_transition(case, cold, &state);
+            }
+            let outcome = apply_blocks(case, &mut state, &config, false);
             super::check_transition(case, outcome, &state)
         }));
     }

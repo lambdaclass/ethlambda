@@ -66,7 +66,7 @@ fn epoch_duration_ms(config: &Config) -> u64 {
     config
         .slot_duration_ms
         .max(1)
-        .saturating_mul(preset::SLOTS_PER_EPOCH)
+        .saturating_mul(preset::slots_per_epoch())
 }
 
 /// The epoch the wall clock reads at `now_ms`; epoch 0 before genesis.
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn the_epoch_is_read_off_the_slot_duration() {
         let config = Config::mainnet();
-        let epoch_ms = config.slot_duration_ms * preset::SLOTS_PER_EPOCH;
+        let epoch_ms = config.slot_duration_ms * preset::slots_per_epoch();
         let genesis = 1_000;
         assert_eq!(epoch_at_ms(&config, genesis, 0), 0);
         assert_eq!(
@@ -542,7 +542,7 @@ mod tests {
         let mut server = unconnected_beacon_server(config(), 0).await;
         apply(&mut server, GLOAS - 1);
         let wire = server.wire.beacon().unwrap();
-        let first_gloas_slot = GLOAS * preset::SLOTS_PER_EPOCH;
+        let first_gloas_slot = GLOAS * preset::slots_per_epoch();
         // Before the switch has run, a slot-B message still names the new digest.
         assert_eq!(wire.fork, ForkName::Fulu);
         assert_eq!(
@@ -560,7 +560,7 @@ mod tests {
         let mut server = unconnected_beacon_server(config(), 0).await;
         apply(&mut server, GLOAS - 2);
         let wire = server.wire.beacon().unwrap();
-        let slot_of = |epoch: Epoch| epoch * preset::SLOTS_PER_EPOCH;
+        let slot_of = |epoch: Epoch| epoch * preset::slots_per_epoch();
         // The current digest, and the next one once its window has opened.
         assert!(wire.publish_digest(slot_of(GLOAS - 2)).is_some());
         assert!(wire.publish_digest(slot_of(GLOAS)).is_none());

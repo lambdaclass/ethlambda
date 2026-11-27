@@ -10,14 +10,11 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-# Compile the Beacon Chain half against the minimal preset instead of mainnet.
-#
-# Container shapes are compile-time constants (SSZ list and vector bounds), so
-# the preset cannot be selected at runtime. Mainnet is the implicit default;
-# enabling this feature switches every beacon constant to the minimal preset.
-# The beacon spec-test target builds the crate twice, once per preset, and each
-# build walks only its own fixture tree. Lean's own state transition reads none
-# of these constants, so the feature cannot change lean behavior.
+# Make minimal the default preset of a process that selects none, so this
+# crate's `--lib` tests run under minimal. See `ethlambda-types`' feature of the
+# same name. The beacon spec-test binary does not need it: it selects its
+# preset at runtime from `BEACON_SPEC_PRESET`, so one build runs both fixture
+# trees.
 preset-minimal = ["ethlambda-types/preset-minimal"]
 
 # Builds the beacon spec-test target. Off by default, and it gates only that
@@ -86,6 +83,11 @@ c-kzg = { version = "2.1.8", features = ["ethereum_kzg_settings"] }
 # Reduction modulo the BLS field order, for the two Fiat-Shamir challenge
 # functions that c-kzg does not export.
 num-bigint = "0.4.6"
+
+# The Fast Confirmation Rule's per-vote maps, keyed by block root: one lookup
+# per validator's latest message, where SipHash was most of the pass. The
+# version `ethlambda-storage` already uses for its own block-root maps.
+foldhash = "0.2.0"
 
 [dev-dependencies]
 ethlambda-test-fixtures.workspace = true

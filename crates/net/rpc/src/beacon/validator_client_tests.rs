@@ -417,7 +417,7 @@ async fn the_validator_client_can_attest_through_this_node() {
     let indices: Vec<u64> = entries.iter().map(|entry| entry.index).collect();
 
     let proposers = client.proposer_duties(epoch).await.unwrap();
-    assert_eq!(proposers.duties.len(), preset::SLOTS_PER_EPOCH as usize);
+    assert_eq!(proposers.duties.len(), preset::slots_per_epoch() as usize);
 
     let attesters = client.attester_duties(epoch, &indices).await.unwrap();
     assert_eq!(
@@ -853,6 +853,7 @@ async fn produce_with_pool(
         address,
         slot,
         randao_reveal,
+        request,
     }
 }
 
@@ -878,6 +879,8 @@ struct Proposal {
     address: std::net::SocketAddr,
     slot: u64,
     randao_reveal: BlsSignature,
+    /// What the block was asked for with, to ask for it again.
+    request: BlockRequest,
 }
 
 /// A proposer's slot through this node: the block produced from this node's
@@ -889,6 +892,133 @@ async fn the_validator_client_can_propose_through_this_node() {
     p.client.publish_block(ForkName::Fulu, &body).await.unwrap();
     assert_eq!(p.network.blocks.lock().unwrap().len(), 1);
     assert!(p.network.sidecars.lock().unwrap().is_empty());
+}
+
+/// The `Content-Type` of every block production answer [`blobber`] relayed.
+type Relayed = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A stand-in for ethereum-package's blobber (marioevz/blobber v1.1.0's
+/// [`validator_proxy/proxy.go`](https://github.com/marioevz/blobber/blob/v1.1.0/validator_proxy/proxy.go),
+/// a file of that repository, not this one) in front of the node at `node`: a
+/// client for it, and what it relayed.
+///
+/// Like blobber, it rewrites `Accept` to `application/json` on
+/// `produceBlockV3` and hands the node's headers and body back unchanged, but
+/// not its status: blobber's `proxyHandler` never writes the upstream status,
+/// so every answer it relays there is a 200, a failure included. Every other
+/// request passes through as it came, status and all, as blobber's plain
+/// reverse proxy passes it.
+async fn blobber(node: std::net::SocketAddr) -> (HttpBeaconNode, Relayed) {
+    use axum::body::{Body, Bytes};
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue, Method, Uri, header};
+    use axum::response::Response;
+
+    let relayed = Relayed::default();
+    let state = (reqwest::Client::new(), relayed.clone());
+    let forward = move |State((client, relayed)): State<(reqwest::Client, Relayed)>,
+                        method: Method,
+                        uri: Uri,
+                        headers: HeaderMap,
+                        body: Bytes| async move {
+        let produces = uri.path().starts_with("/eth/v3/validator/blocks/");
+        let path = uri.path_and_query().map_or("/", |path| path.as_str());
+        // Host and length are the hop's own, set again for the next one.
+        let mut forwarded = HeaderMap::new();
+        for (name, value) in &headers {
+            if name == header::HOST || name == header::CONTENT_LENGTH {
+                continue;
+            }
+            let value = if produces && name == header::ACCEPT {
+                HeaderValue::from_static("application/json")
+            } else {
+                value.clone()
+            };
+            forwarded.insert(name.clone(), value);
+        }
+        let answer = client
+            .request(method, format!("http://{node}{path}"))
+            .headers(forwarded)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        let status = if produces {
+            axum::http::StatusCode::OK
+        } else {
+            answer.status()
+        };
+        let mut answer_headers = answer.headers().clone();
+        answer_headers.remove(header::CONTENT_LENGTH);
+        answer_headers.remove(header::TRANSFER_ENCODING);
+        if produces {
+            let content_type = answer_headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            relayed.lock().unwrap().push(content_type);
+        }
+        let mut response = Response::new(Body::from(answer.bytes().await.unwrap()));
+        *response.status_mut() = status;
+        *response.headers_mut() = answer_headers;
+        response
+    };
+    let app = axum::Router::new().fallback(forward).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = HttpBeaconNode::new(format!("http://{address}")).unwrap();
+    (client, relayed)
+}
+
+/// Behind blobber, which asks this node for JSON whatever the client asked
+/// for, a proposal still goes through. The block decoded from this node's own
+/// JSON is the one its SSZ gives, so the root signed over is the block's, and
+/// the node takes the signed block and its blobs.
+#[tokio::test]
+async fn the_validator_client_can_propose_through_blobber() {
+    let p = produce_for_proposer(2).await;
+    let (through_blobber, relayed) = blobber(p.address).await;
+
+    let produced = through_blobber.produce_block(&p.request).await.unwrap();
+    assert_eq!(*relayed.lock().unwrap(), [crate::JSON_CONTENT_TYPE]);
+    assert_eq!(produced, p.produced, "JSON and SSZ give one block");
+
+    let body = produced.into_signed_ssz(p.signature);
+    through_blobber
+        .publish_block(ForkName::Fulu, &body)
+        .await
+        .unwrap();
+    assert_eq!(p.network.blocks.lock().unwrap().len(), 1);
+    assert_eq!(
+        p.network.sidecars.lock().unwrap().len(),
+        preset::NUMBER_OF_COLUMNS
+    );
+}
+
+/// [`block_production_without_an_execution_client_is_retryable`] behind
+/// blobber: the node's 503 reaches the client as a 200 carrying the node's
+/// error message, and the client still reads it as a node to fail over from,
+/// not as a malformed block.
+#[tokio::test]
+async fn a_node_failing_block_production_behind_blobber_is_still_syncing() {
+    let (_, state, _, address, _) = serve_at(None).await;
+    let (through_blobber, relayed) = blobber(address).await;
+    let request = BlockRequest {
+        slot: state.slot() + 1,
+        fork: ForkName::Fulu,
+        proposer_index: 0,
+        randao_reveal: Default::default(),
+        graffiti: Default::default(),
+        builder_boost_factor: None,
+        builder_min_bid: 0,
+    };
+    let err = through_blobber.produce_block(&request).await.unwrap_err();
+    assert_eq!(*relayed.lock().unwrap(), [crate::JSON_CONTENT_TYPE]);
+    assert!(matches!(err, Error::BeaconNodeSyncing), "got {err:?}");
+    assert!(err.is_retryable());
 }
 
 /// A voluntary exit in the node's pool rides in the block it produces. The
@@ -1149,12 +1279,12 @@ async fn sync_committee_slot(
         .collect();
     assert_eq!(
         seats,
-        (0..preset::SYNC_COMMITTEE_SIZE as u64).collect(),
+        (0..preset::sync_committee_size() as u64).collect(),
         "every seat belongs to a member of the registry"
     );
     let all_subnets: BTreeSet<u64> = (0..SYNC_COMMITTEE_SUBNET_COUNT as u64).collect();
 
-    let period = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+    let period = preset::epochs_per_sync_committee_period();
     let until_epoch = (epoch / period + 1) * period;
     let subscriptions: Vec<SyncCommitteeSubscriptionDto> = duties
         .iter()
@@ -1220,7 +1350,7 @@ async fn sync_committee_slot(
     let contributions = network.sync_contributions.lock().unwrap().clone();
     assert_eq!(contributions.len(), count);
     let (committee, _) = state.sync_committees().unwrap();
-    let per_subnet = preset::SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT;
+    let per_subnet = preset::sync_committee_size() / SYNC_COMMITTEE_SUBNET_COUNT;
     for signed in &contributions {
         let contribution = &signed.message.contribution;
         assert_eq!(contribution.slot, slot);
@@ -1246,12 +1376,12 @@ fn assert_full_sync_aggregate(
     advanced: &BeaconState,
     aggregate: &ethlambda_types::beacon::containers::altair::SyncAggregate,
 ) {
-    let set = (0..preset::SYNC_COMMITTEE_SIZE)
+    let set = (0..preset::sync_committee_size())
         .filter(|&position| aggregate.sync_committee_bits.get(position).unwrap_or(false))
         .count();
     assert_eq!(
         set,
-        preset::SYNC_COMMITTEE_SIZE,
+        preset::sync_committee_size(),
         "every member signed the parent"
     );
     let mut state = advanced.clone();
@@ -1367,7 +1497,7 @@ mod gloas {
         let first_slot = compute_start_slot_at_epoch(epoch - 1);
         let cache =
             ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache::default();
-        let window: Vec<_> = (first_slot..first_slot + preset::PTC_WINDOW_LENGTH as u64)
+        let window: Vec<_> = (first_slot..first_slot + preset::ptc_window_length() as u64)
             .map(|slot| compute_ptc(&state, slot, &cache).unwrap())
             .collect();
         let BeaconState::Gloas(inner) = &mut state else {
@@ -1930,6 +2060,8 @@ mod builder_flow {
     struct Harness {
         world: BuilderWorld,
         client: HttpBeaconNode,
+        /// Where the node listens, for a client other than `client`.
+        address: std::net::SocketAddr,
         proposer: u64,
         keys: RwLock<ValidatorStore>,
         context: SigningContext,
@@ -1953,7 +2085,7 @@ mod builder_flow {
         // real anchor's checkpoint does.
         crate::test_utils::finalize_at(&mut store, anchor_root, parent_root, head_state.slot());
 
-        let (client, _network, _pool, _address) =
+        let (client, _network, _pool, address) =
             spawn_server(store, Some(engine), Some(world.builder.clone())).await;
 
         let proposer = get_beacon_proposer_index(&world.state).unwrap();
@@ -1965,6 +2097,7 @@ mod builder_flow {
         Harness {
             world,
             client,
+            address,
             proposer,
             keys,
             context,
@@ -2173,6 +2306,36 @@ mod builder_flow {
             .expect("the node hands the block to its builder");
         assert_eq!(published, Published::HandedToBuilder);
 
+        let signed = SignedBlindedBeaconBlock::from_ssz_bytes(&body).unwrap();
+        assert_eq!(h.world.relay.blinded_blocks(), [signed]);
+    }
+
+    /// [`the_validator_client_can_propose_a_builder_block_through_this_node`]
+    /// behind blobber: the blinded block this node answers in JSON decodes
+    /// into the one its SSZ gives, and goes to the builder.
+    #[tokio::test]
+    async fn the_validator_client_can_propose_a_builder_block_through_blobber() {
+        let world = builder_world(false, SyncStatus::Synced).await;
+        let engine = fake_execution_client_paying("0x2a", false).await;
+        let h = harness(world, engine).await;
+        h.register().await;
+        h.world.offer(1, |_| {});
+        let direct = h.produce(Some(u64::MAX)).await;
+        assert!(direct.is_blinded());
+
+        let (client, relayed) = blobber(h.address).await;
+        let h = Harness { client, ..h };
+        let produced = h.produce(Some(u64::MAX)).await;
+        assert_eq!(*relayed.lock().unwrap(), [crate::JSON_CONTENT_TYPE]);
+        assert_eq!(produced, direct, "JSON and SSZ give one blinded block");
+
+        let producer = produced.producer;
+        let body = h.sign(produced).await;
+        let published = h
+            .publish_blinded(producer, &body)
+            .await
+            .expect("the node hands the block to its builder");
+        assert_eq!(published, Published::HandedToBuilder);
         let signed = SignedBlindedBeaconBlock::from_ssz_bytes(&body).unwrap();
         assert_eq!(h.world.relay.blinded_blocks(), [signed]);
     }

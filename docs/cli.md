@@ -62,21 +62,26 @@ one `CommonOptions` struct flattened into each.
 | `--api-port` | `5052` | API server port. `beacon` binds it too, off its own anchored store rather than an empty one; the lean-shaped `/lean/v0` routes still don't answer for it (see [`beacon` flags](#beacon-flags) below) |
 | `--metrics-port` | `5054` | Metrics and debug server port. Equal to `--api-port` merges the routers onto one listener |
 | `--node-key` | `<data-dir>/node.key` | Hex file holding the secp256k1 key that is this node's libp2p and discv5 identity. When omitted, the key stored in `--data-dir` as `node.key` is used, generated and stored there (mode `0600`) on the directory's first start, so the PeerId and ENR stay the same across restarts until the directory is wiped |
-| `--bootnodes` | see below | Bootnode ENR list: one `enr:...` per line, as a YAML block sequence, a YAML flow sequence, or a plain list (`#` comments and leading `- ` are both tolerated) |
 | `--checkpoint-sync-url` | see below | API base URLs, tried in order until one answers. Supplies `node`'s starting state on the lean API, and `beacon`'s anchor on a standard Beacon API; required on a fresh `beacon` data directory only for a built-in network, since a loaded network anchors at its own `genesis.ssz` instead. See [`checkpoint_sync.md`](checkpoint_sync.md) |
 | `--discovery.port` | `9000` | discv5 UDP port; must differ from `--gossipsub-port`. See [Peer discovery](./discovery.md) |
 | `--discovery.advertise-ip` | bind address | IP published in the ENR |
 | `--discovery.target-peers` | `200` | Connected-peer count above which discovery stops dialing |
+| `--telemetry.clickhouse-url` | off | ClickHouse HTTP endpoint for per-block `block_events` rows; also read from `ETHLAMBDA_TELEMETRY_CLICKHOUSE_URL`, the place for a URL with a password. See [Block telemetry](./telemetry.md) |
+| `--telemetry.client-name` | `--node-id` / `ethlambda@<hostname>` | `meta_client_name` on those rows; requires the URL |
 
-Three of those have no clap default, because the two chains answer them
+Two of those have no clap default, because the two chains answer them
 differently. A single `default_value` can only say one thing, so the flag
 carries none and each chain resolves an absent value itself:
 
 | Flag | Absent on `node` | Absent on `beacon` |
 |---|---|---|
 | `--node-key` | `<data-dir>/node.key`, generated on the directory's first start | same |
-| `--bootnodes` | no bootnodes: peers only via discv5 (with `--discovery.enable`) or by being dialed, warned about | falls back to the resolved network's own bootnode list: a built-in network's embedded list, or a loaded directory's `bootstrap_nodes.yaml`/`.txt` |
 | `--checkpoint-sync-url` | start from a resumable DB, else from genesis | start from a resumable DB, else anchor at the resolved network's own genesis (loaded network only), else abort |
+
+`--bootnodes` is taken by both too, but not with one meaning, so it is listed
+under each sub-command instead: on `node` it names a file of ENRs, and on
+`beacon` it is a list of ENRs and multiaddrs added to the network's own
+bootnodes.
 
 Whether discv5 runs is not a common flag. `beacon` always runs it, since
 published mainnet bootnode ENRs carry no `quic` entry and so are not statically
@@ -100,6 +105,7 @@ On top of the common flags above.
 | `--hash-sig-keys-dir` | required | Directory of per-validator XMSS keys |
 | `--node-id` | required | The key in `annotated_validators.yaml` naming this node, e.g. `ethlambda_0` |
 | `--is-aggregator` | `false` | Seed the runtime aggregator flag |
+| `--bootnodes` | none, warned about | Path to a bootnode ENR file: one `enr:...` per line, as a YAML block sequence, a YAML flow sequence, or a plain list (`#` comments and leading `- ` are both tolerated). An unusable entry is skipped with a warning. Without the flag the node starts with no bootnodes, since a lean network has no built-in list, and reaches peers only via discv5 (with `--discovery.enable`) or by being dialed |
 | `--discovery.enable` | `false` | Run discv5 peer discovery; off, the node peers from `--bootnodes` alone. See [Peer discovery](./discovery.md) |
 | `--aggregate-subnet-ids` | this node's subnets | Subnets to aggregate on; requires `--is-aggregator` |
 | `--attestation-committee-count` | from `validator-config.yaml`, else `1` | Committees per slot |
@@ -118,6 +124,8 @@ from a normal build.
 | `--execution-endpoint` | none | Base URL of the execution client's Engine API endpoint, e.g. `http://127.0.0.1:8551`. Must be given together with `--execution-jwt-secret` |
 | `--execution-jwt-secret` | none | File holding the 32-byte hex JWT secret shared with the execution client |
 | `--safe-slots-to-import-optimistically` | the specification's own value | How far behind the wall clock a block must be before it may be imported optimistically on age alone |
+| `--always-prepare-payload` | off | Publish the `payload_attributes` event for every slot, not only for proposers a validator client registered through `prepare_beacon_proposer`. For an external block builder reading this node's event stream (ethereum-package's buildoor). With `--execution-endpoint` it also has the execution client start a payload build for every slot, a third of a slot ahead, whether or not anything is subscribed to the event stream. For a proposer no validator client registered, that build pays the fee recipient of the proposer's signed preferences on gloas, else `--fallback-fee-recipient`, else the zero address. Lighthouse's flag of the same name |
+| `--fallback-fee-recipient` | none | Execution address (20 bytes of hex, `0x` optional) a locally built payload pays when no validator client named a fee recipient for the proposer through `prepare_beacon_proposer` or a builder registration (and, on gloas, no signed proposer preferences name one). Without it such a payload pays the zero address and its fees are lost. The zero address itself is accepted but reported at error at startup, since a proposal that falls back to it logs only at debug. It does not register the proposer: `payload_attributes` events still need `prepare_beacon_proposer` or `--always-prepare-payload`. Lighthouse's beacon-node `--suggested-fee-recipient` |
 | `--builder` | none | Base URL of a builder API endpoint, normally MEV-Boost (e.g. `http://127.0.0.1:18550`). Without it every block is built locally |
 | `--builder-header-timeout` | `1000` | Milliseconds block production waits for the builder's bid; also sent to the builder as `X-Timeout-Ms`. Requires `--builder` |
 | `--builder-follow-redirects` | off | Follow the builder's 307 and 308 redirects, up to ten per call, never from https to http. A 301, 302 or 303 is not followed even then, since following one resends a POST as a GET without its body. Off, every redirect fails the call with an error naming its target, so registrations and signed blocks go only where `--builder` points; on, so does any redirect it does not follow. Requires `--builder` |
@@ -151,12 +159,13 @@ Engine API endpoint always requires authentication. See
 [the execution layer pairing](./beacon_engine.md) for what each verdict does and
 for the limitations that go with the retry ladder.
 
-`beacon` takes one more flag of its own, and two common flags also mean
+`beacon` takes two more flags of its own, and two common flags also mean
 something specific here.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--network` | `mainnet` | A built-in network name (`mainnet`, `sepolia`, `hoodi` or `plataberget`), or a path to a directory of published network files. A value containing a slash is always a path, so `mainnet` is the built-in and `./mainnet` is a directory. The directory must hold `config.yaml` and `genesis.ssz`, and may hold `bootstrap_nodes.yaml` or `bootstrap_nodes.txt` |
+| `--bootnodes` | none: the network's own list alone | Extra bootnodes: ENRs and multiaddrs, comma-separated, and the flag may be repeated. Added to the resolved network's own list, never replacing it. A bad entry is a startup error, and a file path is no longer accepted. See [Bootnodes on `beacon`](#bootnodes-on-beacon) |
 
 `genesis_validators_root` and `genesis_time`, which the fork digest that keys
 every gossip topic, the ENR `eth2` entry and discv5 admission is computed from,
@@ -174,13 +183,17 @@ wrong chain.
 
 `beacon` therefore takes no genesis config, validator registry, or bootnode file
 of its own the way `node` does: those are read off the resolved network instead
-of being separate operator input. A `config.yaml` (a directory's, or a built-in
-network's embedded one) is read permissively: absent keys fall back to mainnet's values,
+of being separate operator input, and `beacon`'s `--bootnodes` only adds entries
+to the network's list (see [Bootnodes on `beacon`](#bootnodes-on-beacon)). A
+`config.yaml` (a directory's, or a built-in network's embedded one) is read
+permissively: absent keys fall back to mainnet's values,
 numbers are accepted quoted or bare, and unrecognised keys (on a current
 config, the heze schedule this build does not claim) are dropped
-with one warning line naming each. Its `PRESET_BASE` is checked against the
-compiled preset; a mismatch is a hard startup error naming the cargo feature
-that would fix it. Sepolia's config schedules gloas, which this build follows, so
+with one warning line naming each. Its `PRESET_BASE` (`mainnet` or `minimal`)
+selects the preset the process runs, before anything is decoded against it; a
+missing or unknown one is a hard startup error. The validator client has no
+`--network` and adopts the preset its beacon node's `/eth/v1/config/spec`
+reports. Sepolia's config schedules gloas, which this build follows, so
 it parses and runs like any other fork. A scheduled fork the build claims but
 does not follow gets a separate, explicit warning at startup, since the chain
 follower would stop tracking the chain there regardless of what parsed
@@ -218,6 +231,66 @@ site serves both chains, but it picks the router by the store's chain, so a
 `beacon` run serves the Beacon API under `/eth/v1` and `/eth/v2` and answers a
 `/lean/v0/...` path with a 404. See [`rpc.md`](./rpc.md).
 
+### Bootnodes on `beacon`
+
+`beacon`'s `--bootnodes` is a list, not a file, modeled on Lighthouse's
+`--boot-nodes`. Entries are comma-separated and the flag may be repeated, all
+of its values combined; each entry is trimmed, and an empty one is ignored. An
+entry is either an ENR, written with or without its `enr:` prefix, or a
+multiaddr, which starts with `/`:
+
+```sh
+ethlambda beacon --network hoodi --checkpoint-sync-url <URL> \
+  --bootnodes enr:-Iq4Q…,/ip4/203.0.113.7/tcp/9000/p2p/16Uiu2HAm… \
+  --bootnodes /ip4/203.0.113.8/udp/9000/p2p/16Uiu2HAk…
+```
+
+A multiaddr is `/ip4/<ip>` or `/ip6/<ip>`, then one transport, then
+`/p2p/<peer-id>`. The transport decides what the entry is used for:
+
+| Transport | The peer is |
+|---|---|
+| `tcp/<port>` | dialed over TCP |
+| `udp/<port>/quic-v1` | dialed over QUIC |
+| `udp/<port>` | not dialed directly: the port is the peer's discv5 port, so the entry seeds discovery, which is how Lighthouse reads a UDP multiaddr too |
+
+QUIC is `quic-v1` only; the older draft `/quic` is refused. The
+`/p2p/<peer-id>` is required, and DNS multiaddrs (`/dns`, `/dns4`, `/dns6`,
+`/dnsaddr`) are refused, so write the address as `/ip4` or `/ip6`. Those two are
+departures from Lighthouse; [Peer discovery](./discovery.md#multiaddrs) lists
+them with the rest.
+
+The entries are added to the resolved network's own list (a built-in network's
+embedded one, or a loaded directory's `bootstrap_nodes.yaml`/`.txt`), never put
+in its place, which is Lighthouse's behavior too. Giving the flag used to
+replace that list; now the network's bootnodes are always used, and the flag
+only adds to them. Nothing turns them off: each one with a QUIC or TCP port is
+dialed at startup and redialed 12 seconds after every failed dial or
+disconnect, even on a host that cannot reach it. To run on other bootnodes
+alone, load the network from a directory whose `bootstrap_nodes.yaml` lists
+only those.
+
+An IPv6 entry is dialed like an IPv4 one, but discv5 binds the IPv4 wildcard
+and an IPv4 socket cannot reach an IPv6 address, so an IPv6 entry that is only
+a discv5 contact (`/ip6/<ip>/udp/<port>`, or an ENR whose only address is `ip6`
+and whose only port is `udp`) is refused. The check reads the address discovery
+binds rather than assuming IPv4, so it lifts on its own once discovery binds
+IPv6 ([#853](https://github.com/lambdaclass/ethlambda/issues/853)).
+
+Every entry is checked at startup. One that does not parse, or that is
+unusable (an ENR with no `quic`, `tcp` or `udp` port, a port of `0`, and so
+on), is a startup error naming the entry: an operator who typed it meant to
+reach that peer, and skipping it would leave the node running on a list it was
+not given. The network's own list keeps the old rule, a bad entry there being
+skipped with a warning, as `node` skips one in its file.
+
+**A file path is no longer accepted.** Startup fails on one, with a hint that
+`--bootnodes` now takes a list; so does a missing path ending in `.yaml`,
+`.yml` or `.txt`. A launch script that passed `beacon` a bootnode file must
+pass the records it lists joined with commas instead (without a YAML list's
+`- ` markers or any comments), or, for a network loaded from a directory, list
+them in that directory's `bootstrap_nodes.yaml`.
+
 ## What `ethlambda beacon` does today
 
 It follows the resolved network as a non-validating follower. It anchors a
@@ -240,8 +313,8 @@ not chain-specific, branches once, and shares the shutdown:
 | register metrics, print the banner, log the version | shared | shared |
 | raise `RLIMIT_NOFILE` | shared | shared |
 | `HIVE_LEAN_TEST_DRIVER` early return | yes | no: those endpoints are lean's |
-| resolve `--network` into a `NetworkSource` | n/a: lean has no `--network` | classify the value (built-in name vs. directory); parse the `config.yaml` (embedded, or the directory's) and check `PRESET_BASE` against the compiled preset and the constant-backed keys against their constants; for a directory, then decode `genesis.ssz` |
-| read `--bootnodes` (falls back to the chain's default list; see the table above) | shared | shared |
+| resolve `--network` into a `NetworkSource` | n/a: lean has no `--network` | classify the value (built-in name vs. directory); parse the `config.yaml` (embedded, or the directory's), select the preset its `PRESET_BASE` names, and check the constant-backed keys against their constants; for a directory, then decode `genesis.ssz` |
+| read `--bootnodes` | a file of ENRs; absent means no bootnodes, warned about | a comma-separated list of ENRs and multiaddrs, added to the resolved network's own list; a bad entry is a startup error (see [Bootnodes on `beacon`](#bootnodes-on-beacon)) |
 | build the aggregator, sync-status and event handles | shared | shared |
 | open `--data-dir`'s RocksDB backend | shared | shared |
 | resolve `--node-key`, else load `<data-dir>/node.key`, generating it on first start (after the open, so RocksDB's lock covers the write) | shared | shared |
@@ -297,24 +370,100 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 > or in the same keymanager API request that imports the key. See
 > [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-eip-3076s-minimal-watermarks-not-full-history).
 
+### Several beacon nodes: the chain check
+
+The client learns its chain, the preset, genesis, slot duration and fork
+schedule, from `--beacon-nodes` at startup: the reference is the first node in
+list order that answers both `/eth/v1/beacon/genesis` and
+`/eth/v1/config/spec`. While none does, the client warns, naming what each node
+said, and asks them all again every 2 seconds, as Lighthouse's validator client
+does, rather than exiting: a client started beside its beacon node otherwise
+exits before the node's API is up. Only when every node answered, each with a
+preset this client cannot run on or a spec it cannot read, does startup fail; a
+body that is not JSON at all (a proxy's page while the node boots) is waited out. A
+response without the slot
+duration, `GENESIS_FORK_VERSION`, or the epoch and version of any fork from
+altair to fulu is refused rather than filled in from mainnet; only gloas may be
+absent, meaning unscheduled.
+
+Every other node is compared with the reference, and one that differs is not
+used: not for a duty, not for failover, not for a subscription. The comparison
+names the first field that differs: `PRESET_BASE`, `genesis_time`,
+`genesis_validators_root`, the slot duration, `GENESIS_FORK_VERSION`, or the
+epoch or version of a fork. A fork may differ only while it is still in the
+future under both schedules, which is how a node upgraded ahead of the others
+stays in use. A node that did not answer at startup is not used until a check
+has verified it. The warning names the node and the field, when the state
+changes and then at most once per epoch. If no node is usable, every request
+fails with an error that says no configured node is on the client's chain.
+
+A background task, separate from the duty loop, repeats the check for every node
+at the start of every slot, so a node upgraded partway through an epoch for a fork
+at the next one is read while that fork is still ahead. Each node's answer is
+judged the moment it arrives, at the epoch read then, so a node that hangs until
+its request timeout holds back only its own answer, and a fork whose epoch passed
+while a node was answering counts as arrived rather than as still ahead.
+
+As each answer arrives, a fork the compatible nodes schedule and the client does
+not have yet is adopted by the slot clock and every signing domain together, and
+the client logs at `warn` which fields moved. Only nodes that answered one of
+their last three checks have a say in this. A fork the client does not have is
+taken only when every one of them schedules it, at the same epoch and with the
+same version:
+one node, misconfigured or not, cannot put a fork on the client's schedule that
+the others do not have. So while a node not yet upgraded still answers, the fork
+waits; it is taken once that node is upgraded, or once it stops answering
+(restarting for the upgrade, say) for three slots and so loses its say. One missed
+check does not cost a node its say, so a single timeout of a correct node does not
+leave a misconfigured one to move the schedule alone. A warning names the nodes
+that disagree, once per epoch, and a node without the client's epoch stops being
+used when the fork's epoch arrives. Once the client has a fork scheduled, it
+moves only when every node with a say that schedules it agrees on the new epoch
+and version, so one node cannot pull it elsewhere, and it is never unscheduled:
+a node reporting it unscheduled may only be the one not upgraded yet, while the
+upgraded one is restarting. A fork the network cancels therefore needs a
+restart. A node that stops answering loses its say after three slots, so it cannot
+hold a fork at an epoch the network has postponed (unless the postponement comes in
+the fork's last three slots); the duty offsets are still read from the first node
+through a round it misses. A merge that would put a fork before the one it follows
+is refused whole and warned about. A fork that is already active is never moved: a
+node that reports another epoch or version for it is on another chain.
+The client does not need a restart for a fork the network schedules after it
+started.
+
+A send that has to reach every node (proposer preferences) counts as delivered
+everywhere once every node in use took it: a node skipped for being on another
+chain is not a refusal. When a check lets a skipped node back in, the client
+sends it what it missed: the proposer preferences at the next poll, and the
+epoch's attestation subnet subscriptions, sync committee subscriptions and
+builder registrations at the next slot.
+
+Offsets into the slot (`*_DUE_BPS`) above 10000 basis points are held to the
+slot's end, so a node serving a wrong one cannot park a duty past its slot.
+
 | Flag | Default | Meaning |
 |---|---|---|
-| `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in list order; the first that answers serves the request, so the order is a preference, not load balancing |
+| `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Every node on this client's chain is asked `/eth/v1/node/syncing` once a slot and ranked by the answer, list order breaking ties. The first that answers serves the request, so the order is a preference, not load balancing. A node on another chain, or not checked yet, is skipped: see [the chain check](#several-beacon-nodes-the-chain-check), [The per-slot sync check](#the-per-slot-sync-check) and [Ranking and broadcast](#ranking-and-broadcast) |
+| `--broadcast` | none | Signed messages to send to every beacon node on this client's chain at once instead of the first that accepts them, comma-separated: `attestations` (attestations, aggregates, payload attestations), `blocks` (blocks and envelopes, never a blinded block), `sync-committee` (messages and contributions). `subscriptions` and `none` are accepted, as Lighthouse takes them, and change nothing, since subscriptions, fee recipients, builder registrations and proposer preferences always go to every node. See [Ranking and broadcast](#ranking-and-broadcast) |
 | `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml`, which also lists the keys a remote signer holds (see [Remote signing](#remote-signing-web3signer)). Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`, password in `--secrets-dir/<0xpubkey>`) are discovered and the file is written |
 | `--secrets-dir` | required | Directory holding one password file per keystore, named after the validator's public key |
 | `--http-address` | `127.0.0.1` | Bind address for the metrics and keymanager servers |
 | `--metrics-port` | `5064` | Prometheus metrics port |
 | `--keymanager-port` | `5062` | Keymanager API port. Only bound with `--enable-keymanager` |
-| `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours. The addresses reach each beacon node as one `prepare_beacon_proposer` request every slot, listing each validator that has an index on chain and an address, as Lighthouse's validator client sends it. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay |
+| `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node pays its own fallback address (on ethlambda, `beacon --fallback-fee-recipient`), which is the zero address unless its operator set one, and may not be yours. The addresses reach each beacon node as one `prepare_beacon_proposer` request every slot, listing each validator that has an index on chain and an address, as Lighthouse's validator client sends it. The zero address is accepted, as every other client accepts it, but reported at error at startup: it burns the rewards, and builder registrations and proposer preferences sign it for the builder to pay |
 | `--gas-limit` | `60000000` | The gas limit every validator targets, unless the keymanager API gives it its own. Before gloas it goes into builder registrations (with `--builder-proposals`). From gloas it goes into the proposer preferences, which are published for every proposal, and the beacon node builds this client's own payloads toward it as well, so a network whose gas limit is not 60M needs it set, or every proposal pulls the limit toward 60M. **Sepolia and Platåberget schedule `200000000`** (their `config.yaml`'s `GAS_LIMIT_SCHEDULE`, which this client does not read yet, [#795](https://github.com/lambdaclass/ethlambda/issues/795)), so on either pass `--gas-limit 200000000`. Must be positive |
 | `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
 | `--enable-keymanager` | off | Serve the keymanager API: keystores, remote keys, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
+| `--keymanager-token-file` | `api-token.txt` in `--validators-dir` | File to read the keymanager API's bearer token from instead, for a token shared with other tooling, such as the one ethereum-package gives every validator client. Never written or created, so a missing file, or one shorter than 16 characters once trimmed or holding a character an `Authorization` header cannot carry (anything but visible ASCII, spaces and tabs), is a startup error. Only read with `--enable-keymanager`; set without it, startup warns. See [The keymanager API](#the-keymanager-api) |
 | `--web3signer-url` | none | Base URL of a Web3Signer (`https://signer:9000`): the signer a remote key imported through `POST /eth/v1/remotekeys` without a `url` of its own is assigned to. Checked for shape at startup. Keys whose definitions entry names a signer need no default |
-| `--builder-proposals` | off | Propose builder blocks: register each validator with the beacon node's builder (an ethlambda node: `--builder`) and accept a blinded block when the builder's bid wins. Registrations and blinded blocks are fulu and earlier only. From gloas the builder market works through proposer preferences, which are published with or without this flag; there it only sets the boost factor that weighs p2p bids in `produceBlockV4`. Without it that factor is `0`, the local payload unless it cannot be built: a node whose execution client fails at the slot may still build on a pooled p2p bid, and the client signs that block, as Lighthouse, Prysm and Teku do |
-| `--builder-boost-factor` | `100` | How a builder's bid is weighed against the local payload: the local payload wins iff `local >= factor * bid / 100`. `0` prefers the local payload unless it cannot be built. From gloas it is also sent in `produceBlockV4`'s body, so a pooled p2p bid can win on value; without `--builder-proposals` the body carries `0`, which still lets a node whose local build fails build on such a bid. Requires `--builder-proposals`; conflicts with `--prefer-builder-proposals` |
-| `--prefer-builder-proposals` | off | Take the builder's block whenever there is a valid bid: this client sends `builder_boost_factor = u64::MAX`. The beacon node still keeps its local payload when its execution client sets `shouldOverrideBuilder`. Requires `--builder-proposals`; conflicts with `--builder-boost-factor` |
-| `--builder-min-bid` | `0` | The smallest builder bid, in gwei, a gloas block may be built on: sent as `produceBlockV4`'s `min_bid`, so the node takes no p2p bid whose value plus execution payment is below it, however the boost factor weighs it. Gloas only. Worth setting with `--prefer-builder-proposals`, which otherwise takes a 1-gwei bid over the local payload. `0` sets no floor. Taken with or without `--builder-proposals`: without it, it is the floor for the bid a node may build on when its own execution client fails at the slot |
+| `--builder-proposals` | off | Propose builder blocks before gloas: register each validator with the beacon node's builder (an ethlambda node: `--builder`) and accept a blinded block when the builder's bid wins. Registrations and blinded blocks are fulu and earlier only. From gloas the builder market works through proposer preferences and p2p bids, and neither needs this flag: the preferences are published, and p2p bids compete with the local payload under `--builder-boost-factor` and `--builder-min-bid`, with or without it, as in Lighthouse, Teku and Nimbus. Conflicts with `--self-build-only` |
+| `--builder-boost-factor` | `100` | How a builder's bid is weighed against the local payload: the local payload wins iff `local >= factor * bid / 100`. `0` prefers the local payload unless it cannot be built. From gloas it is sent in `produceBlockV4`'s body with or without `--builder-proposals`, so by default a pooled p2p bid competes at par and wins when it pays more than the local payload, or when the local payload cannot be built. Before gloas it is sent only with `--builder-proposals`, and the factor is `0` without it; on a network that schedules no gloas, a factor other than `100`, `--prefer-builder-proposals` or a `--builder-min-bid` set without `--builder-proposals` is warned of at startup, since it does nothing yet. Conflicts with `--prefer-builder-proposals` and `--self-build-only` |
+| `--prefer-builder-proposals` | off | Take the builder's block whenever there is a valid bid: this client sends `builder_boost_factor = u64::MAX`. The beacon node still keeps its local payload when its execution client sets `shouldOverrideBuilder`. From gloas with or without `--builder-proposals`; before gloas only with it. Conflicts with `--builder-boost-factor` and `--self-build-only` |
+| `--builder-min-bid` | `0` | The smallest builder bid, in gwei, a gloas block may be built on: sent as `produceBlockV4`'s `min_bid`, so the node takes no p2p bid whose value plus execution payment is below it, however the boost factor weighs it. Gloas only, and taken with or without `--builder-proposals`. Worth setting with `--prefer-builder-proposals`, which otherwise takes a 1-gwei bid over the local payload. `0` sets no floor. Conflicts with `--self-build-only` |
+| `--self-build-only` | off | Never sign a block built on a builder's payload (Lodestar's `executiononly`). From gloas each block request asks for no bid (`builder_boost_factor` `0`, `min_bid` `2^64 - 1`), and a block whose bid names a builder anyway, from a node that ignores `min_bid`, is refused before slashing protection records the slot. When the beacon node cannot build the payload itself, the slot is missed rather than built on a bid. Before gloas nothing changes: without `--builder-proposals` a blinded block is already refused. Conflicts with `--builder-proposals`, `--builder-boost-factor`, `--prefer-builder-proposals` and `--builder-min-bid` |
 | `--init-slashing-protection` | off | Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing |
+| `--enable-doppelganger-protection` | off | Sign no attestation or block for a validator until the beacon node has seen it stay silent for a full epoch, and stop if it sees one act meanwhile. Applies at every start and to every key the keymanager API imports, and costs two to three epochs of attestations each time. See [Doppelganger protection](#doppelganger-protection) |
+| `--disable-event-stream` | off | Read no beacon node's event stream, so every attestation, sync committee message and payload timeliness committee vote waits for its offset into the slot. One flag for what Lighthouse splits between `--disable-beacon-head-monitor` and `--disable-payload-available-monitor`; Prysm's nearest is `--disable-attest-timely`. For a node whose stream is broken, or a proxy in front of it that holds events back. See [Duties start on the block](#duties-start-on-the-block) |
 
 ### What it does today
 
@@ -371,7 +520,9 @@ dependent root.
 Each slot it wakes at the boundary. If one of its validators proposes that
 slot, it signs the RANDAO reveal, asks the beacon node for a block, checks that
 the block is for the slot and proposer it asked about, signs it and publishes
-it. One third into the slot it fetches the attestation data, checks that it is
+it. When the slot's block becomes a beacon node's head, or one third into the
+slot at the latest (see [Duties start on the block](#duties-start-on-the-block)),
+it fetches the attestation data, checks that it is
 for the slot it asked about and that its `index` is one the slot's fork allows
 (0 before gloas, 0 or 1 from it, where it is the payload signal), signs for
 every validator due that slot, and submits the batch. A node whose answer fails
@@ -406,10 +557,18 @@ and it would buy nothing: the attestations this client submits are electra's
 cannot serve whatever it does with blocks. A block from any earlier fork is
 refused by name rather than failing to decode.
 
-Blocks are fetched and published as SSZ rather than JSON. Signing a block means
-computing its `hash_tree_root`, which only the typed container can give; a
-hand-written JSON mapping of an execution payload would be a large surface on
+Blocks are fetched as SSZ by preference and published as SSZ. Signing a block
+means computing its `hash_tree_root`, which only the typed container can give;
+a hand-written JSON mapping of an execution payload would be a large surface on
 which a single wrong field silently produces a signature over the wrong block.
+`produceBlockV3` (electra and fulu) is still asked for
+`application/octet-stream;q=1.0,application/json;q=0.9`, and a JSON answer is
+decoded into the same containers through their serde support in
+`ethlambda-types`, the one an ethlambda beacon node writes that answer with.
+That is for ethereum-package's blobber, which sits between the client and its
+node, rewrites `Accept` to `application/json` on block production, and relays
+the node's answer unchanged. Gloas's `produceBlockV4`, which blobber does not
+intercept, stays SSZ-only.
 
 From gloas on a proposal is two messages. The client asks for the block with
 `include_payload=true` (`produceBlockV4`), publishes the block bare, then signs
@@ -418,26 +577,42 @@ it with its blobs and cell proofs (`Eth-Blob-Data-Included: true`). Both go out 
 SSZ. The envelope shares the proposal's budget (the attester offset, below), so
 a proposal that overruns it is abandoned wherever it is. A failure to publish
 the envelope is logged at error and counted, and does not fail the proposal. A
-block that commits to a builder's bid is left alone.
+block that commits to a builder's bid is signed and published, and its envelope
+left to that builder; with `--self-build-only` such a block is refused before
+slashing protection records the slot or the block is signed (only the RANDAO
+reveal, which is not slashable, was signed before the request).
 
 Each epoch it also fetches the payload timeliness committee duties for the
-validators it holds, for this epoch and the next when they are gloas ones. A member sleeps until `PAYLOAD_ATTESTATION_DUE_BPS` of the
-slot, asks the node for the
+validators it holds, for this epoch and the next when they are gloas ones. The
+gloas fork epoch's are the exception: a node cannot know them before the fork,
+so they are fetched at the fork epoch's first slot rather than as the previous
+epoch's lookahead. When an epoch's schedule could not be fetched, the client
+asks again after each slot's duties until it has one. A member waits for a
+node's `execution_payload_available` for the slot, or for
+`PAYLOAD_ATTESTATION_DUE_BPS` of the slot at the latest, asks the node for the
 payload attestation data, signs it under the PTC domain and submits it. A `204`
-(the node knows no block for the slot) means no vote. So a gloas slot runs in
-this order: propose at the boundary, attest at `ATTESTATION_DUE_BPS_GLOAS`,
-aggregate at `AGGREGATE_DUE_BPS_GLOAS`, then the committee vote. The attestation
-and the committee vote are each bounded by the end of the slot.
+(the node knows no block for the slot) means no vote, and so does a node whose
+last sync probe said syncing or optimistic: the data is not asked of it, so
+no vote is cast over an optimistic head. So a gloas slot runs in this order:
+propose at the boundary, attest on the block or at
+`ATTESTATION_DUE_BPS_GLOAS`, aggregate at `AGGREGATE_DUE_BPS_GLOAS`, and the
+committee vote on the payload or at its deadline, beside the other two rather
+than after them, since a payload that arrives early can come before the
+aggregation. The attestation and the committee vote are each bounded by the
+end of the slot.
 
 Sync committee duties run beside the attester and committee work, not after it.
 Each epoch the client fetches its sync duties for the current period and the
 next (`POST /eth/v1/validator/duties/sync/{epoch}`, asked at the period's first
 epoch) and posts `sync_committee_subscriptions` for the current period's seats,
 until the period's end, so the node joins the subnets. The next period's are
-added once its boundary is within four epochs. A member sleeps until
-`SYNC_MESSAGE_DUE_BPS` (`SYNC_MESSAGE_DUE_BPS_GLOAS` from gloas), reads
+added once its boundary is within four epochs. A member waits for the slot's
+block, or for `SYNC_MESSAGE_DUE_BPS` (`SYNC_MESSAGE_DUE_BPS_GLOAS` from gloas)
+at the latest, reads
 `/eth/v1/beacon/blocks/head/root`, signs it and submits one message per
-validator. It refuses to sign when the node reports the head optimistic. A
+validator. It refuses to sign when the node reports the head optimistic, and
+never reads the head from a node whose last sync probe said syncing or
+optimistic, since a syncing node answers its stale head with no flag set. A
 member selected by the selection-proof hash for a subnet then waits for
 `CONTRIBUTION_DUE_BPS` (`CONTRIBUTION_DUE_BPS_GLOAS`), fetches the node's
 contribution for that subnet and publishes it wrapped and signed. A subnet whose
@@ -446,9 +621,243 @@ for wall slot `S` are those of the period containing `S + 1`, since members
 assigned to slot `S` sign for `S - 1`. Both halves are bounded by the end of the
 slot.
 
-Not implemented: doppelganger protection. Voluntary exits are signed by the
-keymanager API's `voluntary_exit` route and by
-[`ethlambda voluntary-exit`](#voluntary-exit).
+Voluntary exits are signed by the keymanager API's `voluntary_exit` route and
+by [`ethlambda voluntary-exit`](#voluntary-exit).
+
+### The per-slot sync check
+
+A validator must not sign against a beacon node that is syncing, whose head is
+not the network's, or one whose head is optimistic (its execution client has
+not validated the payload): the optimistic-sync specification says an
+optimistic validator must not propose, attest or take part in sync
+committees. So every slot the client asks every configured node on its chain
+(see [the chain check](#several-beacon-nodes-the-chain-check))
+`GET /eth/v1/node/syncing`, all at once, a sixth of a slot before the slot's
+boundary: 2 s on 12 s slots, as Lighthouse does. That is after the previous
+slot's last duty and leaves a healthy node time to answer, so the duty loop
+reads the answers at the boundary and never waits for one. A node gets until
+the next slot's probe to answer.
+
+- **A slot signs nothing when every node that answered is syncing or
+  optimistic**, and at least one answered: no block, attestation, aggregate,
+  sync committee message, contribution or payload timeliness vote. The epoch's
+  duty refresh, the proposer preferences poll and the builder registration
+  re-sends are skipped with the slot, and a refresh that was due runs at the
+  next slot that passes. The fee recipient re-send still goes out, since it
+  signs nothing and a node restarted while syncing must be prepared before its
+  first proposal. Each skipped slot is logged at warn and counted on
+  `ethlambda_validator_slots_skipped_syncing_total`, also by a client with no
+  keys loaded.
+- **A node that did not answer does not count as syncing.** Its duty endpoints
+  still answer `503` while it syncs, which the client reads as a node to fail
+  over from. So nodes that cannot be reached never stop the duties by
+  themselves, and only the probe taken for the slot counts: a late answer, or
+  one from an earlier slot, opens the check rather than holding it shut. A
+  node whose answer is still on its way at the boundary, and that answered
+  synced the slot before, holds the check open too, so a slow synced node does
+  not lose the slot to a fast syncing one.
+- **Requests go to the best-ranked node first**: see
+  [Ranking and broadcast](#ranking-and-broadcast). A blinded block still goes
+  back to the node that produced it.
+- **The head root and the payload attestation data are never asked of a node
+  whose last probe said syncing or optimistic, or got no answer**, even after
+  the nodes that passed have failed the request. Neither endpoint has a `503`
+  for that state: a syncing node answers its stale head, and an optimistic one
+  hands out payload data for a block its execution client has not validated.
+  So here, unlike for the slot's check, a node that did not answer is not
+  given the benefit of the doubt. With no node left to ask, the sync committee
+  message and the payload vote are not signed.
+- **`el_offline` ranks a node lower and stops nothing**: a node whose
+  execution client has just gone offline still has the head it validated
+  before, and reports itself optimistic once that stops being true. A node's
+  change of state (synced, syncing, optimistic, no answer, `el_offline`,
+  behind by its sync distance) is logged once, when it changes.
+- **There is no clock-based rule for signing.** The client never skips duties
+  because the head looks old: during a network-wide stall every head is old,
+  and clients that stop signing then keep the chain stalled. Only the node's
+  own `is_syncing` and `is_optimistic` count. `sync_distance` only ranks the
+  nodes, and in a stall every node is about as far behind. The
+  [clock checks](#clock-checks) read it and `head_slot` as well, and only warn.
+
+### Ranking and broadcast
+
+With several `--beacon-nodes`, every request walks the nodes in rank order
+and takes the first answer. The rank comes from each node's last sync probe,
+best first, as Lighthouse ranks its nodes:
+
+1. synced and validated: not syncing, not optimistic, execution client
+   online, and at most 8 slots behind by its own `sync_distance`
+   (Lighthouse's tolerance);
+2. synced but optimistic, or with its execution client offline;
+3. syncing, or more than 8 slots behind;
+4. not probed yet;
+5. failing: it did not answer its last probe, or since then did not answer a
+   request.
+
+Inside a tier, a node that reports syncing goes last, and an optimistic one
+or one with its execution client offline after the rest. That only reorders
+tier 3, which a stalled network fills with every node, so a synced node is
+still asked ahead of a syncing one there. `--beacon-nodes` order breaks ties,
+so a single healthy node, or several equally healthy ones, are asked exactly
+as listed. Lighthouse's finer tiers (16 and 64 slots behind) are not kept:
+they only reorder nodes that are all behind, which in practice means a stalled
+network, where every node is behind by about as much.
+
+A request that times out, or whose connection cannot be made, ranks its node
+failing at once, until a probe sent after it answers. So a node that takes requests
+and never answers costs one request timeout (8 s) and then nothing until it
+answers again, rather than a timeout on every request: an attestation duty
+used to wait out the whole timeout on a hung first node every slot, which
+left the second node no time. An answer with an error status (a `404` from a
+node with nothing to aggregate, a `503` from a syncing one) is an answer and
+changes no rank. A probe more than two slots old is not read, which only
+matters if the probe task stops, and puts every node back in list order.
+
+Every node here means every node on this client's chain: a node the
+[chain check](#several-beacon-nodes-the-chain-check) found on another chain,
+or has not checked yet, is never probed, asked or sent a broadcast, whatever
+its rank, and an envelope whose producer left the chain goes to the others.
+
+`--broadcast` sends signed messages to every node at once rather than to the
+first that accepts them, so they reach the network through every node's gossip
+mesh: `attestations` (attestations, aggregates, payload attestations),
+`blocks` (blocks and envelopes) and `sync-committee` (messages and
+contributions), comma-separated. None by default, as in Lighthouse, so the
+client behaves as before unless asked. Subscriptions, fee recipient
+preparations, builder registrations and proposer preferences always go to
+every node; `subscriptions` and `none` are accepted for compatibility and
+change nothing.
+
+- **One accepting node is success.** A message one node took is on the
+  network. A node that refused is logged.
+- **Failing nodes are sent it last.** A node ranked failing is sent a
+  broadcast only when no other node took it, so a hung node does not hold
+  every broadcast back by a request timeout.
+- **Half a second after the first acceptance, the rest are cut off.** A node
+  still sending by then is not waited for, so a node that hangs costs a
+  broadcast half a second, not a request timeout a proposal's deadline would
+  cut short. It is not ranked failing for it: a node that is only slower (to
+  import a block, or to take a large envelope) would otherwise be dropped
+  from every broadcast until its next probe, slot after slot. A node that
+  really hung is ranked failing once its probe gets no answer.
+- **A block reports the best answer**: imported (`200`) over broadcast but
+  not imported (`202`) over refused, each node's answer logged. A blinded
+  block still goes only to the node that produced it.
+- **An envelope goes to its block's producer first**, then to the other
+  nodes once the producer has answered, or after half a second without an
+  answer. The producer certainly holds the block the envelope reveals; a
+  node that has not imported it yet queues or drops the envelope, and
+  waiting for the producer's answer gives each a round trip longer to import
+  it. The half-second bound is for a producer that holds the request open
+  (one that answered the block `202` and never imported it waits for it),
+  which would otherwise keep the envelope from every node until the
+  proposal's deadline. An envelope sent without its blobs goes to the
+  producer first, with or without the flag, since only it cached them; if it
+  does not take it, the other nodes are tried in rank order, since a block
+  with no blobs can be revealed through any of them.
+- **Signed once.** Every message is signed, and recorded by slashing
+  protection, before it is sent, however many nodes it is sent to.
+
+### Clock checks
+
+Every duty is timed by this client's own clock. Ahead by more than half a
+second, an ethlambda beacon node refuses its block requests; ahead by a few
+seconds, its attestations vote for the parent; behind, every duty goes out late
+and nothing refuses it. So the client compares its clock with each beacon
+node's on every sync probe, and watches its own for steps. These checks only
+warn, since a difference does not say which clock is off. A client and a node
+on one host share a clock, so between the two only a split setup is caught.
+
+- **`Date`.** The probe answer's `Date` header, taken at the middle of the
+  second it names, less the midpoint of the round trip; answers slower than a
+  second are not used. A node is warned about once the median of its last three
+  samples is 2 s or more off, which is as fine as a one-second header can tell.
+  A sample is read for six slots, so a node that stops sending a usable `Date`
+  loses its estimate rather than keeping an old one.
+- **Slots.** A `head_slot` more than one slot past this client's wall slot
+  means this client's clock is behind, as Lighthouse checks. A node that
+  reports a nonzero `sync_distance` and is not syncing also gives its own wall
+  slot, `head_slot + sync_distance`, compared with this client's at send and at
+  receive, so a boundary crossed while the request was out does not count.
+  (Teku reports a distance of 0 whenever it is in sync, so no other distance
+  is read.) A node that sends no `Date` gets this check alone.
+- **Steps.** Each pass of the duty loop compares how far the wall clock moved
+  with how far the monotonic clock did. A step of half a second or more is
+  logged and counted on `ethlambda_validator_clock_steps_total`: back before
+  the slot served, the loop waits for the wall clock to reach the next slot
+  again; forward past the next slot, the slots stepped over are lost; within
+  those, only the next boundary moves. A loop back more than a slot late with no step (a duty
+  overran, or the process was paused) is logged too.
+
+The warnings name the node by its position in `--beacon-nodes`, from 0, and
+recur at most once an epoch while the clocks disagree.
+`ethlambda_validator_beacon_node_clock_offset_seconds` carries each node's
+offset. A warning from the slots alone shows there only the offset the slots
+prove, which can read under 2 (about 1.9 s on 12 s slots when this client is
+behind), so an alert meant to match the warnings fires lower; see
+[Metrics](./metrics.md#validator-client). A slot disagreement proving less
+than half a second, a boundary crossed inside a long round trip, is not
+warned about.
+
+### Doppelganger protection
+
+Off unless `--enable-doppelganger-protection` is passed. A doppelganger is a
+second validator client running the same key, usually a key moved to a new
+machine while the old one still runs. Slashing protection cannot see it, since
+each client's record holds only what that client signed. With the flag on, a
+key signs no attestation or block until its beacon node has watched it stay
+silent for a full epoch, through the standard
+`POST /eth/v1/validator/liveness/{epoch}`. The rule is Lighthouse's:
+
+- A key loaded at startup, or imported through the keymanager API, in epoch
+  `E` is watched from `E + 1`. Activity in `E` is not held against it, since it
+  is most likely this client's own previous process, restarted within the
+  epoch.
+- Three quarters into every slot the client asks about the previous epoch and
+  the current one. A key found live in an epoch it is watched for stops the
+  client with an error naming the validators.
+- An epoch counts as clean at the last slot of the epoch after it, once its
+  attestations have had their full inclusion window, and only when both
+  questions were answered and the key was explicitly reported not live. A
+  failed query, or a beacon node reporting itself syncing or optimistic, makes
+  no progress. With several `--beacon-nodes`, a syncing one is skipped for the
+  next.
+- So a key registered in `E` signs from `E + 3`, missing two to three epochs of
+  attestations. A key registered in epoch 0 (before genesis or during the
+  chain's first epoch, at startup or by import) signs at once, as Lighthouse's
+  do: every validator missing those epochs together could stall a new chain.
+- An epoch that could not be counted clean (no beacon node answered at its
+  deciding slot) is not asked about again, since a node answers only for the
+  previous, current and next epoch: the key waits for the next epoch instead,
+  and the miss is logged at error.
+
+Withheld while a key is checked: attestations, blocks (with the RANDAO reveal)
+and aggregates, the last because a node marks an aggregator live and would
+report this client as a doppelganger of itself. Everything else goes on: duties
+are fetched and subnets subscribed, so the key is ready the moment it is
+cleared, and sync committee messages and contributions, payload timeliness
+votes, builder registrations, proposer preferences and voluntary exits are
+signed as usual, as Lighthouse's client signs them during its own check. None
+of them is slashable, and an ethlambda beacon node counts none of them as
+liveness: it counts attestations, aggregates and block proposers. A beacon node
+that did count one of them (a sync committee message, say) would report this
+client's own message back as a doppelganger and stop it; against such a node,
+leave the flag off.
+
+A key with no validator index yet is not asked about and stays withheld; with
+no index it has no duties either. A key deleted through the keymanager API is
+no longer checked, so a copy the operator now runs elsewhere on purpose does
+not stop this client, and importing it again starts the check again.
+
+Under a supervisor that restarts the client (`Restart=on-failure`), a detection
+becomes a restart loop: each start checks again and stops again for as long as
+the other client runs. That is safe, since a key under the check signs nothing,
+but the loop does not end until the other client is found and stopped. The
+check is not foolproof either: two clients with the same key started together
+both see silence and both start signing, and a doppelganger that is down for
+the epochs checked goes unseen until it comes back, when nothing is checking any
+more. `ethlambda_validator_doppelganger_detecting` counts the keys still
+withheld.
 
 ### Duty offsets come from the network
 
@@ -466,6 +875,48 @@ committee offsets (`SYNC_MESSAGE_DUE_BPS`, `CONTRIBUTION_DUE_BPS` and their
 `SECONDS_PER_SLOT` no longer exists in the specification and is accepted only as
 a fallback, since deployed nodes still send it. A node sending both is required
 to agree with itself.
+
+### Duties start on the block
+
+The offsets are deadlines, not start times. The specification has an attester
+sign once it has the slot's block or once the offset has passed, whichever comes
+first, a sync committee member likewise, and a payload timeliness committee
+member as soon as it has seen the payload and its blob data. So the client reads
+every beacon node's `GET /eth/v1/events`, one connection per topic: `head`, and
+on a network that schedules gloas `execution_payload_available` as well, opened
+when gloas first shows in the fork schedule, at startup or once the chain check
+picks it up later.
+
+- A `head` for the current slot, not `execution_optimistic`, starts the slot's
+  attestation and sync committee message.
+- An `execution_payload_available` for the current slot starts its committee
+  vote. The block alone never does.
+- What is signed is still the node's answer, fetched through the usual failover,
+  and the early attempt signs it only if it is about the event's block: the
+  attestation data's `beacon_block_root`, the head root, or payload attestation
+  data that also says `payload_present` and `blob_data_available`. Otherwise
+  nothing is recorded or signed, and the duty asks again on the next report
+  about the slot it has not tried (another node's, or another block's), or
+  runs at its offset if none comes, as it would have with no event. An answer
+  still outstanding at the offset is dropped there, so an event never makes a
+  duty later. Each duty is signed at most once a slot either way.
+- An event from any node starts a duty. The check above is what makes that safe
+  when the node answering has not imported the block yet: that attempt
+  declines, and the answering node's own report of the block starts the next.
+- A stream that drops is opened again after a second, the wait doubling to 12
+  seconds while the node stays unreachable. One silent for a minute is taken
+  for dead and opened again, logged at debug only, since a stream quiet by
+  design (`execution_payload_available` before gloas, on a node that sends no
+  keep-alives) does that every minute. While a stream is down the duties keep
+  their offsets, so a broken stream costs the early start and nothing else.
+- Aggregation and sync contributions keep their own offsets, and nothing waits
+  after the block before attesting.
+
+`ethlambda_validator_duty_triggers_total` counts what started each duty (see
+[Metrics](./metrics.md#validator-client)). An ethlambda beacon node builds its
+`single_attestation` events while any client is subscribed to any topic, so this
+client's subscription turns that work on (see
+[`rpc.md`](rpc.md#get-ethv1events)). `--disable-event-stream` reads no stream.
 
 ### Proposer duties are less durable than attester ones
 
@@ -587,7 +1038,14 @@ Off unless `--enable-keymanager` is passed. It serves `GET`, `POST` and
 `DELETE /eth/v1/keystores`, authenticated with a bearer token read from
 `api-token.txt` in the validators directory and generated there on first start
 if absent. The token file is written `0600` and a file too short to be a real
-token is refused rather than accepted.
+token, or holding a character an `Authorization` header cannot carry (anything
+but visible ASCII, spaces and tabs), is refused rather than accepted.
+
+`--keymanager-token-file` names another file to read the token from instead,
+and `api-token.txt` is then neither read nor written. That file is the
+operator's: the client only reads it, trimmed and held to the same checks, and
+a missing or refused one stops it at startup rather than being replaced with a
+generated token.
 
 It serves `GET`, `POST` and `DELETE /eth/v1/remotekeys` for the keys a
 Web3Signer holds. The two routes partition the store: `/keystores` lists and
@@ -687,6 +1145,47 @@ returns the deleted keys' records as a minimal EIP-3076 interchange, answering
 The specification requires TLS. This binds to `--http-address`, loopback by
 default; exposing it further means putting a TLS terminator in front.
 
+### Stopping
+
+SIGINT or SIGTERM stops the client cleanly once its startup is done. It logs
+`Shutdown signal received`, starts no other slot, and lets the work in flight
+finish:
+
+- The slot in progress, with its proposal, gloas envelope and attestations,
+  and a signed blinded block's publish, get up to 8 s after the signal, which
+  is what Prysm's validator client waits. On a 12 s slot that covers the
+  proposal and the attestations; the aggregates, sync committee contributions
+  and payload timeliness vote due later in the slot may be cut. Cutting any of
+  it is safe: a block or attestation is recorded in slashing protection before
+  it is signed, and the rest is not slashable.
+- The keymanager API takes no new request, and one in flight gets up to 60 s
+  more, so an import is not cut between saving its keys and registering them.
+- The sends that are repeated anyway (proposer preferences, subnet
+  subscriptions, builder registrations, the fee recipient re-send) are not
+  waited for.
+
+It then logs `Shutdown complete` and exits 0. Three more signals end it at
+once, with exit code 1. Anything still running on the client's threads by
+then, such as an import the keymanager wait gave up on, gets up to 2 s more
+before the process exits; signals do nothing in those 2 s.
+
+Both signals are listened for from the moment the client starts. One sent
+during startup, while the keystores are decrypted and the beacon node is
+first asked for the chain, logs `Shutdown signal received during startup`
+and ends the process at once with exit code 0: no duty has run and the
+keymanager API has taken no request, so nothing is signed and there is
+nothing to wait for. That holds in a container too, where the client is
+PID 1 and a signal with no handler is ignored.
+
+A signal sent while the client stops on an error (an unusable
+slashing-protection record, a doppelganger) does not cut its keymanager wait
+short: it is logged, and three more end the process with exit code 1.
+
+systemd's defaults need no change: `KillSignal` is SIGTERM, and `TimeoutStopSec`
+(90 s) covers both waits. `docker stop` sends SIGTERM and waits 10 s, enough for
+the slot; with `--enable-keymanager`, pass `--stop-timeout 70` so an import in
+flight is not cut short.
+
 ### Metrics
 
 Served on `--metrics-port`, prefixed `ethlambda_validator_` rather than the
@@ -694,6 +1193,69 @@ Served on `--metrics-port`, prefixed `ethlambda_validator_` rather than the
 beacon chain. Every series is registered at startup so it reads zero rather
 than being absent before its first event, which is what lets an alert fire on
 "attestations stopped". See [Metrics](./metrics.md#validator-client).
+
+`GET /health` on the same port answers whether the client can do its duties:
+`200` when it can, `503` when it cannot or has not started yet, with the checks
+behind the answer.
+
+```json
+{
+  "status": "unhealthy",
+  "service": "ethlambda-validator",
+  "checks": {
+    "beacon_nodes": { "usable": 0, "configured": 2 },
+    "validators": { "loaded": 64, "resolved": 64 },
+    "slashing_protection": { "last_write_ok": true },
+    "started": true,
+    "schedule_current": true
+  }
+}
+```
+
+It reads state the client already keeps and sends no request of its own, so it
+is cheap to poll.
+
+- **`beacon_nodes`**: `usable` counts the nodes whose latest
+  [sync probe](#the-per-slot-sync-check) was answered, neither syncing nor
+  optimistic, and is at most two slots old. One usable node is enough: a client
+  with some nodes down and one usable is `healthy`, with the counts in the
+  body.
+- **`validators`**: the keys loaded, and those the last duty refresh resolved to
+  an index. Reported, never failing: a key waiting for activation has no index
+  yet, and a client started with no keys, to wait for a keymanager import, is
+  idle on purpose. A key doppelganger protection still withholds counts as
+  loaded.
+- **`slashing_protection.last_write_ok`**: the record's last write succeeded,
+  and the last access to it did not give up after waiting 3 s for another one
+  to finish. A failed write keeps it `false` until a later write succeeds. A
+  full disk or a read-only remount under `--validators-dir` shows up here.
+- **`started`**: a duty refresh has succeeded since the process started.
+- **`schedule_current`**: the attester schedule the last successful duty
+  refresh left held reaches the current epoch: the refresh's own epoch, and
+  the next when its lookahead fetch went through too. A node can answer its
+  probe synced and still fail every refresh, or every lookahead; once the
+  schedule runs out the client has no attestations to make. `true` before the
+  first refresh and before genesis. A client with no validator resolved (no
+  keys, or keys waiting for activation) holds no schedule, and a refresh
+  counts through the next epoch, so it is not caught out at each boundary.
+
+`status` is one of three:
+
+- `healthy` (`200`): started, at least one usable node, the last write went
+  through, and the schedule is current.
+- `starting` (`503`): no refresh has succeeded yet and nothing else has failed.
+  A node not probed yet does not count against a client that has not started,
+  so a normal startup reads `starting` throughout. Once started, a node with no
+  probe counts as unusable.
+- `unhealthy` (`503`): anything else.
+
+Remote signers are not checked, since that would take a request to each.
+`ethlambda_validator_healthy` carries the same answer as a series, set from the
+same report on every scrape.
+
+Point readiness checks, load balancers and uptime monitors at it, not a
+Kubernetes liveness probe: it answers `503` while every beacon node is down or
+syncing, which restarting the validator client does not fix.
 
 ## `voluntary-exit`
 

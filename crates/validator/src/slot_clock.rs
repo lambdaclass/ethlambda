@@ -3,21 +3,28 @@
 //! Seeded once from the beacon node's genesis, then independent of it. It is
 //! deliberately not driven by the node's event stream: that stream is
 //! best-effort by contract, dropping events for a slow subscriber, and a
-//! dropped event must not mean a missed duty.
+//! dropped event must not mean a missed duty. The stream can only start a duty
+//! earlier than the offset this clock gives (see `crate::head_monitor`); the
+//! offset stays its deadline.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
 use ethlambda_types::beacon::primitives::{Epoch, Slot};
+use ethlambda_types::beacon::signing::compute_epoch_at_slot;
+
+use crate::shared_config::SharedConfig;
 
 /// Basis points in a whole, which is what the duty offsets are expressed in.
 const BASIS_POINTS: u64 = 10_000;
 
-/// Converts wall-clock time to slots and back, for a chain whose genesis, slot
-/// length and duty offsets are fixed for the life of the clock.
+/// Converts wall-clock time to slots and back, for a chain whose genesis and
+/// slot length are fixed for the life of the clock. The fork schedule and the
+/// duty offsets are read from a [`SharedConfig`] on every call, so a schedule
+/// swap (see [`crate::chain_check`]) moves the clock along with the signing
+/// domains.
 ///
 /// # Milliseconds and basis points, because the specification moved
 ///
@@ -40,11 +47,13 @@ const BASIS_POINTS: u64 = 10_000;
 /// holds the whole [`Config`] and answers by the fork of the slot's own epoch
 /// (`Config::fork_at_epoch`), which keeps a client running across the boundary
 /// on the right offsets on both sides of it.
+///
+/// Clones share the configuration handle, so a swap reaches every copy.
 #[derive(Debug, Clone)]
 pub struct SlotClock {
     genesis_time: u64,
     slot_duration_ms: u64,
-    config: Config,
+    config: SharedConfig,
 }
 
 impl SlotClock {
@@ -72,20 +81,26 @@ impl SlotClock {
     /// of every fork reach it. See the type's docs for why it keeps the whole
     /// configuration rather than one pair of offsets.
     pub fn from_config(genesis_time: u64, config: &Config) -> Self {
-        assert!(
-            config.slot_duration_ms > 0,
-            "slot_duration_ms must be nonzero"
-        );
+        Self::from_shared(genesis_time, SharedConfig::new(config.clone()))
+    }
+
+    /// A clock reading the schedule from `config`, shared with whatever else
+    /// holds the handle (the signing context). The slot duration is taken
+    /// from it now and never again: the chain check refuses a node whose
+    /// slot duration differs, so it cannot change under a running clock.
+    pub fn from_shared(genesis_time: u64, config: SharedConfig) -> Self {
+        let slot_duration_ms = config.load().slot_duration_ms;
+        assert!(slot_duration_ms > 0, "slot_duration_ms must be nonzero");
         Self {
             genesis_time,
-            slot_duration_ms: config.slot_duration_ms,
-            config: config.clone(),
+            slot_duration_ms,
+            config,
         }
     }
 
     /// Whether `slot` is a gloas slot.
     pub fn is_gloas(&self, slot: Slot) -> bool {
-        self.config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Gloas
+        self.config.load().fork_at_epoch(self.epoch_of(slot)) >= ForkName::Gloas
     }
 
     /// The slot containing `now`, or `None` before genesis.
@@ -107,7 +122,13 @@ impl SlotClock {
 
     /// The epoch containing `slot`.
     pub fn epoch_of(&self, slot: Slot) -> Epoch {
-        slot / SLOTS_PER_EPOCH
+        compute_epoch_at_slot(slot)
+    }
+
+    /// The current epoch, or `None` before genesis. Each caller picks what
+    /// "before genesis" means for it.
+    pub fn current_epoch(&self) -> Option<Epoch> {
+        self.now().map(|slot| self.epoch_of(slot))
     }
 
     /// How long one slot lasts.
@@ -127,11 +148,11 @@ impl SlotClock {
 
     /// When the attester duty for `slot` should run.
     pub fn attestation_time(&self, slot: Slot) -> SystemTime {
-        let bps = if self.is_gloas(slot) {
-            self.config.attestation_due_bps_gloas
-        } else {
-            self.config.attestation_due_bps
-        };
+        let bps = self.offset_bps(
+            slot,
+            |config| config.attestation_due_bps,
+            |config| config.attestation_due_bps_gloas,
+        );
         self.offset_into(slot, bps)
     }
 
@@ -140,7 +161,7 @@ impl SlotClock {
     /// Only meaningful for a gloas slot; the offset is the configured one
     /// whatever the slot, and callers gate on [`Self::is_gloas`].
     pub fn payload_attestation_time(&self, slot: Slot) -> SystemTime {
-        self.offset_into(slot, self.config.payload_attestation_due_bps)
+        self.offset_into(slot, self.config.load().payload_attestation_due_bps)
     }
 
     /// When the aggregation duty for `slot` should run.
@@ -149,11 +170,11 @@ impl SlotClock {
     /// necessarily: an aggregator folds together votes its beacon node has
     /// collected, and before the attesters have voted there is nothing to fold.
     pub fn aggregation_time(&self, slot: Slot) -> SystemTime {
-        let bps = if self.is_gloas(slot) {
-            self.config.aggregate_due_bps_gloas
-        } else {
-            self.config.aggregate_due_bps
-        };
+        let bps = self.offset_bps(
+            slot,
+            |config| config.aggregate_due_bps,
+            |config| config.aggregate_due_bps_gloas,
+        );
         self.offset_into(slot, bps)
     }
 
@@ -162,22 +183,39 @@ impl SlotClock {
     /// The fork of `slot` picks the offset, as it does for attestations:
     /// gloas moves it earlier.
     pub fn sync_message_time(&self, slot: Slot) -> SystemTime {
-        let bps = if self.is_gloas(slot) {
-            self.config.sync_message_due_bps_gloas
-        } else {
-            self.config.sync_message_due_bps
-        };
+        let bps = self.offset_bps(
+            slot,
+            |config| config.sync_message_due_bps,
+            |config| config.sync_message_due_bps_gloas,
+        );
         self.offset_into(slot, bps)
     }
 
     /// When a sync committee aggregator publishes its contribution for `slot`.
     pub fn contribution_time(&self, slot: Slot) -> SystemTime {
-        let bps = if self.is_gloas(slot) {
-            self.config.contribution_due_bps_gloas
-        } else {
-            self.config.contribution_due_bps
-        };
+        let bps = self.offset_bps(
+            slot,
+            |config| config.contribution_due_bps,
+            |config| config.contribution_due_bps_gloas,
+        );
         self.offset_into(slot, bps)
+    }
+
+    /// The offset for `slot` in basis points: `gloas`'s from the first gloas
+    /// slot on, `before`'s until then. The fork and the offset come from one
+    /// snapshot of the configuration, so a swap cannot split them.
+    fn offset_bps(
+        &self,
+        slot: Slot,
+        before: impl Fn(&Config) -> u64,
+        gloas: impl Fn(&Config) -> u64,
+    ) -> u64 {
+        let config = self.config.load();
+        if config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Gloas {
+            gloas(&config)
+        } else {
+            before(&config)
+        }
     }
 
     /// `bps` basis points of the way into `slot`.
@@ -187,7 +225,13 @@ impl SlotClock {
     /// milliseconds, multiplying before dividing. Doing it in `Duration`
     /// instead would keep nanoseconds and land 0.4 ms past the spec's answer on
     /// mainnet, which is wrong in the direction that matters for a deadline.
+    ///
+    /// No offset lands past the end of the slot: the offsets are read from a
+    /// beacon node's spec, at startup and again by the chain check, and one
+    /// above [`BASIS_POINTS`] would otherwise park the duty loop on a sleep
+    /// that changing the configuration later does not shorten.
     fn offset_into(&self, slot: Slot, bps: u64) -> SystemTime {
+        let bps = bps.min(BASIS_POINTS);
         let offset_ms = bps.saturating_mul(self.slot_duration_ms) / BASIS_POINTS;
         self.start_of(slot) + Duration::from_millis(offset_ms)
     }
@@ -247,8 +291,9 @@ impl SlotClock {
     /// How long from `now` until the payload timeliness committee's duty for
     /// `slot`, or zero once that instant has passed.
     ///
-    /// The PTC counterpart to [`Self::until_aggregation`]: the loop sleeps on
-    /// it between aggregation and the committee vote.
+    /// The PTC counterpart to [`Self::until_aggregation`]: the committee
+    /// vote's deadline, which it waits for unless a beacon node reports the
+    /// slot's payload available first (see `crate::head_monitor`).
     pub fn until_payload_attestation(&self, slot: Slot, now: SystemTime) -> Duration {
         self.payload_attestation_time(slot)
             .duration_since(now)
@@ -347,6 +392,7 @@ impl SlotClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_types::beacon::preset::slots_per_epoch;
 
     const GENESIS: u64 = 1_000_000;
     const SECONDS_PER_SLOT: u64 = 12;
@@ -365,6 +411,15 @@ mod tests {
 
     fn at(offset_secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(GENESIS + offset_secs)
+    }
+
+    /// An offset a node serves past the end of the slot is held to the end of
+    /// the slot, rather than parking a duty for as long as the number says.
+    #[test]
+    fn an_offset_past_the_slot_lands_at_its_end() {
+        let clock = SlotClock::new(GENESIS, SECONDS_PER_SLOT * 1_000, u64::MAX, 20_000);
+        assert_eq!(clock.attestation_time(10), clock.end_of(10));
+        assert_eq!(clock.aggregation_time(10), clock.end_of(10));
     }
 
     #[test]
@@ -418,8 +473,8 @@ mod tests {
     fn an_epoch_is_slots_per_epoch_slots() {
         let clock = clock();
         assert_eq!(clock.epoch_of(0), 0);
-        assert_eq!(clock.epoch_of(SLOTS_PER_EPOCH - 1), 0);
-        assert_eq!(clock.epoch_of(SLOTS_PER_EPOCH), 1);
+        assert_eq!(clock.epoch_of(slots_per_epoch() - 1), 0);
+        assert_eq!(clock.epoch_of(slots_per_epoch()), 1);
     }
 
     /// 3333 basis points of a 12-second slot is 3999 ms, not the 4000 a third
@@ -618,8 +673,8 @@ mod tests {
     fn the_offsets_change_at_the_gloas_boundary() {
         let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 2);
         let clock = SlotClock::from_config(GENESIS, &config);
-        let last_fulu = 2 * SLOTS_PER_EPOCH - 1;
-        let first_gloas = 2 * SLOTS_PER_EPOCH;
+        let last_fulu = 2 * slots_per_epoch() - 1;
+        let first_gloas = 2 * slots_per_epoch();
         let ms =
             |t: SystemTime, slot: u64| t.duration_since(clock.start_of(slot)).expect("after start");
 
@@ -647,8 +702,8 @@ mod tests {
     fn the_sync_offsets_follow_the_fork_of_the_slot() {
         let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 2);
         let clock = SlotClock::from_config(GENESIS, &config);
-        let last_fulu = 2 * SLOTS_PER_EPOCH - 1;
-        let first_gloas = 2 * SLOTS_PER_EPOCH;
+        let last_fulu = 2 * slots_per_epoch() - 1;
+        let first_gloas = 2 * slots_per_epoch();
         let ms =
             |t: SystemTime, slot: u64| t.duration_since(clock.start_of(slot)).expect("after start");
 

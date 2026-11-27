@@ -443,7 +443,7 @@ per-node fault (so a healthy node isn't blamed for a chain-wide stall). For duty
 Do NOT immediately restart. Diagnose that devnet in order (full method in
 `references/operations.md`): is it the young-devnet bootstrap regime (justified
 still advancing, finalized=0)? → `host-check.sh` for the per-node picture (who is
-down, restarting, or lagging past the sync gate) → vote count vs
+down, restarting, lagging, or held in `syncing`) → vote count vs
 `ceil(2/3·NODES)` → which validator cohort is missing on the aggregator → are
 missing nodes silent or voting STALE targets → host memory/CPU via the central
 Prometheus (reachable even when that server's SSH is down) → confirm no block

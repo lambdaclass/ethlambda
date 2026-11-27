@@ -235,7 +235,7 @@ pub(crate) mod tests {
     /// default key is enough to get the field's length right.
     fn empty_sync_committee() -> altair::SyncCommittee {
         altair::SyncCommittee {
-            pubkeys: vec![Default::default(); preset::SYNC_COMMITTEE_SIZE]
+            pubkeys: vec![Default::default(); preset::sync_committee_size()]
                 .try_into()
                 .expect("built at exactly SYNC_COMMITTEE_SIZE"),
             aggregate_pubkey: Default::default(),
@@ -323,13 +323,13 @@ pub(crate) mod tests {
             genesis_validators_root: H256::ZERO,
             // An interior slot of its epoch, well clear of a boundary, since
             // `advance_one_slot` needs a `+= 1` that does not itself cross one.
-            slot: preset::SLOTS_PER_EPOCH * 2,
+            slot: preset::slots_per_epoch() * 2,
             fork: Default::default(),
             latest_block_header: Default::default(),
-            block_roots: vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            block_roots: vec![H256::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
-            state_roots: vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            state_roots: vec![H256::ZERO; preset::slots_per_historical_root()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             historical_roots: Default::default(),
@@ -342,10 +342,10 @@ pub(crate) mod tests {
             balances: vec![preset::MIN_ACTIVATION_BALANCE; count]
                 .try_into()
                 .expect("`count` is far below VALIDATOR_REGISTRY_LIMIT"),
-            randao_mixes: vec![H256::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+            randao_mixes: vec![H256::ZERO; preset::epochs_per_historical_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+            slashings: vec![0; preset::epochs_per_slashings_vector()]
                 .try_into()
                 .expect("the vector is built at its exact length"),
             previous_epoch_participation: vec![0u8; count]
@@ -400,7 +400,7 @@ pub(crate) mod tests {
             body_root: root_for_index(state.slot),
         };
 
-        let ring_index = (state.slot as usize) % preset::SLOTS_PER_HISTORICAL_ROOT;
+        let ring_index = (state.slot as usize) % preset::slots_per_historical_root();
         state.block_roots[ring_index] = root_for_index(state.slot);
         state.state_roots[ring_index] = root_for_index(state.slot + 1);
 
@@ -412,7 +412,7 @@ pub(crate) mod tests {
 
         // One slot's attesters: one epoch's worth of committees split across
         // SLOTS_PER_EPOCH slots.
-        let attesters = VALIDATOR_COUNT / preset::SLOTS_PER_EPOCH as usize;
+        let attesters = VALIDATOR_COUNT / preset::slots_per_epoch() as usize;
         for index in 0..attesters {
             state.current_epoch_participation[index] = 0b0000_0111;
         }
@@ -430,9 +430,9 @@ pub(crate) mod tests {
         let mut state = base.clone();
         // Repositioned to the last slot of its own epoch, so the `+= 1` below
         // is a genuine epoch crossing regardless of where `base` itself sits.
-        state.slot = (base.slot / preset::SLOTS_PER_EPOCH + 1) * preset::SLOTS_PER_EPOCH - 1;
+        state.slot = (base.slot / preset::slots_per_epoch() + 1) * preset::slots_per_epoch() - 1;
         state.slot += 1;
-        let epoch = state.slot / preset::SLOTS_PER_EPOCH;
+        let epoch = state.slot / preset::slots_per_epoch();
 
         for index in 0..state.balances.len() {
             state.balances[index] = balance_for_index(index);
@@ -458,9 +458,9 @@ pub(crate) mod tests {
         state.previous_epoch_participation =
             std::mem::replace(&mut state.current_epoch_participation, zeroed_participation);
 
-        let randao_index = (epoch as usize) % preset::EPOCHS_PER_HISTORICAL_VECTOR;
+        let randao_index = (epoch as usize) % preset::epochs_per_historical_vector();
         state.randao_mixes[randao_index] = root_for_index(epoch);
-        let slashings_index = (epoch as usize) % preset::EPOCHS_PER_SLASHINGS_VECTOR;
+        let slashings_index = (epoch as usize) % preset::epochs_per_slashings_vector();
         state.slashings[slashings_index] = balance_for_index(slashings_index);
 
         state.previous_justified_checkpoint = state.current_justified_checkpoint;

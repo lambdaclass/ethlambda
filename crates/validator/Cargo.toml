@@ -13,8 +13,9 @@ version.workspace = true
 ethlambda-types.workspace = true
 ethlambda-metrics.workspace = true
 
-# A produced block is decoded and re-published as SSZ, not JSON: signing it
-# needs its `hash_tree_root`, which only the typed container can give. See
+# A produced block is decoded into its typed container (from SSZ, or from JSON
+# when a proxy left nothing else) and re-published as SSZ: signing it needs its
+# `hash_tree_root`, which only the typed container can give. See
 # `beacon_node::block_contents`.
 libssz.workspace = true
 libssz-derive.workspace = true
@@ -33,8 +34,9 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["time", "macros", "rt"] }
 # `CancellationToken`: the signal that stops the client when the
 # slashing-protection record becomes unusable, and the one that tells the
-# keymanager server to finish its requests in flight.
-tokio-util.workspace = true
+# keymanager server to finish its requests in flight. `rt` for `TaskTracker`,
+# which holds the detached tasks a shutdown waits for.
+tokio-util = { workspace = true, features = ["rt"] }
 reqwest = { workspace = true, features = ["json"] }
 
 # BLS12-381. Same version and backend the state transition verifies with, so a

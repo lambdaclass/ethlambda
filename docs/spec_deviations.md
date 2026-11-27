@@ -28,6 +28,114 @@ interval, and stops early once it runs out of time.
 - **leanSpec:** `aggregate()` is called inline and synchronously from `tick_interval`, at interval 2 only. It walks every attestation data with fresh evidence, with no job cap, no time budget, no worker, and no cancellation.
 - **Equivalence:** on cancellation the worker emits only the groups that finished, so a slot may pack fewer aggregates than the synchronous path would; any such subset still yields a valid block, affecting how many votes are included rather than signature validity. The job cap has the same character: it bounds prover work per slot, not what a block may carry.
 
+## The duty sync gate compares the head with peers' heads, not with imported blocks
+
+A node reports itself syncing, and stops proposing and attesting, only when its
+head trails the wall clock **and** its peers report a head ahead of it.
+
+- **leanSpec:** `ValidatorService._is_synced_for_duties` (PR #708) takes the
+  freshest block it knows from imported blocks only. When that block is more
+  than 8 slots behind the wall clock it reads the network as stalled and allows
+  duties; otherwise the node is syncing once its head is more than 4 slots
+  behind the clock, with a hysteresis band of 2.
+  `test_no_extra_blocks_treats_isolation_as_network_stall` pins the case of a
+  node 100 slots behind with nothing newer imported, which does its duties.
+- **ethlambda:** the node is syncing when its head is more than 4 slots behind
+  the wall clock and the head its peers report is more than 1 slot ahead of its
+  own, with a band of 2 on the clock lag (the band never takes the lead's
+  threshold below 1 slot, so the lead gets none) (`SyncThresholds::LEAN`,
+  `crates/net/api/src/sync.rs`, judged in
+  `crates/blockchain/src/sync_status.rs`). The peers' head comes from `Status`
+  (`crates/net/p2p/src/peer_heads.rs`): the highest of each connected peer's
+  latest report, re-requested every 2 slots and counted for 8 slots after it
+  arrives, with a head past the wall clock by more than a slot dropped and a
+  head the node has already imported not counted (the peer is not ahead of
+  it, whatever its slot). A node whose own clock runs slow therefore drops
+  honest heads too, and reads as synced however far behind it is: when most
+  connected peers, and at least two, report a head past its clock it warns,
+  at most once a stall window, and counts them in
+  `lean_sync_peers_held_back{reason="future"}`.
+  The peer lead is smaller
+  than the clock lag because a report is up to 2 slots old: a node 5 slots
+  behind a producing network sees its peers' 2-slot-old heads 2 slots ahead.
+  With no report at all the node cannot be behind anyone and reads as synced,
+  from the first judgment on: a node resuming a stale database does its duties
+  on its stale head until a peer reports a lead, as a Lighthouse node does in
+  its initial `Stalled` state. Assuming the network is at the clock instead
+  would idle every node at once whenever all of them are behind it (a slow
+  start, a restart after an outage), and a network where nobody proposes stays
+  stalled.
+- **Stall window:** a lead that does not turn into progress is given up on. A
+  node that has read as syncing on its peers' word for 16 slots in all
+  (`SyncThresholds::stall_window`) with its head flat throughout treats the
+  network as stalled and does its duties, until its head next advances. The
+  slots are added up rather than counted from when the node last fell behind:
+  each slot spent behind counts once, and a lead that lapses for less than the
+  window pauses the count rather than restarting it. One judgment counts at
+  most half a window: judgments come at least once a slot, so a longer gap is
+  the process not running (a `docker pause`, a host suspend), and a resume
+  must not find the window spent before range sync has had a chance. A
+  judgment older than the last by up to that much is judged at the last, so
+  no slot counts twice; one further back is the wall clock stepping back (a
+  clock that ran ahead, corrected), and the count's slots move back with it
+  rather than the count stopping until the clock passes its old reading. A
+  lead absent for longer
+  than that (an outage) ends the count once per head position, and the next
+  claim gets a whole window, unless the node already gave up on a lead at
+  that head. A peer that claims a head it does not serve (an empty answer,
+  invalid blocks, no answer at all) therefore costs at most that window at
+  each head the node reaches (two around an outage), not the rest of a
+  network stall. A peer that has just failed to serve a range request, or
+  whose range blocks left the head where it was for a whole window, does
+  not count towards the lead for a while either. An empty range answer
+  counts as such a failure even over a span an honest chain skipped every slot
+  of (a long run of missed proposals): it cannot be told from a peer claiming
+  a head it does not serve, and excused, that peer would take a range batch
+  on every `Status` it sends. Range sync does not step past a span a whole
+  batch long with no block either way (its cursor moves only on delivered
+  blocks): the parent lookups of newer blocks fill it, and the peers serving
+  it stop counting for a while, so the node can read as synced meanwhile. The cost: if the node's own
+  import stalls for a window (an execution client down), the honest peers
+  that delivered the lowest batch stop counting too, and the node reads as synced on its stale head
+  until the head passes what they handed over, or for 4 stall windows at
+  most. The same happens to an honest peer whose batch ends short (its last
+  slots were missed) when the peer serving the batch above lies: the short
+  batch is held only to its last block when the next batch's first block
+  names that block as its parent, and the upper sender chooses that parent
+  (`HeadWatch::note_delivery`). These bounds hold per peer identity: a fresh identity starts with
+  none of the history (claims, cooldowns, suspicion) its predecessor
+  earned, so an adversary with many identities is bounded by how many it
+  can connect, as for any client. The window is sized above what can legitimately hold a
+  catching-up head still.
+- **Why:** imported blocks cannot tell "the network is stalled" from "this node
+  is behind". A node catching up has imported nothing recent either, so the
+  specification's rule reports it synced for the whole catch-up and it proposes
+  and attests on a stale head (lambdaclass/ethlambda#559). Lighthouse and Prysm
+  decide against what their peers report, and require the head to trail the
+  clock too, so no peer's claim can idle a node that is current. Comparing with
+  peers also keeps a run of missed proposals (leanSpec #1194) from closing the
+  gate on every honest node, since none of them is more than propagation behind
+  another.
+- **Equivalence:** the two agree whenever no peer is further ahead of the node
+  than its newest imported block. They differ for a node behind its peers with
+  nothing newer imported, which the specification lets do its duties and this
+  node does not, until its head has been flat for the stall window.
+
+The beacon node runs the same rule with Lighthouse's numbers (two epochs of
+clock lag, one epoch of peer lead), a band of 4 slots that neither Lighthouse
+nor Prysm has (this node re-judges on every block arrival, and would otherwise
+flip twice a slot at the boundary), an epoch of stall window, and Prysm's
+`Status` refresh, every half epoch (Lighthouse refreshes every 300 s). The
+stall window has no counterpart in either client. A follower more than two
+epochs behind the clock whose head stays flat for an epoch while peers report
+a lead (columns that never arrive, an execution client that is down) does its
+duties on a stale head, and its votes are penalized as wrong or missed, never
+slashed. Without the window, a peer claiming a head it does not serve keeps
+such a node from doing any duty for as long as it keeps claiming, which costs
+those votes and the proposals with them.
+consensus-specs has no sync gate, and the Beacon API leaves `is_syncing` to the
+client.
+
 ## Attestation scoring on block building
 
 Attestations are scored and selected when packing a block, rather than taken in
@@ -85,8 +193,9 @@ anything that does not advance past them.
   past the value written. The same holds for a clock that jumps forward: the
   target is pinned to the slot the local clock asked for, so a beacon node
   that answers for a slot far ahead lets the record run ahead of the chain.
-  A bound against the clock would be circular; the guard is the beacon
-  node's own view of the head, which doppelganger protection will bring.
+  A bound against the clock would be circular; the guard would be the beacon
+  node's own view of the head, which nothing here checks the clock against
+  yet.
 - **No checksum, and rewritten minimal at every start:** the record is an
   EIP-3076 minimal interchange and nothing more, by design: readable by other
   tools and editable by the operator, which the hand edit above relies on. A
@@ -100,8 +209,11 @@ anything that does not advance past them.
   keymanager API with no history is registered the same way before it is
   loaded. Nothing here stops such a key from signing again what it signed
   elsewhere a moment ago, so the flag is only for keys that have signed nothing
-  anywhere for at least two epochs; the migration window is doppelganger
-  protection's to close, which this client does not have yet.
+  anywhere for at least two epochs. `--enable-doppelganger-protection` narrows
+  that migration window: with it on, such a key signs no attestation or block
+  until the beacon network has seen it silent for a full epoch, though like any
+  doppelganger check it cannot see a client that is down while it looks (see
+  [Doppelganger protection](./cli.md#doppelganger-protection)).
 - **Messages outside the rule:** sync committee messages and contributions
   are not slashable, and are not recorded. A gloas proposer also signs an
   execution payload envelope, and a payload timeliness committee member signs
@@ -688,6 +800,25 @@ verified ancestor: a gloas block's EL parent is the ancestor whose payload hash
 is its `bid.parent_block_hash`, skipping blocks it built past on their EMPTY
 node, and a pre-gloas block's is its parent. Both walks stop at finality.
 
+## Columns built from the execution client's blobs are verified
+
+- **The specification:** fulu `p2p-interface.md`, "Distributed blob publishing
+  using blobs retrieved from local execution-layer client": a client that
+  builds data column sidecars from `engine_getBlobsV2`'s answer SHOULD skip
+  verifying them, and MUST then treat them as received on gossip.
+- **ethlambda:** the built sidecars go through every chain check a fetched
+  column gets, KZG proofs included, before they are published, recorded seen
+  or stored (`crates/blockchain/src/beacon_blobs.rs`, `check_built`). Columns
+  that fail are dropped and counted in `lean_engine_blob_columns_refused_total`.
+- **Why:** a stored column keeps every later copy of it out (`AlreadyStored`),
+  and block import trusts the stored columns, so a wrong blob or proof taken
+  on trust from a faulty execution client would either stop its block for
+  good or import it on data nobody verified. The same checks also catch a
+  block from the wrong proposer past its parent state's lookahead, which the
+  proposer precheck made before the call cannot.
+- **Consequence:** one KZG batch over the custody columns per `getBlobsV2`
+  hit, on the blocking pool, between the answer and publication.
+
 ## `forkchoiceUpdated` for a gloas head
 
 - The head hash follows the head node: `bid.block_hash` for a FULL head,
@@ -695,10 +826,25 @@ node, and a pre-gloas block's is its parent. Both walks stop at finality.
   been computed yet is skipped.
 - `finalized_block_hash` is the finalized block's `bid.parent_block_hash`, as
   the specification has it.
-- `safe_block_hash` is the justified block's `bid.parent_block_hash`. The
-  specification's `get_safe_execution_block_hash` is built on fast
-  confirmation, which the follower does not run, so this is the fallback. It
-  can only be older than the confirmed block, which keeps it safe.
+- `safe_block_hash` is the Fast Confirmation Rule's confirmed block's
+  `bid.parent_block_hash`, the specification's gloas
+  `get_safe_execution_block_hash`. (It used to be the justified block's, a
+  stand-in from before the rule was implemented.) Before the rule's first run,
+  or while the node is far behind the clock and the rule is not run, the
+  confirmed root is the finalized block, which is what the rule's own
+  initialization sets it to.
+- **One deviation, on every fork:** the confirmed block is sent only while it
+  is on the stored head's chain at or above the finalized epoch's start slot,
+  and the finalized block is sent otherwise. The rule runs once a slot, while
+  imports move the head (and send `forkchoiceUpdated`) many times a slot, and
+  the specification's `get_safe_execution_block_hash` names the confirmed block
+  whatever the head is. An execution client answers `-38002 Invalid forkchoice
+  state` to a safe block that is not an ancestor of the head. The confirmed
+  block leaves the head's chain only when the rule's synchrony assumption
+  broke, and the rule's next run falls back to the finalized block then too
+  (`get_latest_confirmed`), so this only answers early what the rule will
+  answer at the next slot. The check is one read of the canonical `BlockRoots`
+  index (`beacon_payloads::safe_root`).
 - A pre-gloas checkpoint block, including one beneath a gloas head, keeps its
   own payload hash.
 - The call is V4 with the node's custody columns when the head block is gloas,
@@ -765,14 +911,26 @@ contributions only.
   never the block.
 - Messages from earlier slots over the same root are not packed.
 
-## The validator client signs a sync committee message at the deadline only
+## The validator client withholds payload timeliness votes over an optimistic head
 
-`validator.md` ("Prepare sync committee message") has a member sign as soon as
-it sees the block for the slot, or at the sync-message deadline, whichever
-comes first. The validator client signs once, at the deadline
-(`SYNC_MESSAGE_DUE_BPS`, or its gloas variant), over the head root it then
-reads, and refuses to when that root is optimistic
-(`specs/bellatrix/optimistic-sync.md`).
+- **Specification:** `specs/bellatrix/optimistic-sync.md` says an optimistic
+  validator must not produce a block, attest, or take part in sync
+  committees. It does not name `DOMAIN_PTC_ATTESTER`, and the Beacon API asks
+  for a `503` on `GET /eth/v1/validator/payload_attestation_data` only while a
+  node is syncing. Its answer carries no `execution_optimistic`.
+- **ethlambda:** the validator client asks every configured beacon node
+  `/eth/v1/node/syncing` once a slot, a sixth of a slot before the boundary
+  (`crates/validator/src/beacon_node/health.rs`). It does not ask a node whose
+  last probe reported syncing or optimistic for payload attestation data, and
+  casts no vote when no node is left to ask. A slot in which every node that
+  answered reported syncing or optimistic signs nothing at all, this vote
+  included.
+- **Why:** the vote is signed over the block's root and says whether its
+  payload arrived, which a node tracking an unvalidated payload is in no
+  position to say. ethlambda's own beacon node already refuses the data for an
+  optimistic block (`require_validated` in `crates/net/rpc/src/beacon/ptc.rs`),
+  so this matters against other implementations. A node that turns optimistic
+  between its probe and the vote is not caught by the client.
 
 ## The validator client's builder proposals
 
@@ -806,14 +964,15 @@ signature, whichever way the node answered. Three departures:
   up to 5 s on the relay and the client up to 8 s on the node, against well
   under a second for a full block. The publish runs on its own task so the
   proposal budget cannot cut it off: past the budget the proposal returns
-  "still publishing" and the task reports the outcome itself. The process
-  handles no signals, though: a SIGINT in that window ends the task with the
-  request.
+  "still publishing" and the task reports the outcome itself. A SIGINT or
+  SIGTERM in that window waits for the task, up to 8 s after the signal; a
+  publish still going then, or a SIGKILL, ends it with the request.
 - **Registrations stop at gloas.** The client sends no `register_validator` from
   the gloas fork epoch on: the builder market works through proposer
   preferences there (see the next section), and `produceBlockV4` sends the
-  configured boost factor and `--builder-min-bid` (default `0`), and no
-  builders.
+  configured boost factor (default `100`) and `--builder-min-bid` (default
+  `0`), with or without `--builder-proposals`, and no builders
+  (`--self-build-only`: `0` and `2^64 - 1`).
   Validators with no fee recipient are not registered either (the field is
   required), and only validators the beacon node resolved, pending or active,
   are signed for: the flashbots relay refuses a whole batch over an exited or

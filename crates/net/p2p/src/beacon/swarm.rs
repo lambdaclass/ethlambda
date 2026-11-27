@@ -22,7 +22,7 @@ use ethlambda_types::beacon::primitives::{ForkDigest, Root};
 /// rather than the number it evaluates to, so it stays correct if either factor
 /// moves.
 pub fn seen_ttl(config: &Config) -> Duration {
-    Duration::from_secs(preset::SLOTS_PER_EPOCH * config.seconds_per_slot * 2)
+    Duration::from_secs(preset::slots_per_epoch() * config.seconds_per_slot * 2)
 }
 
 /// Lighthouse's identify protocol version. go-libp2p peers gate gossipsub GRAFT

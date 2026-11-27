@@ -226,9 +226,9 @@ pub fn slash_validator(
     validator.slashed = true;
     validator.withdrawable_epoch = validator
         .withdrawable_epoch
-        .max(epoch + preset::EPOCHS_PER_SLASHINGS_VECTOR as Epoch);
+        .max(epoch + preset::epochs_per_slashings_vector() as Epoch);
 
-    let slot = epoch as usize % preset::EPOCHS_PER_SLASHINGS_VECTOR;
+    let slot = epoch as usize % preset::epochs_per_slashings_vector();
     let slashings = state.slashings_mut();
     slashings[slot] = slashings[slot].saturating_add(effective_balance);
 
@@ -323,7 +323,7 @@ mod tests {
         // proportional penalty.
         let epoch = get_current_epoch(&state);
         assert_eq!(
-            state.slashings()[epoch as usize % preset::EPOCHS_PER_SLASHINGS_VECTOR],
+            state.slashings()[epoch as usize % preset::epochs_per_slashings_vector()],
             effective_balance
         );
 
