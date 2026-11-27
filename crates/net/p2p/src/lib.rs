@@ -2278,8 +2278,14 @@ impl P2PServer {
         _msg: p2p_protocol::AdvanceForkSchedule,
         ctx: &Context<Self>,
     ) {
+        let digest = self.wire.beacon().map(|wire| wire.fork_digest);
         if let Some(delay) = beacon::transition::advance(self) {
             send_after(delay, ctx.clone(), p2p_protocol::AdvanceForkSchedule);
+        }
+        // A switch is when every peer following the fork has joined the new
+        // digest's topics, so what reached no peer before can now.
+        if self.wire.beacon().map(|wire| wire.fork_digest) != digest {
+            beacon::builder_market::publish_owed_proposer_preferences(self).await;
         }
     }
 
@@ -2445,13 +2451,13 @@ impl Handler<PublishExecutionPayloadEnvelope> for P2PServer {
 
 impl Handler<PublishExecutionPayloadBid> for P2PServer {
     async fn handle(&mut self, msg: PublishExecutionPayloadBid, _ctx: &Context<Self>) {
-        beacon::builder_market::publish_execution_payload_bid(self, msg.bid);
+        beacon::builder_market::publish_execution_payload_bid(self, msg.bid).await;
     }
 }
 
 impl Handler<PublishProposerPreferences> for P2PServer {
     async fn handle(&mut self, msg: PublishProposerPreferences, _ctx: &Context<Self>) {
-        beacon::builder_market::publish_proposer_preferences(self, msg.preferences);
+        beacon::builder_market::publish_proposer_preferences(self, msg.preferences).await;
     }
 }
 
@@ -3169,6 +3175,11 @@ async fn handle_behaviour_event(
                 message,
             )
             .await;
+        }
+        // A peer joined a topic: proposer preferences whose publish found no
+        // peer on it go out now. This is how a publish waits for a peer.
+        BehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Subscribed { topic, .. }) => {
+            return beacon::builder_market::on_peer_subscribed(server, topic.as_str()).await;
         }
         BehaviourEvent::Gossipsub(_) => return,
         BehaviourEvent::ReqResp(event) => match event {
@@ -4013,8 +4024,9 @@ pub(crate) mod test_support {
     use crate::{P2PServer, SwarmConfig, WireConfig, build_swarm};
 
     /// A chain actor stand-in recording what reaches it: each block's
-    /// announcement and each aggregate with its attesting indices. The rest
-    /// of the protocol is accepted and dropped.
+    /// announcement, each aggregate with its attesting indices, each column
+    /// batch and each proposer preferences report. The rest of the protocol is
+    /// accepted and dropped.
     #[derive(Default)]
     pub(crate) struct RecordingChain {
         pub(crate) announcements: std::sync::Mutex<Vec<ethlambda_network_api::BlockAnnouncement>>,
@@ -4027,6 +4039,8 @@ pub(crate) mod test_support {
         /// Each `new_data_column_sidecars` batch, in arrival order.
         pub(crate) sidecar_batches:
             std::sync::Mutex<Vec<Vec<ethlambda_types::beacon::containers::DataColumnSidecar>>>,
+        /// Each `new_proposer_preferences` proposal slot, in arrival order.
+        pub(crate) preference_slots: std::sync::Mutex<Vec<u64>>,
     }
 
     impl ethlambda_network_api::P2PToBlockChain for RecordingChain {
@@ -4095,8 +4109,9 @@ pub(crate) mod test_support {
         }
         fn new_proposer_preferences(
             &self,
-            _proposal_slot: u64,
+            proposal_slot: u64,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.preference_slots.lock().unwrap().push(proposal_slot);
             Ok(())
         }
     }

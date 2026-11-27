@@ -4,7 +4,7 @@ use std::time::Duration;
 use libp2p::{
     PeerId,
     futures::StreamExt,
-    gossipsub::{FailedMessages, IdentTopic, TopicScoreParams},
+    gossipsub::{FailedMessages, IdentTopic, MessageId, PublishError, TopicScoreParams},
     request_response,
     swarm::{SwarmEvent, dial_opts::DialOpts},
 };
@@ -46,6 +46,11 @@ pub enum SwarmCommand {
     Publish {
         topic: libp2p::gossipsub::IdentTopic,
         data: Vec<u8>,
+        /// Where to report what gossipsub did with it, for a caller that logs
+        /// or keeps state on the answer (see [`SwarmHandle::publish_reporting`]).
+        /// `None` for a fire-and-forget publish, whose failure the adapter logs
+        /// at debug itself.
+        outcome_tx: Option<tokio::sync::oneshot::Sender<PublishOutcome>>,
     },
     /// Join a topic after startup: the aggregator subnets, which a validator
     /// client names slot by slot.
@@ -130,6 +135,69 @@ impl From<&libp2p::swarm::DialError> for DialOutcome {
     }
 }
 
+/// What gossipsub did with a publish, for a caller that asked for it through
+/// [`SwarmHandle::publish_reporting`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// Handed to at least one peer.
+    Published,
+    /// Refused as a duplicate. A message's id is its topic and payload alone,
+    /// and gossipsub keeps the id of every message it sent to a peer or
+    /// received from one for its duplicate cache's lifetime (`seen_ttl`, two
+    /// epochs on the beacon wire), refusing to publish it again until then. So
+    /// this very message went out from this node earlier, or a peer sent it
+    /// here: it cannot be sent again, and that is not this publish failing.
+    /// (An earlier publish that found every peer's queue full left its id
+    /// there too, so its retry also lands here although no peer got it.)
+    Duplicate,
+    /// Not handed to any peer, with the reason for the log: no peer is
+    /// subscribed to the topic (`NoPeersSubscribedToTopic`, in which case
+    /// gossipsub keeps no trace of the message and a later publish of it can
+    /// still go out), every recipient's queue was full, the message is too
+    /// large, or the adapter is gone.
+    Failed(String),
+}
+
+impl From<Result<MessageId, PublishError>> for PublishOutcome {
+    fn from(result: Result<MessageId, PublishError>) -> Self {
+        match result {
+            Ok(_) => Self::Published,
+            Err(PublishError::Duplicate) => Self::Duplicate,
+            Err(err) => Self::Failed(err.to_string()),
+        }
+    }
+}
+
+impl PublishOutcome {
+    /// The answer when the adapter never ran the publish.
+    fn adapter_closed() -> Self {
+        Self::Failed("the swarm adapter is closed".to_string())
+    }
+
+    /// Whether no peer was handed the message, so it is still owed a publish.
+    pub fn failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+}
+
+/// A publish already queued with the adapter, whose [`PublishOutcome`] is read
+/// with [`Self::outcome`]. The publish does not wait for the receipt to be
+/// read, so a caller can hand off other work first.
+#[must_use = "the receipt is how the publish's outcome is read"]
+pub struct PublishReceipt(Option<tokio::sync::oneshot::Receiver<PublishOutcome>>);
+
+impl PublishReceipt {
+    /// What gossipsub did with the publish, once the adapter has run it.
+    pub async fn outcome(self) -> PublishOutcome {
+        let Some(outcome_rx) = self.0 else {
+            return PublishOutcome::adapter_closed();
+        };
+        outcome_rx
+            .await
+            .unwrap_or_else(|_| PublishOutcome::adapter_closed())
+    }
+}
+
 #[derive(Clone)]
 pub struct SwarmHandle {
     cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
@@ -139,8 +207,35 @@ impl SwarmHandle {
     pub fn publish(&self, topic: libp2p::gossipsub::IdentTopic, data: Vec<u8>) {
         let _ = self
             .cmd_tx
-            .send(SwarmCommand::Publish { topic, data })
+            .send(SwarmCommand::Publish {
+                topic,
+                data,
+                outcome_tx: None,
+            })
             .inspect_err(|_| debug!("Swarm adapter closed, cannot publish"));
+    }
+
+    /// [`Self::publish`], reporting what gossipsub did with it. The publish is
+    /// queued at once, in order with every other command; the receipt only
+    /// reads its answer.
+    ///
+    /// For a caller that logs the outcome itself, at the level its topic
+    /// warrants, or remembers it: the adapter logs nothing for these.
+    pub fn publish_reporting(
+        &self,
+        topic: libp2p::gossipsub::IdentTopic,
+        data: Vec<u8>,
+    ) -> PublishReceipt {
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let queued = self
+            .cmd_tx
+            .send(SwarmCommand::Publish {
+                topic,
+                data,
+                outcome_tx: Some(outcome_tx),
+            })
+            .is_ok();
+        PublishReceipt(queued.then_some(outcome_rx))
     }
 
     pub fn subscribe(&self, topic: libp2p::gossipsub::IdentTopic) {
@@ -537,13 +632,22 @@ fn disconnect_graylisted_peers(swarm: &mut libp2p::Swarm<Behaviour>) {
 
 pub(crate) fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
     match cmd {
-        SwarmCommand::Publish { topic, data } => {
-            swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(topic, data)
-                .inspect_err(|err| debug!(%err, "Swarm adapter: publish failed"))
-                .ok();
+        SwarmCommand::Publish {
+            topic,
+            data,
+            outcome_tx,
+        } => {
+            let result = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data);
+            match outcome_tx {
+                // The caller logs the outcome, at the level its topic warrants.
+                Some(outcome_tx) => {
+                    let _ = outcome_tx.send(PublishOutcome::from(result));
+                }
+                None => {
+                    let _ = result
+                        .inspect_err(|err| debug!(%topic, %err, "Swarm adapter: publish failed"));
+                }
+            }
         }
         SwarmCommand::Subscribe(topic) => {
             let _ = swarm
@@ -844,6 +948,62 @@ mod tests {
             deferred: 0,
         };
         assert_eq!(slow_peers.check(), expected);
+    }
+
+    /// A duplicate is told apart from a failure: it means the message already
+    /// left this node (or arrived from a peer), so nothing is owed, and its
+    /// callers log it at debug rather than warn.
+    #[test]
+    fn a_publish_result_is_classified_by_whether_a_peer_got_it() {
+        let published = PublishOutcome::from(Ok(MessageId::new(b"id")));
+        assert_eq!(published, PublishOutcome::Published);
+        assert!(!published.failed());
+
+        let duplicate = PublishOutcome::from(Err(PublishError::Duplicate));
+        assert_eq!(duplicate, PublishOutcome::Duplicate);
+        assert!(!duplicate.failed());
+
+        for err in [
+            PublishError::NoPeersSubscribedToTopic,
+            PublishError::AllQueuesFull(3),
+            PublishError::MessageTooLarge,
+        ] {
+            assert!(PublishOutcome::from(Err(err)).failed());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reporting_publish_is_queued_at_once_and_answered_through_its_receipt() {
+        let (handle, mut commands) = SwarmHandle::capturing();
+        let topic = IdentTopic::new("topic");
+        let receipt = handle.publish_reporting(topic.clone(), b"data".to_vec());
+
+        let Ok(SwarmCommand::Publish {
+            topic: queued,
+            data,
+            outcome_tx: Some(outcome_tx),
+        }) = commands.try_recv()
+        else {
+            panic!("the publish is queued before its receipt is read");
+        };
+        assert_eq!(queued.hash(), topic.hash());
+        assert_eq!(data, b"data");
+        outcome_tx.send(PublishOutcome::Duplicate).unwrap();
+        assert_eq!(receipt.outcome().await, PublishOutcome::Duplicate);
+    }
+
+    #[tokio::test]
+    async fn a_publish_the_adapter_never_ran_failed() {
+        let (handle, commands) = SwarmHandle::capturing();
+        drop(commands);
+        let receipt = handle.publish_reporting(IdentTopic::new("topic"), Vec::new());
+        assert!(receipt.outcome().await.failed());
+
+        // Queued, then dropped unanswered when the adapter stopped.
+        let (handle, mut commands) = SwarmHandle::capturing();
+        let receipt = handle.publish_reporting(IdentTopic::new("topic"), Vec::new());
+        drop(commands.try_recv());
+        assert!(receipt.outcome().await.failed());
     }
 
     #[test]
