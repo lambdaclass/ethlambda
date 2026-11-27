@@ -34,7 +34,9 @@
 //!   never comes still gets its first verdict, as it would have before.
 //! - **A cap.** Votes are parked before their signature is checked, so at
 //!   [`MAX_PARKED_VOTES`] the next one is reported as it would have been
-//!   before this queue existed.
+//!   before this queue existed. Aggregates have a smaller cap of their own,
+//!   [`MAX_PARKED_AGGREGATES`], since one can be far larger than a subnet
+//!   attestation.
 //!
 //! The import signal can win the race against the verdict it releases: the
 //! check reads the store on a blocking thread, the import caches the state
@@ -55,6 +57,17 @@ use crate::beacon::verdict::{GossipId, Validated};
 /// How many votes may be parked at once. Lighthouse's
 /// `MAXIMUM_QUEUED_ATTESTATIONS`.
 pub(crate) const MAX_PARKED_VOTES: usize = 16_384;
+
+/// How many of the parked votes may be aggregates.
+///
+/// An electra aggregate's bits run to `MAX_VALIDATORS_PER_COMMITTEE *
+/// MAX_COMMITTEES_PER_SLOT`, 16 KiB decoded and a few hundred bytes on the
+/// wire, and it is parked before its signature is checked. Under
+/// [`MAX_PARKED_VOTES`] alone a peer naming roots that never import could
+/// keep about 256 MiB of them resident; this keeps it near 32 MiB. An honest
+/// network sends about a thousand aggregates a slot, so this holds two slots'
+/// worth.
+pub(crate) const MAX_PARKED_AGGREGATES: usize = 2_048;
 
 /// How long after its arrival a parked vote may still wait for its block.
 /// See the module documentation for why it must stay under 3.5 s with
@@ -85,6 +98,16 @@ impl ParkedVote {
     pub(crate) fn expired(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.id.received_at) >= PARKED_VOTE_DEADLINE
     }
+
+    /// Whether this is an aggregate, which [`MAX_PARKED_AGGREGATES`] caps.
+    fn is_aggregate(&self) -> bool {
+        matches!(self.object, Validated::Aggregate { .. })
+    }
+}
+
+/// How many of `votes` are aggregates.
+fn aggregates_in(votes: &[ParkedVote]) -> usize {
+    votes.iter().filter(|vote| vote.is_aggregate()).count()
 }
 
 /// What [`ParkedVotes::park`] did with a vote.
@@ -102,6 +125,8 @@ pub(crate) enum Parking {
 pub(crate) struct ParkedVotes {
     by_root: HashMap<Root, Vec<ParkedVote>>,
     len: usize,
+    /// How many of the `len` are aggregates.
+    aggregates: usize,
     recently_ready: VecDeque<Root>,
     /// Whether an expiry sweep is already scheduled, so parking a vote never
     /// starts a second timer.
@@ -114,11 +139,13 @@ impl ParkedVotes {
         if self.recently_ready.contains(&root) {
             return Parking::Ready(vote);
         }
-        if self.len >= MAX_PARKED_VOTES {
+        let aggregate = vote.is_aggregate();
+        if self.len >= MAX_PARKED_VOTES || (aggregate && self.aggregates >= MAX_PARKED_AGGREGATES) {
             return Parking::Full(vote);
         }
         self.by_root.entry(root).or_default().push(vote);
         self.len += 1;
+        self.aggregates += usize::from(aggregate);
         Parking::Parked
     }
 
@@ -134,6 +161,7 @@ impl ParkedVotes {
         }
         let votes = self.by_root.remove(&root).unwrap_or_default();
         self.len -= votes.len();
+        self.aggregates -= aggregates_in(&votes);
         votes
     }
 
@@ -149,6 +177,7 @@ impl ParkedVotes {
             !votes.is_empty()
         });
         self.len -= expired.len();
+        self.aggregates -= aggregates_in(&expired);
         expired
     }
 
@@ -206,6 +235,42 @@ mod tests {
                 subnet_id: 0,
             },
             outcome: Outcome::Ignore(IgnoreReason::StateUnavailable),
+        }
+    }
+
+    fn aggregate(aggregator: u64, received_at: Instant) -> ParkedVote {
+        use ethlambda_types::beacon::containers::{SignedAggregateAndProof, phase0};
+
+        let aggregate = SignedAggregateAndProof::Phase0(phase0::SignedAggregateAndProof {
+            message: phase0::AggregateAndProof {
+                aggregator_index: aggregator,
+                aggregate: phase0::Attestation {
+                    aggregation_bits: phase0::AggregationBits::with_length(1).unwrap(),
+                    data: AttestationData {
+                        slot: 1,
+                        index: 0,
+                        beacon_block_root: Root::repeat_byte(1),
+                        source: Checkpoint::default(),
+                        target: Checkpoint::default(),
+                    },
+                    signature: Default::default(),
+                },
+                selection_proof: Default::default(),
+            },
+            signature: Default::default(),
+        });
+        ParkedVote {
+            id: GossipId {
+                message_id: MessageId::new(&aggregator.to_be_bytes()),
+                propagation_source: PeerId::random(),
+                received_at,
+                kind: "beacon_aggregate_and_proof",
+            },
+            object: Validated::Aggregate {
+                aggregate: Box::new(aggregate),
+                attesting_indices: Vec::new(),
+            },
+            outcome: Outcome::Ignore(IgnoreReason::UnknownBlock),
         }
     }
 
@@ -293,6 +358,44 @@ mod tests {
             parked.park(Root::repeat_byte(9), vote(u64::MAX, now)),
             Parking::Parked
         ));
+    }
+
+    /// Aggregates fill a cap of their own, well below the queue's: past it
+    /// the next aggregate is handed back, while a subnet attestation still
+    /// parks, and releasing or expiring aggregates makes room for more.
+    #[test]
+    fn aggregates_have_a_smaller_cap_of_their_own() {
+        let now = Instant::now();
+        let mut parked = ParkedVotes::default();
+        let (a, b) = (Root::repeat_byte(1), Root::repeat_byte(2));
+        for aggregator in 0..MAX_PARKED_AGGREGATES as u64 {
+            let root = if aggregator % 2 == 0 { a } else { b };
+            assert!(matches!(
+                parked.park(root, aggregate(aggregator, now)),
+                Parking::Parked
+            ));
+        }
+
+        assert!(matches!(
+            parked.park(a, aggregate(u64::MAX, now)),
+            Parking::Full(_)
+        ));
+        assert!(matches!(parked.park(a, vote(1, now)), Parking::Parked));
+
+        assert_eq!(parked.take_ready(a).len(), MAX_PARKED_AGGREGATES / 2 + 1);
+        assert!(matches!(
+            parked.park(Root::repeat_byte(3), aggregate(u64::MAX, now)),
+            Parking::Parked
+        ));
+        let expired = parked.take_expired(now + PARKED_VOTE_DEADLINE).len();
+        assert_eq!(expired, MAX_PARKED_AGGREGATES / 2 + 1);
+        assert!(parked.is_empty());
+        for aggregator in 0..MAX_PARKED_AGGREGATES as u64 {
+            assert!(matches!(
+                parked.park(b, aggregate(aggregator, now)),
+                Parking::Parked
+            ));
+        }
     }
 
     #[test]

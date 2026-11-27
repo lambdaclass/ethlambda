@@ -285,6 +285,16 @@ const COLUMN_CHECK_PERMITS: usize = 16;
 /// has data from a follower.
 const ATTESTATION_VALIDATION_PERMITS: usize = 128;
 
+/// How many batches of parked votes may be checked again at once (see
+/// `beacon::parked_votes`).
+///
+/// A pool of its own, a quarter of [`ATTESTATION_VALIDATION_PERMITS`]: a
+/// block's votes are released together, and on the attestation pool a big
+/// release would take the permits of the votes arriving meanwhile, which
+/// would be ignored as overloaded. A batch waits for a permit here rather
+/// than failing without one.
+const RECHECK_PERMITS: usize = 32;
+
 /// How many `execution_payload_bid` and `proposer_preferences` stateful checks
 /// may run at once. A pool of its own, so a burst of bids (each costs a BLS
 /// verification) cannot starve blocks, columns or attestations of permits.
@@ -1642,6 +1652,7 @@ impl P2P {
             attestation_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 ATTESTATION_VALIDATION_PERMITS,
             )),
+            recheck_permits: Arc::new(tokio::sync::Semaphore::new(RECHECK_PERMITS)),
             payload_attestation_pool,
             builder_market,
             builder_validation_permits: Arc::new(tokio::sync::Semaphore::new(
@@ -1854,6 +1865,9 @@ pub struct P2PServer {
     /// [`Self::gossip_validation_permits`]; see
     /// [`ATTESTATION_VALIDATION_PERMITS`].
     pub(crate) attestation_validation_permits: Arc<tokio::sync::Semaphore>,
+    /// Permits for batches of parked votes checked again once their block's
+    /// post-state is ready. See [`RECHECK_PERMITS`].
+    pub(crate) recheck_permits: Arc<tokio::sync::Semaphore>,
     /// Permits for sync committee message and contribution stateful gossip
     /// checks in flight on blocking threads. Separate from the other two
     /// pools; see [`SYNC_VALIDATION_PERMITS`].
@@ -4148,6 +4162,9 @@ pub(crate) mod test_support {
             )),
             attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::ATTESTATION_VALIDATION_PERMITS,
+            )),
+            recheck_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::RECHECK_PERMITS,
             )),
             seen_sync_messages:
                 ethlambda_state_transition::beacon::gossip::sync_committee::SeenSyncCommitteeMessages::new(

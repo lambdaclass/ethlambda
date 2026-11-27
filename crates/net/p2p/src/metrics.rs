@@ -475,10 +475,17 @@ pub fn observe_beacon_gossip_verdict(
 
 /// Labels of the permit pools that bound blocking-thread validation work.
 /// `column_check` is [`P2PServer::column_check_permits`](crate::P2PServer),
-/// shared by the fetched-column and fetched-envelope checks; the rest are the
-/// four gossip pools.
-pub(crate) const VALIDATION_POOLS: &[&str] =
-    &["gossip", "attestation", "builder", "sync", "column_check"];
+/// shared by the fetched-column and fetched-envelope checks; `recheck` is
+/// [`P2PServer::recheck_permits`](crate::P2PServer), for parked votes checked
+/// again; the rest are the four gossip pools.
+pub(crate) const VALIDATION_POOLS: &[&str] = &[
+    "gossip",
+    "attestation",
+    "builder",
+    "sync",
+    "column_check",
+    "recheck",
+];
 
 static LEAN_BEACON_VALIDATION_PERMITS_IN_USE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(

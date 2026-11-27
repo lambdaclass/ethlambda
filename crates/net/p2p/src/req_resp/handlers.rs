@@ -3731,6 +3731,9 @@ pub(crate) mod tests {
             attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
+            recheck_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::RECHECK_PERMITS,
+            )),
             seen_sync_messages:
                 ethlambda_state_transition::beacon::gossip::sync_committee::SeenSyncCommitteeMessages::new(
                     crate::SEEN_SYNC_MESSAGES_CAPACITY,

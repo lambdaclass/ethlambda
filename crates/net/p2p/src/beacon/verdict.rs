@@ -771,14 +771,15 @@ pub(crate) fn schedule_parked_vote_sweep(ctx: &Context<P2PServer>) {
 }
 
 /// Run the stateful checks of released votes again, a verdict each, in
-/// blocking batches of up to [`RECHECK_BATCH`] votes of one kind, a permit a
-/// batch.
+/// blocking batches of up to [`RECHECK_BATCH`] votes of one kind.
 ///
-/// Batched because a root's votes are released together: one task, and one
-/// permit, per vote would put the whole burst on the attestation pool at
-/// once, and every vote past its last permit would be reported
-/// `Ignore(Overloaded)`. A vote already past its deadline gets its first
-/// verdict instead, since a second one could not reach gossipsub in time.
+/// Batched because a root's votes are released together, and run on a pool
+/// of their own ([`P2PServer::recheck_permits`]): on the attestation pool, a
+/// big release would take the permits of the votes arriving meanwhile, which
+/// would then be ignored as overloaded, the very loss parking is there to
+/// prevent. A batch waits for a permit rather than failing without one, and
+/// each vote's deadline is checked again right before its turn (see
+/// [`recheck`]), so a vote reached too late still gets its first verdict.
 fn spawn_rechecks(server: &mut P2PServer, ctx: &Context<P2PServer>, votes: Vec<ParkedVote>) {
     let now = Instant::now();
     let mut by_kind: HashMap<&'static str, Vec<ParkedVote>> = HashMap::new();
@@ -787,7 +788,6 @@ fn spawn_rechecks(server: &mut P2PServer, ctx: &Context<P2PServer>, votes: Vec<P
             metrics::inc_parked_votes(vote.id.kind, "expired");
             conclude(server, vote.id, vote.outcome, vote.object);
         } else {
-            metrics::inc_parked_votes(vote.id.kind, "rechecked");
             by_kind.entry(vote.id.kind).or_default().push(vote);
         }
     }
@@ -800,49 +800,67 @@ fn spawn_rechecks(server: &mut P2PServer, ctx: &Context<P2PServer>, votes: Vec<P
     }
 }
 
-/// One blocking batch of [`spawn_rechecks`].
+/// One blocking batch of [`spawn_rechecks`], started once a
+/// [`P2PServer::recheck_permits`] permit is free.
 fn spawn_recheck_batch(
-    server: &mut P2PServer,
+    server: &P2PServer,
     ctx: &Context<P2PServer>,
     kind: &'static str,
     votes: Vec<ParkedVote>,
 ) {
-    const POOL: &str = "attestation";
-    let Ok(permit) = server
-        .attestation_validation_permits
-        .clone()
-        .try_acquire_owned()
-    else {
-        for vote in votes {
-            metrics::inc_validation_permit_exhausted(POOL);
-            let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
-            conclude(server, vote.id, outcome, vote.object);
-        }
-        return;
-    };
+    let permits = server.recheck_permits.clone();
     let store = server.store.clone();
     let actor = ctx.actor_ref();
-    let in_use = metrics::PoolInUse::new(POOL);
-    let task = metrics::BlockingTask::new(kind);
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let _in_use = in_use;
-        let _run = task.start();
-        for ParkedVote { id, mut object, .. } in votes {
-            let outcome = guarded(|| object.stateful_checks(&store));
-            let verdict = GossipVerdict {
-                id,
-                outcome,
-                object,
-                parkable: false,
-            };
-            if actor.send(verdict).is_err() {
-                warn!("P2P actor stopped before a rechecked vote's verdict arrived");
-                return;
+    tokio::spawn(async move {
+        let Ok(permit) = permits.acquire_owned().await else {
+            warn!("The recheck permit pool closed before a batch of parked votes ran");
+            return;
+        };
+        let in_use = metrics::PoolInUse::new(RECHECK_POOL);
+        let task = metrics::BlockingTask::new(kind);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _in_use = in_use;
+            let _run = task.start();
+            for vote in votes {
+                let verdict = recheck(&store, vote, Instant::now());
+                if actor.send(verdict).is_err() {
+                    warn!("P2P actor stopped before a rechecked vote's verdict arrived");
+                    return;
+                }
             }
-        }
+        });
     });
 }
+
+/// Check a released vote again at `now`, or, past its deadline by then, give
+/// it the outcome of its first check, since a second one could not reach
+/// gossipsub in time. Either way the verdict may not park it again.
+fn recheck(store: &Store, vote: ParkedVote, now: Instant) -> GossipVerdict {
+    let late = vote.expired(now);
+    let ParkedVote {
+        id,
+        mut object,
+        outcome,
+    } = vote;
+    let outcome = if late {
+        metrics::inc_parked_votes(id.kind, "expired");
+        outcome
+    } else {
+        metrics::inc_parked_votes(id.kind, "rechecked");
+        guarded(|| object.stateful_checks(store))
+    };
+    GossipVerdict {
+        id,
+        outcome,
+        object,
+        parkable: false,
+    }
+}
+
+/// The label of [`P2PServer::recheck_permits`] (see
+/// [`metrics::VALIDATION_POOLS`]).
+const RECHECK_POOL: &str = "recheck";
 
 /// How many released votes one blocking task checks again.
 const RECHECK_BATCH: usize = 64;
@@ -953,13 +971,26 @@ pub(crate) fn spawn_stateful_checks(
         let _in_use = in_use;
         let _run = task.start();
         let mut object = object;
-        let outcome = guarded(|| object.stateful_checks(&store));
+        let mut outcome = guarded(|| object.stateful_checks(&store));
+        let mut parkable = true;
+        // A missing post-state means the block is still importing only when
+        // it has no stored state either. With one, it was imported: its state
+        // left the cache since, and no release will come for it, or it landed
+        // while this check ran, and its release may already be gone. Either
+        // way the vote is checked once more now and not parked.
+        if outcome == Outcome::Ignore(IgnoreReason::StateUnavailable)
+            && parkable_root(&object, outcome)
+                .is_some_and(|root| store.has_state(&root).unwrap_or(false))
+        {
+            outcome = guarded(|| object.stateful_checks(&store));
+            parkable = false;
+        }
         let _ = actor
             .send(GossipVerdict {
                 id,
                 outcome,
                 object,
-                parkable: true,
+                parkable,
             })
             .inspect_err(|_| warn!("P2P actor stopped before a gossip verdict arrived"));
     });
@@ -1967,6 +1998,34 @@ mod tests {
             },
             parkable,
         }
+    }
+
+    /// A released vote still in time has its checks run again; one past its
+    /// deadline by its turn keeps the outcome of its first check. Neither
+    /// verdict may park the vote a second time. The first outcome here is one
+    /// the stateful checks never give, so a fresh check is told apart from it.
+    #[tokio::test]
+    async fn a_recheck_never_parks_again_and_keeps_the_first_outcome_past_the_deadline() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let first = Outcome::Ignore(IgnoreReason::Overloaded);
+        let parked = |received_at| ParkedVote {
+            id: gossip_id(1, "beacon_attestation", received_at),
+            object: Validated::Attestation {
+                attestation: Box::new(electra_attestation(1, 1)),
+                subnet_id: 0,
+            },
+            outcome: first,
+        };
+        let arrived = Instant::now();
+
+        let deadline = arrived + crate::beacon::parked_votes::PARKED_VOTE_DEADLINE;
+        let late = recheck(&server.store, parked(arrived), deadline);
+        assert_eq!(late.outcome, first);
+        assert!(!late.parkable);
+
+        let in_time = recheck(&server.store, parked(arrived), arrived);
+        assert_ne!(in_time.outcome, first, "the checks ran again");
+        assert!(!in_time.parkable);
     }
 
     /// The verdicts reported to gossipsub so far, in order, by name:

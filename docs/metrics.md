@@ -445,8 +445,10 @@ topics never answer `queue`. An aggregate or a subnet attestation whose vote
 block is not stored yet, or has no cached post-state yet
 (`IgnoreReason::UnknownBlock`/`StateUnavailable`), is held anyway, though not
 as `queue`: its verdict is withheld while it waits for the block's import, then
-its checks run again (`lean_beacon_gossip_parked_votes_total`, and
-`crates/net/p2p/src/beacon/parked_votes.rs`). Only a vote still waiting at its
+its checks run again, on a permit pool of their own (`pool="recheck"`)
+(`lean_beacon_gossip_parked_votes_total`, and
+`crates/net/p2p/src/beacon/parked_votes.rs`). A vote whose block was imported
+but whose state has left the cache is checked once more at once and not held. Only a vote still waiting at its
 deadline, 2.5 s after it arrived, or one the full queue refused, is counted
 under those two reasons. Its time to verdict includes the wait, so
 `lean_beacon_gossip_validation_seconds` for these two kinds reads up to that
@@ -509,7 +511,7 @@ ethlambda-specific, not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
-| `lean_beacon_validation_permits_in_use` | Gauge | Permits held per pool: blocking tasks queued or running | A permit is acquired / released | pool=gossip,attestation,builder,sync,column_check | |
+| `lean_beacon_validation_permits_in_use` | Gauge | Permits held per pool: blocking tasks queued or running | A permit is acquired / released | pool=gossip,attestation,builder,sync,column_check,recheck | |
 | `lean_beacon_validation_permit_exhausted_total` | Counter | Objects reported `Ignore(Overloaded)` because their pool had no free permit | On each failed `try_acquire` | pool=gossip,attestation,builder,sync | |
 | `lean_beacon_validation_queue_seconds` | Histogram | Time from `spawn_blocking` being called to the closure starting (tokio blocking-pool queueing) | When the closure starts | kind | 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 |
 | `lean_beacon_validation_run_seconds` | Histogram | Run time of the closure itself | When the closure ends (panic included) | kind | same as above |
