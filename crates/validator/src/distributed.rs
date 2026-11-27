@@ -1153,7 +1153,10 @@ mod tests {
     /// it cannot combine, keeps no other slot's subscription back: the duty
     /// it did combine is subscribed with the role while that request is
     /// still out.
-    #[tokio::test]
+    ///
+    /// On a paused clock, so the wait for the request that never returns
+    /// costs the run no time.
+    #[tokio::test(start_paused = true)]
     async fn a_held_retry_slot_holds_back_no_other_slots_subscription() {
         let (store, pubkey) = store();
         let (chosen, held) = (EPOCH_START + 5, EPOCH_START + 9);
@@ -1396,7 +1399,9 @@ mod tests {
     /// waits, as Charon does, until every entry in a request is combined, so
     /// a request shared by both seats would go unanswered for both; asked on
     /// its own, the combined seat is answered and contributes.
-    #[tokio::test]
+    ///
+    /// On a paused clock: the uncombined seat waits out its whole budget.
+    #[tokio::test(start_paused = true)]
     async fn a_seat_the_middleware_cannot_combine_holds_back_no_other() {
         let (store, pubkey) = store();
         let size = sync_subcommittee_size() as u64;
@@ -1423,10 +1428,8 @@ mod tests {
         let context = distributed_context();
         let distributed = Distributed::new(node.clone(), context.clone());
 
-        // Short, since the uncombined seat waits it out.
-        let budget = Duration::from_millis(500);
         let combined = distributed
-            .exchange_sync(slot, std::slice::from_ref(&sync_duty), &store, budget)
+            .exchange_sync(slot, std::slice::from_ref(&sync_duty), &store, SYNC_BUDGET)
             .await;
 
         assert_eq!(combined, 1);
