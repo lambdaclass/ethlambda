@@ -434,9 +434,7 @@ from the Beacon API, and no other way.
 - **An IGNORE verdict is a `400`,** the same as a REJECT, because the API has no
   separate status for it. The message names the verdict and the reason, such as
   `ignore: preferences_unseen`.
-- **An identical resubmission is a `200`** and is not published again, except
-  preferences this node still owes a publish (no peer was handed them), which
-  are handed to p2p again while their slot is ahead.
+- **An identical resubmission is a `200`** and is not published again.
 - **The prose and the rules disagree** on a mismatched fee recipient or gas
   limit: the Beacon API text says the bid is rejected, while consensus-specs
   IGNOREs it. ethlambda follows consensus-specs.

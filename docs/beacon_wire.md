@@ -125,8 +125,6 @@ its slot is ahead (`publish_owed_proposer_preferences`):
 
 - when a peer joins a `proposer_preferences` topic (gossipsub's `Subscribed`
   event, which comes once the peer is counted on the topic);
-- when the validator client sends it again (once an epoch, at the epoch's
-  second-to-last slot, see `docs/cli.md`);
 - at every fork-digest switch. The new digest's first slot has started by
   then, so its preference is past helping and is left out.
 

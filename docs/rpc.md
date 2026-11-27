@@ -765,13 +765,8 @@ message accepted from either side is seen by both.
   preference's slot); `fulu` is accepted as leniency towards one that names its
   wall clock's fork. Each entry runs the gossip rules in order; an entry already
   cached, identical, succeeds without a republish, including one gossip cached
-  while this copy was being validated. The exception is an entry this node
-  still owes a publish (one whose publish reached no peer): while its slot is
-  ahead, the re-send is handed to p2p again (see `docs/beacon_wire.md`,
-  Gossip). Accepted entries are cached (the first per
-  `(proposal slot, dependent root)` wins) and gossiped; one that finds no peer
-  on its topic goes out once a peer joins it, and the answer is the same either
-  way. If any
+  while this copy was being validated. Accepted entries are cached
+  (the first per `(proposal slot, dependent root)` wins) and gossiped. If any
   entry fails the answer is `400`
   `{code, message, failures: [{index, message}]}` and the others were still
   published. The endpoint is not gated on the sync status. A node whose

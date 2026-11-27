@@ -199,22 +199,6 @@ pub(crate) async fn publish_proposer_preferences(
     gossip_proposer_preferences(server, preferences).await;
 }
 
-/// Gossip again preferences the market holds that this node still owes a
-/// publish, handed back by the Beacon API when a validator client sends them
-/// again. The chain actor is not told a second time: it was when they were
-/// first accepted.
-pub(crate) async fn republish_proposer_preferences(
-    server: &mut P2PServer,
-    preferences: SignedProposerPreferences,
-) {
-    debug!(
-        proposal_slot = preferences.message.proposal_slot,
-        validator_index = preferences.message.validator_index,
-        "Resubmitted proposer preferences are still owed a publish"
-    );
-    gossip_proposer_preferences(server, preferences).await;
-}
-
 /// Gossip every preference the market still owes a publish whose slot has not
 /// started. Runs whenever a peer joins a `proposer_preferences` topic, which
 /// is how a publish waits for a peer, as Prysm's does, and at every fork-digest
@@ -255,9 +239,9 @@ pub(crate) async fn publish_owed_proposer_preferences(server: &mut P2PServer) {
 
 /// Publish on `publish_digest(proposal_slot)`. Records in the market whether a
 /// peer was handed them, so preferences that reached none are published again
-/// (once a peer joins a `proposer_preferences` topic, on a validator client's
-/// re-send, and at the next digest switch), and logs it: `info` once a peer
-/// has them, `warn` when none was handed them.
+/// (once a peer joins a `proposer_preferences` topic, and at the next digest
+/// switch), and logs it: `info` once a peer has them, `warn` when none was
+/// handed them.
 async fn gossip_proposer_preferences(
     server: &mut P2PServer,
     preferences: SignedProposerPreferences,
@@ -297,7 +281,7 @@ async fn gossip_proposer_preferences(
             proposal_slot,
             validator_index,
             %err,
-            "Failed to publish proposer preferences to gossipsub; publishing them again once a peer joins the topic, on a re-send or at the next digest switch"
+            "Failed to publish proposer preferences to gossipsub; publishing them again once a peer joins the topic or at the next digest switch"
         ),
     }
 }
@@ -779,47 +763,5 @@ mod tests {
         assert!(server.builder_market.preferences_publish_owed(&last_fulu));
         assert!(server.builder_market.preferences_publish_owed(&first_gloas));
         assert!(!server.builder_market.preferences_publish_owed(&later));
-    }
-
-    /// A first publish tells the chain actor; a re-send's republish does not
-    /// tell it again, and a failure leaves the preferences owed.
-    #[tokio::test]
-    async fn a_resubmission_republishes_without_reporting_to_the_chain_again() {
-        let mut server = unconnected_beacon_server(gloas_from_genesis(), 0).await;
-        let chain = std::sync::Arc::new(RecordingChain::default());
-        server.blockchain = Some(chain.clone());
-        let wall = hold_the_wall_clock_digest(&mut server);
-        let mut commands = capture_commands(&mut server);
-        let preferences = preferences_at(wall + 40);
-        assert!(
-            server
-                .builder_market
-                .record_preferences(preferences.clone(), wall)
-        );
-        let no_peer = PublishOutcome::Failed("NoPeersSubscribedToTopic".to_string());
-
-        answering(
-            &mut commands,
-            no_peer.clone(),
-            publish_proposer_preferences(&mut server, preferences.clone()),
-        )
-        .await;
-        assert_eq!(*chain.preference_slots.lock().unwrap(), vec![wall + 40]);
-        assert!(server.builder_market.preferences_publish_owed(&preferences));
-
-        let published = answering(
-            &mut commands,
-            no_peer,
-            republish_proposer_preferences(&mut server, preferences.clone()),
-        )
-        .await;
-
-        assert_eq!(published, vec![preferences.to_ssz()]);
-        assert!(server.builder_market.preferences_publish_owed(&preferences));
-        assert_eq!(
-            chain.preference_slots.lock().unwrap().len(),
-            1,
-            "the chain actor is told once"
-        );
     }
 }

@@ -51,8 +51,8 @@ use ethlambda_network_api::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
         PublishBeaconOperation, PublishExecutionPayloadBid, PublishExecutionPayloadEnvelope,
         PublishPayloadAttestationMessage, PublishProposerPreferences,
-        PublishSyncCommitteeContribution, PublishSyncCommitteeMessage,
-        RepublishProposerPreferences, SubscribeAttestationSubnets, SubscribeSyncCommitteeSubnets,
+        PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
+        SubscribeSyncCommitteeSubnets,
     },
 };
 use ethlambda_state_transition::beacon::aggregate::max_aggregates_per_slot;
@@ -2354,12 +2354,6 @@ impl Handler<PublishExecutionPayloadBid> for P2PServer {
 impl Handler<PublishProposerPreferences> for P2PServer {
     async fn handle(&mut self, msg: PublishProposerPreferences, _ctx: &Context<Self>) {
         beacon::builder_market::publish_proposer_preferences(self, msg.preferences).await;
-    }
-}
-
-impl Handler<RepublishProposerPreferences> for P2PServer {
-    async fn handle(&mut self, msg: RepublishProposerPreferences, _ctx: &Context<Self>) {
-        beacon::builder_market::republish_proposer_preferences(self, msg.preferences).await;
     }
 }
 

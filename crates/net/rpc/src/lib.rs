@@ -585,11 +585,6 @@ pub(crate) mod test_utils {
         pub(crate) proposer_preferences: std::sync::Mutex<
             Vec<ethlambda_types::beacon::containers::gloas::SignedProposerPreferences>,
         >,
-        /// Preferences handed back for another publish, apart from first
-        /// publishes.
-        pub(crate) republished_proposer_preferences: std::sync::Mutex<
-            Vec<ethlambda_types::beacon::containers::gloas::SignedProposerPreferences>,
-        >,
         /// `(subnet ids, message)` per sync committee message published.
         pub(crate) sync_messages: std::sync::Mutex<
             Vec<(
@@ -685,17 +680,6 @@ pub(crate) mod test_utils {
             preferences: ethlambda_types::beacon::containers::gloas::SignedProposerPreferences,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.proposer_preferences.lock().unwrap().push(preferences);
-            Ok(())
-        }
-
-        fn republish_proposer_preferences(
-            &self,
-            preferences: ethlambda_types::beacon::containers::gloas::SignedProposerPreferences,
-        ) -> Result<(), spawned_concurrency::error::ActorError> {
-            self.republished_proposer_preferences
-                .lock()
-                .unwrap()
-                .push(preferences);
             Ok(())
         }
 
