@@ -69,13 +69,14 @@ use crate::beacon_node::health::{
     NodeHealth, Probe, Reply, Standing, SyncStatus, SyncVerdict, Tier,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery, Genesis, Liveness,
-    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails, ValidatorEntry,
+    AggregateAttestation, AttesterDuties, BeaconCommitteeSelection, BeaconNodeApi, BlockRequest,
+    Delivery, Genesis, Liveness, ProposerDuties, PtcDuties, Published, SignedAggregates,
+    SyncCommitteeSelection, ValidatorDetails, ValidatorEntry,
 };
 use crate::chain_check::{
     ChainId, ExpectedNetwork, Served, first_chain_difference, first_identity_difference,
 };
-use crate::error::{Error, Result};
+use crate::error::{BeaconNodeFailure, Error, Result};
 
 /// The boxed future `#[async_trait]` desugars a trait method call into,
 /// borrowed from the receiver (and, for methods that take borrowed arguments,
@@ -134,6 +135,18 @@ enum Reach {
     /// Every node but the one at this position, which the caller has already
     /// asked.
     EveryBut(usize),
+}
+
+/// Whether `err` is a request the node took and did not answer within its
+/// timeout.
+fn is_timeout(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::BeaconNode {
+            failure: BeaconNodeFailure::Timeout,
+            ..
+        }
+    )
 }
 
 /// One kind of signed message `--broadcast` can send to every node.
@@ -818,6 +831,23 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
             .map(|(_, value)| value)
     }
 
+    /// [`Self::try_each_quiet`] for a call the node may hold until the
+    /// request times out by design: the selection exchanges, which a
+    /// distributed validator middleware answers only once the other
+    /// operators' partial proofs are in (see [`crate::distributed`]). Such a
+    /// timeout says nothing about whether the node answers anything else, so
+    /// it does not rank the node [`Tier::Failing`], which would warn that it
+    /// stopped answering and route every other call away from it until its
+    /// next probe. A connection that could not be made still does.
+    async fn try_each_held<'p, T, F>(&'p self, what: &'static str, call: F) -> Result<T>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
+    {
+        self.try_each_walk(what, false, Reach::Every, false, call)
+            .await
+            .map(|(_, value)| value)
+    }
+
     /// The walk behind every `try_each`. The position returned is the node's
     /// command-line position, whatever order it was asked in.
     async fn try_each_at_inner<'p, T, F>(
@@ -825,6 +855,25 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
         what: &'static str,
         warn_when_all_fail: bool,
         reach: Reach,
+        call: F,
+    ) -> Result<(usize, T)>
+    where
+        F: Fn(&'p B) -> BoxFuture<'p, Result<T>>,
+    {
+        self.try_each_walk(what, warn_when_all_fail, reach, true, call)
+            .await
+    }
+
+    /// [`Self::try_each_at_inner`], with `timeouts_rank` saying whether a
+    /// node that times out is recorded as not answering
+    /// ([`NodeHealth::record_request_failure`]). Only
+    /// [`Self::try_each_held`] says no.
+    async fn try_each_walk<'p, T, F>(
+        &'p self,
+        what: &'static str,
+        warn_when_all_fail: bool,
+        reach: Reach,
+        timeouts_rank: bool,
         call: F,
     ) -> Result<(usize, T)>
     where
@@ -853,7 +902,9 @@ impl<B: BeaconNodeApi> FallbackBeaconNode<B> {
                     // missed a duty is every node failing, below. A node that
                     // stopped answering is warned about once, by the record.
                     debug!(%what, position, %err, "Beacon node request failed; trying the next");
-                    self.health.record_request_failure(position, what, &err);
+                    if timeouts_rank || !is_timeout(&err) {
+                        self.health.record_request_failure(position, what, &err);
+                    }
                     last = Some(err);
                 }
             }
@@ -1993,6 +2044,34 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
             }
         }
     }
+
+    /// A query: the first node that answers gives the combined proofs.
+    /// Quiet, because the caller retries every slot while the middleware
+    /// fails and reports each failure itself. And a timeout does not rank
+    /// the node failing: the middleware holds a request until the other
+    /// operators' partials are in, so the next epoch's request, or a retry
+    /// for a duty they never sent, can go unanswered in normal operation
+    /// (see [`Self::try_each_held`]).
+    async fn beacon_committee_selections(
+        &self,
+        selections: &[BeaconCommitteeSelection],
+    ) -> Result<Vec<BeaconCommitteeSelection>> {
+        self.try_each_held("beacon_committee_selections", |node| {
+            node.beacon_committee_selections(selections)
+        })
+        .await
+    }
+
+    /// As [`Self::beacon_committee_selections`].
+    async fn sync_committee_selections(
+        &self,
+        selections: &[SyncCommitteeSelection],
+    ) -> Result<Vec<SyncCommitteeSelection>> {
+        self.try_each_held("sync_committee_selections", |node| {
+            node.sync_committee_selections(selections)
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -2516,6 +2595,99 @@ mod tests {
             fallback.nodes[1].block_requests().is_empty(),
             "the second node must not have been asked to build a block too"
         );
+    }
+
+    /// A middleware that fails hands the exchange to the next one, and one
+    /// that answers ends it.
+    #[tokio::test]
+    async fn a_selections_exchange_fails_over_and_stops_at_the_first_answer() {
+        use ethlambda_types::beacon::primitives::BlsSignature;
+
+        let answering = || {
+            MockBeaconNode::new()
+                .with_combined_selection(7, 100, BlsSignature([2; 96]))
+                .with_combined_sync_selection(7, 100, 3, BlsSignature([2; 96]))
+        };
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::failing("middleware down"),
+            answering(),
+            answering(),
+        ]);
+        let attester = [BeaconCommitteeSelection {
+            validator_index: 7,
+            slot: 100,
+            selection_proof: BlsSignature([1; 96]),
+        }];
+        let sync = [SyncCommitteeSelection {
+            validator_index: 7,
+            slot: 100,
+            subcommittee_index: 3,
+            selection_proof: BlsSignature([1; 96]),
+        }];
+
+        let answers = fallback
+            .beacon_committee_selections(&attester)
+            .await
+            .expect("the second node answers");
+        assert_eq!(answers[0].selection_proof, BlsSignature([2; 96]));
+        let answers = fallback
+            .sync_committee_selections(&sync)
+            .await
+            .expect("the second node answers");
+        assert_eq!(answers[0].selection_proof, BlsSignature([2; 96]));
+
+        assert_eq!(fallback.nodes[1].selection_requests().len(), 1);
+        assert_eq!(fallback.nodes[1].sync_selection_requests().len(), 1);
+        assert!(fallback.nodes[2].selection_requests().is_empty());
+        assert!(fallback.nodes[2].sync_selection_requests().is_empty());
+    }
+
+    /// A middleware that holds a selections request until it times out, as
+    /// it does while the other operators' partials are missing, is not
+    /// ranked failing for it: the exchange fails over, and every other call
+    /// still asks that node first. Any other call that times out still ranks
+    /// it failing.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_selections_request_does_not_rank_the_node_failing() {
+        use ethlambda_types::beacon::primitives::BlsSignature;
+
+        let fallback = FallbackBeaconNode::new(vec![
+            MockBeaconNode::new().with_hang(TIMEOUT),
+            MockBeaconNode::new()
+                .with_attestation_data(96)
+                .with_combined_selection(7, 100, BlsSignature([2; 96]))
+                .with_combined_sync_selection(7, 100, 3, BlsSignature([2; 96])),
+        ]);
+        let attester = [BeaconCommitteeSelection {
+            validator_index: 7,
+            slot: 100,
+            selection_proof: BlsSignature([1; 96]),
+        }];
+        let sync = [SyncCommitteeSelection {
+            validator_index: 7,
+            slot: 100,
+            subcommittee_index: 3,
+            selection_proof: BlsSignature([1; 96]),
+        }];
+
+        fallback
+            .beacon_committee_selections(&attester)
+            .await
+            .expect("the second node answers");
+        fallback
+            .sync_committee_selections(&sync)
+            .await
+            .expect("the second node answers");
+        let held = &fallback.nodes[0];
+        assert_eq!(held.hung_calls_to("beacon_committee_selections"), 1);
+        assert_eq!(held.hung_calls_to("sync_committee_selections"), 1);
+        assert!(!fallback.health().tiers().contains(&(0, Tier::Failing)));
+
+        fallback
+            .attestation_data(96, fork_of(96))
+            .await
+            .expect("the second node answers");
+        assert_eq!(fallback.health().tiers()[1], (0, Tier::Failing));
     }
 
     #[tokio::test]

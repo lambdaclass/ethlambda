@@ -96,11 +96,21 @@ pub struct SigningContext {
     /// fork schedule.
     pub genesis_validators_root: Root,
     /// Selection proofs already produced; see [`Self::sign_selection_proof`].
+    /// With distributed mode on, the combined proofs the middleware returned
+    /// instead, and never this client's own; see [`Self::selection_proof`].
     selection_proofs: Mutex<HashMap<(BlsPubkey, Slot), BlsSignature>>,
     /// How many times the schedule has been replaced. Written with the
     /// selection proofs' lock held, so a proof signed across a swap can tell
     /// it was: see [`Self::sign_selection_proof`].
     schedule_generation: AtomicU64,
+    /// The combined sync committee selection proofs the middleware returned,
+    /// by key, slot and subcommittee. Empty with distributed mode off, where
+    /// a sync selection proof is signed when it is wanted.
+    sync_selection_proofs: Mutex<HashMap<(BlsPubkey, Slot, u64), BlsSignature>>,
+    /// Whether this client holds key shares of distributed validators, whose
+    /// aggregation is decided by the combined selection proofs a middleware
+    /// returns (see [`crate::distributed`]).
+    distributed: bool,
     /// One permit per remote signature being verified; see [`Self::verified`].
     verifications: Arc<Semaphore>,
     /// Which keys doppelganger protection lets sign an attestation, a block,
@@ -128,6 +138,12 @@ fn same_fork_schedule(a: &Config, b: &Config) -> bool {
 fn selection_proof_retention_slots() -> Slot {
     3 * slots_per_epoch()
 }
+
+/// How many slots before the newest a combined sync committee selection proof
+/// is kept for. It is read at its own slot's contribution deadline, before the
+/// next slot's exchange starts; the one extra slot is margin, so a newer
+/// exchange never prunes a proof whose slot's contribution step still runs.
+const SYNC_SELECTION_PROOF_RETENTION_SLOTS: Slot = 1;
 
 /// How long one duty's batch of signatures may take, from when it is asked
 /// for.
@@ -211,10 +227,25 @@ impl SigningContext {
             genesis_validators_root,
             selection_proofs: Mutex::new(HashMap::new()),
             schedule_generation: AtomicU64::new(0),
+            sync_selection_proofs: Mutex::new(HashMap::new()),
+            distributed: false,
             verifications: Arc::new(Semaphore::new(cores)),
             doppelganger: None,
             slashed: SlashedValidators::default(),
         }
+    }
+
+    /// Distributed mode: the keys are shares, and whether a validator
+    /// aggregates is decided by the combined selection proofs the middleware
+    /// returns, never by this client's own. See [`crate::distributed`].
+    pub fn with_distributed(mut self) -> Self {
+        self.distributed = true;
+        self
+    }
+
+    /// Whether distributed mode is on ([`Self::with_distributed`]).
+    pub fn is_distributed(&self) -> bool {
+        self.distributed
     }
 
     /// Track slashed keys with `slashed`, in place of a tracker that finds
@@ -271,17 +302,24 @@ impl SigningContext {
     }
 
     /// Swap in a new fork schedule, for every holder of the shared handle,
-    /// and forget the selection proofs signed under the old one.
+    /// and forget the selection proofs whose domain it moves.
     ///
     /// The one way to change the schedule, so the two cannot be done
     /// separately: a remembered proof is a signature over a domain, and a
     /// domain that moved makes it one no node accepts.
     ///
-    /// All three steps happen with the proofs' lock held. A reader of the
-    /// memory therefore sees it either before the swap or emptied after it,
-    /// never the old proofs beside the new schedule, and a proof that was
-    /// being signed across the swap finds the generation moved and is not
-    /// remembered.
+    /// Only those proofs: a slot whose epoch has the same fork version under
+    /// both schedules has the same domain, so its proof is as good as before.
+    /// With distributed mode on the memory holds the middleware's combined
+    /// proofs, which this client cannot sign again, so forgetting one the
+    /// swap did not touch (a fork scheduled far ahead, say) would leave its
+    /// duty without an aggregation until the middleware answered again.
+    ///
+    /// All the steps happen with the proofs' lock held. A reader of the
+    /// memory therefore sees it either before the swap or after it, never an
+    /// old proof beside a schedule that moved its domain, and a proof that
+    /// was being signed across the swap finds the generation moved and is
+    /// not remembered.
     ///
     /// A swap that moves no fork epoch or version (only the duty offsets,
     /// which the chain check also follows) changes no domain: the proofs are
@@ -290,11 +328,18 @@ impl SigningContext {
     /// for nothing.
     pub fn replace_config(&self, config: Config) {
         let mut proofs = self.selection_proofs();
-        let domains_moved = !same_fork_schedule(&self.config.load(), &config);
+        let old = self.config.load();
+        let domains_moved = !same_fork_schedule(&old, &config);
+        if domains_moved {
+            proofs.retain(|(_, slot), _| {
+                let epoch = compute_epoch_at_slot(*slot);
+                old.fork_version(old.fork_at_epoch(epoch))
+                    == config.fork_version(config.fork_at_epoch(epoch))
+            });
+        }
         self.config.store(config);
         if domains_moved {
             self.schedule_generation.fetch_add(1, Ordering::Release);
-            proofs.clear();
         }
     }
 
@@ -760,6 +805,13 @@ impl SigningContext {
     /// deleted mid-epoch its selection: the aggregation would go on to fetch
     /// an aggregate it then cannot sign. A key this client no longer holds
     /// is [`Error::UnknownValidator`] here, as it is on every other path.
+    ///
+    /// With distributed mode on, this is the key share's partial proof, what
+    /// the middleware is sent. It neither reads nor writes the memory, which
+    /// there holds only the middleware's combined proofs: answering from it
+    /// would send the middleware a combined proof as if it were this share's,
+    /// and remembering a partial would have it decide a selection. What
+    /// decides one is [`Self::selection_proof`].
     pub async fn sign_selection_proof(
         &self,
         store: &RwLock<ValidatorStore>,
@@ -769,9 +821,11 @@ impl SigningContext {
         if !store.read().await.contains(pubkey) {
             return Err(Error::UnknownValidator(*pubkey));
         }
-        let remembered = self.selection_proofs().get(&(*pubkey, slot)).copied();
-        if let Some(proof) = remembered {
-            return Ok(proof);
+        if !self.distributed {
+            let remembered = self.selection_proofs().get(&(*pubkey, slot)).copied();
+            if let Some(proof) = remembered {
+                return Ok(proof);
+            }
         }
         loop {
             // Read before the signing root is computed, so a schedule swap
@@ -789,6 +843,10 @@ impl SigningContext {
                     },
                 )
                 .await?;
+            // The share's partial proof: never remembered, see above.
+            if self.distributed {
+                return Ok(proof);
+            }
             let mut proofs = self.selection_proofs();
             if self.schedule_generation.load(Ordering::Acquire) != generation {
                 // The schedule was replaced while this was being signed (a
@@ -801,6 +859,92 @@ impl SigningContext {
             proofs.insert((*pubkey, slot), proof);
             return Ok(proof);
         }
+    }
+
+    /// The selection proof that decides whether `pubkey` aggregates at
+    /// `slot`.
+    ///
+    /// With distributed mode off, this client's own, signed or remembered
+    /// ([`Self::sign_selection_proof`]). With it on, the combined proof the
+    /// middleware returned ([`Self::remember_combined_selection_proofs`]), or
+    /// `None` while there is none: the share's own proof hashes to a
+    /// different value than the validator's, so deciding on it would be
+    /// wrong, and no proof means no aggregation.
+    ///
+    /// The store is asked first either way, for the reason
+    /// [`Self::sign_selection_proof`] gives.
+    pub async fn selection_proof(
+        &self,
+        store: &RwLock<ValidatorStore>,
+        pubkey: &BlsPubkey,
+        slot: Slot,
+    ) -> Result<Option<BlsSignature>> {
+        if !self.distributed {
+            return self
+                .sign_selection_proof(store, pubkey, slot)
+                .await
+                .map(Some);
+        }
+        if !store.read().await.contains(pubkey) {
+            return Err(Error::UnknownValidator(*pubkey));
+        }
+        Ok(self.selection_proofs().get(&(*pubkey, slot)).copied())
+    }
+
+    /// Whether a combined selection proof is held for `pubkey` at `slot`.
+    pub fn holds_combined_selection_proof(&self, pubkey: &BlsPubkey, slot: Slot) -> bool {
+        self.distributed && self.selection_proofs().contains_key(&(*pubkey, slot))
+    }
+
+    /// Remember the combined selection proofs a distributed validator
+    /// middleware returned, each for its `pubkey` at its `slot`, in place of
+    /// whatever was held, and answer how many were kept: all of them or
+    /// none. Ignored with distributed mode off, where the memory holds this
+    /// client's own proofs and nothing else may replace them.
+    ///
+    /// `generation` is [`Self::schedule_generation`] as read before the
+    /// partial proofs they were combined from were signed. Once a swap has
+    /// moved it since, the proofs are dropped: they may be over the old
+    /// schedule's domain, which [`Self::replace_config`] already forgot the
+    /// proofs of, so they must neither come back nor replace those a later
+    /// exchange got under the new schedule. Checked with the memory's lock
+    /// held, the lock the swap moves the generation under, so no swap can
+    /// land between the check and the inserts.
+    ///
+    /// One answer's proofs go in together, so the lock is taken and the
+    /// memory pruned once for all of them. Pruning for each proof walked the
+    /// whole memory every time, which made an exchange's cost grow with the
+    /// square of the duties it covers, on a runtime worker and under the lock
+    /// every selection is read through.
+    ///
+    /// Not verified: each is a signature under the validator's key, which
+    /// this client never learns (it holds a share, and the middleware
+    /// presents the share's pubkey as the validator's). A wrong one costs an
+    /// aggregate every node refuses, nothing slashable.
+    pub fn remember_combined_selection_proofs(
+        &self,
+        generation: u64,
+        combined: impl IntoIterator<Item = (BlsPubkey, Slot, BlsSignature)>,
+    ) -> usize {
+        if !self.distributed {
+            return 0;
+        }
+        let combined: Vec<_> = combined.into_iter().collect();
+        let Some(newest) = combined.iter().map(|(_, slot, _)| *slot).max() else {
+            return 0;
+        };
+        let mut proofs = self.selection_proofs();
+        if self.schedule_generation.load(Ordering::Acquire) != generation {
+            return 0;
+        }
+        proofs.retain(|(_, held), _| held + selection_proof_retention_slots() >= newest);
+        let kept = combined.len();
+        proofs.extend(
+            combined
+                .into_iter()
+                .map(|(pubkey, slot, proof)| ((pubkey, slot), proof)),
+        );
+        kept
     }
 
     /// The remembered selection proofs. A poisoned map is still a map of
@@ -1019,9 +1163,63 @@ impl SigningContext {
         .await
     }
 
+    /// The sync committee selection proof that decides whether `pubkey`
+    /// contributes for `subcommittee_index` at `slot`: this client's own
+    /// ([`Self::sign_sync_selection_proof`]), or with distributed mode on the
+    /// combined one the middleware returned, `None` while there is none, for
+    /// the reason [`Self::selection_proof`] gives.
+    pub async fn sync_selection_proof(
+        &self,
+        store: &RwLock<ValidatorStore>,
+        pubkey: &BlsPubkey,
+        slot: Slot,
+        subcommittee_index: u64,
+    ) -> Result<Option<BlsSignature>> {
+        if !self.distributed {
+            return self
+                .sign_sync_selection_proof(store, pubkey, slot, subcommittee_index)
+                .await
+                .map(Some);
+        }
+        if !store.read().await.contains(pubkey) {
+            return Err(Error::UnknownValidator(*pubkey));
+        }
+        let proofs = self
+            .sync_selection_proofs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Ok(proofs.get(&(*pubkey, slot, subcommittee_index)).copied())
+    }
+
+    /// Remember `proof`, the combined sync committee selection proof a
+    /// distributed validator middleware returned. Ignored with distributed
+    /// mode off, and not verified, as
+    /// [`Self::remember_combined_selection_proofs`] says. Unlike that one it
+    /// takes no schedule generation: a sync exchange is for the slot being
+    /// served, and a swap moves only forks still ahead, so never its domain.
+    pub fn remember_combined_sync_selection_proof(
+        &self,
+        pubkey: BlsPubkey,
+        slot: Slot,
+        subcommittee_index: u64,
+        proof: BlsSignature,
+    ) {
+        if !self.distributed {
+            return;
+        }
+        let mut proofs = self
+            .sync_selection_proofs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        proofs.retain(|(_, held, _), _| held + SYNC_SELECTION_PROOF_RETENTION_SLOTS >= slot);
+        proofs.insert((pubkey, slot, subcommittee_index), proof);
+    }
+
     /// Sign the sync committee selection proof for `slot` and one
     /// subcommittee. Deterministic, so not guarded, for the reason
-    /// [`Self::sign_selection_proof`] is not.
+    /// [`Self::sign_selection_proof`] is not. Never remembered: with
+    /// distributed mode on it is the share's partial proof, which decides
+    /// nothing (see [`Self::sync_selection_proof`]).
     pub async fn sign_sync_selection_proof(
         &self,
         store: &RwLock<ValidatorStore>,
@@ -1172,6 +1370,36 @@ mod tests {
         assert!(context.selection_proofs().is_empty());
     }
 
+    /// A swap that schedules a fork far ahead keeps the proofs of the slots
+    /// it leaves on the same fork version, and forgets those it moves onto
+    /// another. With distributed mode on these are the middleware's combined
+    /// proofs, which this client cannot sign again.
+    #[test]
+    fn replacing_the_config_keeps_the_proofs_whose_domain_did_not_move() {
+        let context = context().with_distributed();
+        let gloas = context.config().fork_epoch(ForkName::Fulu) + 100;
+        let (pubkey, proof) = (BlsPubkey([1; 48]), BlsSignature([2; 96]));
+        let untouched = 100 * preset::slots_per_epoch();
+        let moved = gloas * preset::slots_per_epoch();
+        context
+            .selection_proofs()
+            .insert((pubkey, untouched), proof);
+        context.selection_proofs().insert((pubkey, moved), proof);
+        let generation = context.schedule_generation();
+
+        context.replace_config(Config::mainnet().with_fork_epoch(ForkName::Gloas, gloas));
+
+        assert_ne!(context.schedule_generation(), generation, "a fork moved");
+        assert!(
+            context.holds_combined_selection_proof(&pubkey, untouched),
+            "still phase0's version"
+        );
+        assert!(
+            !context.holds_combined_selection_proof(&pubkey, moved),
+            "now gloas's version, not fulu's"
+        );
+    }
+
     /// A swap that moves only the duty offsets moves no domain: the proofs
     /// stay, and the generation the duty loop resubscribes on does not move.
     #[test]
@@ -1189,6 +1417,67 @@ mod tests {
         assert_eq!(context.config().attestation_due_bps_gloas, 2_000);
         assert_eq!(context.selection_proofs().len(), 1);
         assert_eq!(context.schedule_generation(), generation);
+    }
+
+    /// A combined proof answered for partials signed before a swap that
+    /// moved a fork is dropped, so an exchange still in flight at the swap
+    /// can neither put back what it cleared nor replace a proof a later
+    /// exchange got under the new schedule.
+    #[test]
+    fn a_combined_proof_from_before_a_swap_is_not_kept() {
+        let context = context().with_distributed();
+        let (pubkey, slot) = (BlsPubkey([1; 48]), 5);
+        let before = context.schedule_generation();
+
+        context.replace_config(Config::mainnet().with_fork_version(ForkName::Phase0, [9, 9, 9, 9]));
+        let after = context.schedule_generation();
+        assert_ne!(before, after);
+        let newer = BlsSignature([3; 96]);
+        let kept = context.remember_combined_selection_proofs(after, [(pubkey, slot, newer)]);
+        assert_eq!(kept, 1);
+
+        let stale = BlsSignature([2; 96]);
+        let kept = context.remember_combined_selection_proofs(before, [(pubkey, slot, stale)]);
+        assert_eq!(kept, 0);
+        assert_eq!(
+            context.selection_proofs().get(&(pubkey, slot)),
+            Some(&newer),
+            "the proof under the new schedule stays"
+        );
+        assert!(context.holds_combined_selection_proof(&pubkey, slot));
+    }
+
+    /// One answer's combined proofs are remembered together: what the newest
+    /// of them leaves outside the retention window is forgotten once, and
+    /// every proof of the answer is kept.
+    #[test]
+    fn an_answers_combined_proofs_are_remembered_and_pruned_as_one() {
+        let context = context().with_distributed();
+        let generation = context.schedule_generation();
+        let (pubkey, proof) = (BlsPubkey([1; 48]), BlsSignature([2; 96]));
+        let kept = context.remember_combined_selection_proofs(generation, [(pubkey, 0, proof)]);
+        assert_eq!(kept, 1);
+
+        // An epoch's answer, far enough on that slot 0's proof is not wanted.
+        let slots = preset::slots_per_epoch();
+        let first = selection_proof_retention_slots() + 1;
+        let answer = (first..first + slots).map(|slot| (pubkey, slot, proof));
+        let kept = context.remember_combined_selection_proofs(generation, answer);
+        assert_eq!(kept as u64, slots);
+
+        assert!(!context.holds_combined_selection_proof(&pubkey, 0));
+        assert!(
+            (first..first + slots)
+                .all(|slot| context.holds_combined_selection_proof(&pubkey, slot)),
+            "none of the answer's own proofs is pruned by it"
+        );
+
+        // An empty answer prunes nothing: it has no newest slot to prune by.
+        assert_eq!(
+            context.remember_combined_selection_proofs(generation, []),
+            0
+        );
+        assert_eq!(context.selection_proofs().len() as u64, slots);
     }
 
     fn attestation_data(target_epoch: Epoch) -> AttestationData {

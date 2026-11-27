@@ -31,6 +31,7 @@ pub mod beacon_node;
 pub mod chain_check;
 pub mod client_health;
 pub mod clock_check;
+pub mod distributed;
 pub mod doppelganger;
 pub mod duties;
 pub mod error;
@@ -200,6 +201,13 @@ pub struct ValidatorConfig {
     /// `--broadcast`: the signed messages sent to every beacon node rather
     /// than the first that accepts them. See [`beacon_node::fallback`].
     pub broadcast: beacon_node::fallback::Broadcast,
+    /// The keys are shares of distributed validators, behind middleware
+    /// that combines their signatures: aggregation is decided by the
+    /// combined selection proofs it returns. See [`distributed`]. Refused
+    /// together with [`Self::doppelganger_protection`]; see
+    /// [`refuse_conflicting_modes`].
+    pub distributed: bool,
+
     /// Stop the client when the chain reports a loaded key slashed, rather
     /// than only dropping that key's proposer, attester and attestation
     /// aggregation duties. See [`slashed`].
@@ -222,6 +230,25 @@ pub struct BuilderProposals {
     pub boost_factor: u64,
 }
 
+/// Refuse distributed mode together with doppelganger protection.
+///
+/// The cluster's other operators keep a share's validator live, so the
+/// liveness check would see it attesting and stop this client as a
+/// doppelganger on every start, with nothing naming the two settings. The
+/// binary's flags refuse the pair, but they are not the only way to build a
+/// [`ValidatorConfig`], so [`run`] checks it too, beside the code that relies
+/// on it.
+fn refuse_conflicting_modes(distributed: bool, doppelganger_protection: bool) -> Result<()> {
+    if distributed && doppelganger_protection {
+        return Err(Error::ConflictingConfig(
+            "distributed mode cannot run with doppelganger protection: the cluster's other \
+             operators keep the validator live, so the check would stop this client"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Run the validator client until the future `stop` returns resolves, or
 /// until something stops it with an error.
 ///
@@ -242,6 +269,7 @@ where
     S: Future<Output = &'static str>,
 {
     metrics::init();
+    refuse_conflicting_modes(config.distributed, config.doppelganger_protection)?;
 
     // Said at startup, where an operator reads it: an operator
     // who never sets this proposes blocks that pay their execution-layer
@@ -445,10 +473,19 @@ where
     if let Some(doppelganger) = &doppelganger {
         context = context.with_doppelganger(doppelganger.clone());
     }
+    if config.distributed {
+        context = context.with_distributed();
+    }
     context = context.with_slashed(slashed::SlashedValidators::new(
         config.shut_down_when_slashed,
     ));
     let context = Arc::new(context);
+    let distributed = config.distributed.then(|| {
+        Arc::new(distributed::Distributed::new(
+            beacon_node.clone(),
+            context.clone(),
+        ))
+    });
 
     // Each validator's duty outcomes, counted by the services that serve them.
     let performance = Arc::new(performance::Performance::new(
@@ -867,18 +904,46 @@ where
             if let Some(owed) = owed {
                 send_owed(
                     owed,
+                    slot,
                     epoch,
                     &beacon_node,
                     &duties,
                     &store,
                     &context,
                     &registration,
+                    distributed.as_ref(),
                 );
             }
             // What a node let back in, or a swapped schedule, left owing (see
             // above), now that the block is out.
             if resubscribe {
-                spawn_subscriptions(epoch, &beacon_node, &duties, &store, &context);
+                spawn_subscriptions(
+                    slot,
+                    epoch,
+                    &beacon_node,
+                    &duties,
+                    &store,
+                    &context,
+                    distributed.as_ref(),
+                );
+            }
+            // In distributed mode, every slot once the block is out: the
+            // retry for the current epoch's duties still missing a combined
+            // selection proof, unless a round just started above covers them,
+            // and the slot's sync committee exchange. See `distributed`.
+            if let Some(distributed) = &distributed {
+                let round = owed_moved || resubscribe;
+                // Only what a retry reads: this epoch's duties still ahead,
+                // and nothing when a round covers them. The whole schedule
+                // is two epochs of duties to clone, every slot, on the way
+                // to the slot's duties.
+                let retried = if round {
+                    Vec::new()
+                } else {
+                    duties.from_slot(slot, epoch)
+                };
+                let sync_owed = duties.sync_at_slot(slot);
+                distributed.after_proposal(slot, round, retried, sync_owed, &store, &clock);
             }
             if let Some((registrable, sync_owed)) = readmission {
                 let node = beacon_node.clone();
@@ -987,14 +1052,17 @@ where
             let deferred = beside_slot_duties(refresh, slot_work).await?;
             if let Some(owed) = deferred {
                 report_refreshed(&health, &duties, epoch, resolved.len());
+                // From the next slot: this one's duties are served.
                 send_owed(
                     owed,
+                    slot + 1,
                     epoch,
                     &beacon_node,
                     &duties,
                     &store,
                     &context,
                     &registration,
+                    distributed.as_ref(),
                 );
             }
 
@@ -1029,7 +1097,16 @@ where
                 let budget = clock.remaining_in(slot, SystemTime::now());
                 if follow_dependent_roots(&mut duties, epoch, budget, &context.config()).await {
                     metrics::set_duties_held(duties.all().len() as u64);
-                    spawn_subscriptions(epoch, &beacon_node, &duties, &store, &context);
+                    // From the next slot: this one's duties are served.
+                    spawn_subscriptions(
+                        slot + 1,
+                        epoch,
+                        &beacon_node,
+                        &duties,
+                        &store,
+                        &context,
+                        distributed.as_ref(),
+                    );
                 }
             }
         }
@@ -1876,17 +1953,28 @@ fn report_refreshed<B: BeaconNodeApi>(
 /// costs at most a builder block, never a duty. Only a refresh that got all
 /// the way through leaves anything owing, so a failing one does not respawn a
 /// full registration send every slot.
+#[allow(clippy::too_many_arguments)]
 fn send_owed<B: BeaconNodeApi + 'static>(
     owed: Refreshed,
+    slot: u64,
     epoch: u64,
     beacon_node: &Arc<B>,
     duties: &DutiesService<B>,
     store: &Arc<RwLock<ValidatorStore>>,
     context: &Arc<SigningContext>,
     registration: &Option<Arc<RegistrationService<B>>>,
+    distributed: Option<&Arc<distributed::Distributed<B>>>,
 ) {
     if owed.moved {
-        spawn_subscriptions(epoch, beacon_node, duties, store, context);
+        spawn_subscriptions(
+            slot,
+            epoch,
+            beacon_node,
+            duties,
+            store,
+            context,
+            distributed,
+        );
     }
     if let Some(registration) = registration {
         let registration = registration.clone();
@@ -1897,15 +1985,28 @@ fn send_owed<B: BeaconNodeApi + 'static>(
 /// Send the subnet subscriptions of every attester duty held, from a task of
 /// its own: after the attester schedule moved, a node was let back in, or the
 /// schedule was swapped. See [`send_owed`] for why nothing waits on it.
+///
+/// In distributed mode, the epoch's selection round for the duties from
+/// `slot` on instead: the subscriptions go out, the middleware's combined
+/// proofs are asked for, and those they select are subscribed again with
+/// the role (see [`distributed::Distributed::spawn_round`]). `slot` is the
+/// first slot whose duties are still to be served, so a caller that runs
+/// after the slot's duties passes the next one.
 fn spawn_subscriptions<B: BeaconNodeApi + 'static>(
+    slot: u64,
     epoch: u64,
     beacon_node: &Arc<B>,
     duties: &DutiesService<B>,
     store: &Arc<RwLock<ValidatorStore>>,
     context: &Arc<SigningContext>,
+    distributed: Option<&Arc<distributed::Distributed<B>>>,
 ) {
-    let (beacon_node, store, context) = (beacon_node.clone(), store.clone(), context.clone());
     let schedule = duties.all();
+    if let Some(distributed) = distributed {
+        distributed.spawn_round(slot, schedule, store);
+        return;
+    }
+    let (beacon_node, store, context) = (beacon_node.clone(), store.clone(), context.clone());
     tokio::spawn(async move {
         let subscribed = subscriptions::subscribe(&beacon_node, &schedule, &store, &context);
         let _ = subscribed.await.inspect_err(|err| {
@@ -2463,6 +2564,21 @@ mod tests {
 
     fn pubkey(byte: u8) -> BlsPubkey {
         BlsPubkey([byte; 48])
+    }
+
+    /// Distributed mode and doppelganger protection are refused together by
+    /// the client itself, since the binary's flags are not the only way to
+    /// reach `run`. Either alone, or neither, starts.
+    #[test]
+    fn distributed_mode_is_refused_with_doppelganger_protection() {
+        assert!(refuse_conflicting_modes(false, false).is_ok());
+        assert!(refuse_conflicting_modes(true, false).is_ok());
+        assert!(refuse_conflicting_modes(false, true).is_ok());
+        let refused = refuse_conflicting_modes(true, true);
+        assert!(
+            matches!(refused, Err(Error::ConflictingConfig(_))),
+            "got {refused:?}"
+        );
     }
 
     /// A node that resolves two validators and has duties for epoch 3, so
@@ -4288,5 +4404,80 @@ mod tests {
             "got {stopped:?}"
         );
         assert_eq!(before.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// What `spawn_subscriptions` sent, from slot 3201, for a schedule of two
+    /// duties in epoch 100: one at slot 3200, which has passed, and one at
+    /// 3205. In distributed mode when `context` is.
+    async fn subscriptions_spawned_from_3201(context: SigningContext) -> Arc<MockBeaconNode> {
+        let mut store = ValidatorStore::new();
+        let secret: [u8; 32] =
+            hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes");
+        let key = store.insert_secret("test", &secret).expect("inserts");
+        let store = Arc::new(RwLock::new(store));
+
+        let ahead = beacon_node::dto::AttesterDutyDto {
+            slot: 3205,
+            ..attester_duty(&key, 22)
+        };
+        let schedule = vec![attester_duty(&key, 11), ahead];
+        let node = Arc::new(MockBeaconNode::new().with_duties(100, Root::repeat_byte(1), schedule));
+        let context = Arc::new(context);
+        let mut duties = DutiesService::new(node.clone(), vec![11, 22]);
+        duties
+            .refresh_around(100, &context.config())
+            .await
+            .expect("refreshes");
+        let distributed = context
+            .is_distributed()
+            .then(|| Arc::new(distributed::Distributed::new(node.clone(), context.clone())));
+
+        let distributed = distributed.as_ref();
+        spawn_subscriptions(3201, 100, &node, &duties, &store, &context, distributed);
+        // On the paused clock: back once the task it spawned has run.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        node
+    }
+
+    /// In distributed mode the subnet subscriptions go through the selection
+    /// round, for the duties from the slot given. The one before it is left
+    /// out, which a caller that runs after its slot's duties relies on when
+    /// it passes the next slot.
+    #[tokio::test(start_paused = true)]
+    async fn in_distributed_mode_the_subscriptions_go_through_the_selection_round() {
+        let node = subscriptions_spawned_from_3201(context().with_distributed()).await;
+
+        let asked: Vec<u64> = node
+            .selection_requests()
+            .iter()
+            .flatten()
+            .map(|entry| entry.slot)
+            .collect();
+        assert_eq!(asked, vec![3205], "the middleware is asked, from the slot");
+        let subscribed: Vec<u64> = node
+            .subscriptions()
+            .iter()
+            .map(|entry| entry.slot)
+            .collect();
+        assert_eq!(subscribed, vec![3205]);
+    }
+
+    /// With the mode off the whole schedule held is subscribed as it is, and
+    /// no middleware is asked for anything.
+    #[tokio::test(start_paused = true)]
+    async fn with_distributed_mode_off_the_schedule_is_subscribed_without_an_exchange() {
+        let node = subscriptions_spawned_from_3201(context()).await;
+
+        assert!(node.selection_requests().is_empty());
+        let mut subscribed: Vec<u64> = node
+            .subscriptions()
+            .iter()
+            .map(|entry| entry.slot)
+            .collect();
+        subscribed.sort_unstable();
+        assert_eq!(subscribed, vec![3200, 3205]);
     }
 }

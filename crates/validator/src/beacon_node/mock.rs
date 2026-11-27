@@ -14,7 +14,9 @@ use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::containers::shared::Checkpoint;
 use ethlambda_types::beacon::containers::shared::SignedVoluntaryExit;
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
+use ethlambda_types::beacon::primitives::{
+    BlsPubkey, BlsSignature, Epoch, Root, Slot, ValidatorIndex,
+};
 use tokio::sync::{Notify, Semaphore};
 
 use crate::beacon_node::block_contents::{
@@ -28,9 +30,10 @@ use crate::beacon_node::dto::{
 use crate::beacon_node::events::{EventSource, EventStream, NodeEvent, Topic};
 use crate::beacon_node::health::SyncStatus;
 use crate::beacon_node::{
-    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
-    Genesis, Liveness, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
-    ValidatorEntry, validate_sync_contribution,
+    AggregateAttestation, AggregateKind, AttesterDuties, BeaconCommitteeSelection, BeaconNodeApi,
+    BlockRequest, Delivery, Genesis, Liveness, ProposerDuties, PtcDuties, Published,
+    SignedAggregates, SyncCommitteeSelection, ValidatorDetails, ValidatorEntry,
+    validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
 
@@ -268,6 +271,25 @@ pub struct MockBeaconNode {
     pub liveness_delay: Option<std::time::Duration>,
     /// How long `spec` takes before it answers, as a hung node would.
     pub spec_delay: Option<std::time::Duration>,
+    /// The combined proof `beacon_committee_selections` answers for each
+    /// (validator, slot), as a middleware would once the cluster's partials
+    /// are in. An entry asked for and not here is left out of the answer.
+    pub combined_selections: Mutex<HashMap<(ValidatorIndex, Slot), BlsSignature>>,
+    /// Every `beacon_committee_selections` request that got past the
+    /// configured failures, in call order.
+    pub selection_requests: Mutex<Vec<Vec<BeaconCommitteeSelection>>>,
+    /// Leave a `beacon_committee_selections` request unanswered while any
+    /// entry in it has no combined proof, as Charon does.
+    pub hold_uncombined_selections: bool,
+    /// [`Self::combined_selections`] for `sync_committee_selections`, by
+    /// (validator, slot, subcommittee).
+    pub combined_sync_selections: Mutex<HashMap<(ValidatorIndex, Slot, u64), BlsSignature>>,
+    /// Every `sync_committee_selections` request that got past the
+    /// configured failures, in call order.
+    pub sync_selection_requests: Mutex<Vec<Vec<SyncCommitteeSelection>>>,
+    /// Leave a `sync_committee_selections` request unanswered while any
+    /// entry in it has no combined proof, as Charon does.
+    pub hold_uncombined_sync_selections: bool,
     /// A delay for the first call of each named method only (see
     /// [`Self::with_first_call_delay`]).
     pub first_call_delays: Mutex<HashMap<&'static str, std::time::Duration>>,
@@ -624,8 +646,9 @@ impl MockBeaconNode {
         self
     }
 
-    /// Make the first call to `what` (`attestation_data`, `head_block_root`
-    /// or `payload_attestation_data`) take `delay` before it answers, and
+    /// Make the first call to `what` (`attestation_data`, `head_block_root`,
+    /// `payload_attestation_data` or `subscribe_committees`) take `delay`
+    /// before it answers, and
     /// every later one answer at once: an early request still out at a
     /// duty's deadline, then the deadline's own request.
     pub fn with_first_call_delay(self, what: &'static str, delay: std::time::Duration) -> Self {
@@ -694,8 +717,8 @@ impl MockBeaconNode {
     /// For a call that checks it: when the node hangs, wait out the timeout
     /// and fail as the HTTP client fails a request that got no answer. Checked
     /// by `sync_status`, `attestation_data`, `publish_block`,
-    /// `submit_attestations` and `publish_execution_payload_envelope`, which
-    /// all also wait out [`Self::slow`] first.
+    /// `submit_attestations`, `publish_execution_payload_envelope` and the two
+    /// selection exchanges, which all also wait out [`Self::slow`] first.
     async fn stall(&self, what: &'static str) -> Result<()> {
         if let Some(delay) = self.slow {
             tokio::time::sleep(delay).await;
@@ -738,6 +761,61 @@ impl MockBeaconNode {
     pub fn with_spec_delay(mut self, delay: std::time::Duration) -> Self {
         self.spec_delay = Some(delay);
         self
+    }
+
+    /// Answer `beacon_committee_selections` for `validator` at `slot` with
+    /// `proof`.
+    pub fn with_combined_selection(
+        self,
+        validator: ValidatorIndex,
+        slot: Slot,
+        proof: BlsSignature,
+    ) -> Self {
+        self.combined_selections
+            .lock()
+            .expect("lock")
+            .insert((validator, slot), proof);
+        self
+    }
+
+    /// Answer `sync_committee_selections` for `validator` at `slot` in
+    /// `subcommittee` with `proof`.
+    pub fn with_combined_sync_selection(
+        self,
+        validator: ValidatorIndex,
+        slot: Slot,
+        subcommittee: u64,
+        proof: BlsSignature,
+    ) -> Self {
+        self.combined_sync_selections
+            .lock()
+            .expect("lock")
+            .insert((validator, slot, subcommittee), proof);
+        self
+    }
+
+    /// Answer `beacon_committee_selections` as Charon does: never, while an
+    /// entry in the request has no combined proof.
+    pub fn holding_uncombined_selections(mut self) -> Self {
+        self.hold_uncombined_selections = true;
+        self
+    }
+
+    /// Answer `sync_committee_selections` as Charon does: never, while an
+    /// entry in the request has no combined proof.
+    pub fn holding_uncombined_sync_selections(mut self) -> Self {
+        self.hold_uncombined_sync_selections = true;
+        self
+    }
+
+    /// Every `beacon_committee_selections` request, in call order.
+    pub fn selection_requests(&self) -> Vec<Vec<BeaconCommitteeSelection>> {
+        self.selection_requests.lock().expect("lock").clone()
+    }
+
+    /// Every `sync_committee_selections` request, in call order.
+    pub fn sync_selection_requests(&self) -> Vec<Vec<SyncCommitteeSelection>> {
+        self.sync_selection_requests.lock().expect("lock").clone()
     }
 
     /// Make `submit_proposer_preferences` take `delay` before it answers.
@@ -1596,6 +1674,7 @@ impl BeaconNodeApi for MockBeaconNode {
     }
 
     async fn subscribe_committees(&self, subscriptions: &[CommitteeSubscriptionDto]) -> Result<()> {
+        self.delay_first_call("subscribe_committees").await;
         self.guard("subscribe_committees")?;
         self.subscriptions
             .lock()
@@ -1761,5 +1840,70 @@ impl BeaconNodeApi for MockBeaconNode {
                     .collect()
             })
             .collect())
+    }
+
+    async fn beacon_committee_selections(
+        &self,
+        selections: &[BeaconCommitteeSelection],
+    ) -> Result<Vec<BeaconCommitteeSelection>> {
+        // Ahead of the configured failures, as for `liveness`.
+        if selections.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.stall("beacon_committee_selections").await?;
+        self.guard("beacon_committee_selections")?;
+        self.selection_requests
+            .lock()
+            .expect("lock")
+            .push(selections.to_vec());
+        let answered: Vec<_> = {
+            let combined = self.combined_selections.lock().expect("lock");
+            selections
+                .iter()
+                .filter_map(|selection| {
+                    let proof = combined.get(&selection.key())?;
+                    Some(BeaconCommitteeSelection {
+                        selection_proof: *proof,
+                        ..*selection
+                    })
+                })
+                .collect()
+        };
+        if self.hold_uncombined_selections && answered.len() < selections.len() {
+            std::future::pending::<()>().await;
+        }
+        Ok(answered)
+    }
+
+    async fn sync_committee_selections(
+        &self,
+        selections: &[SyncCommitteeSelection],
+    ) -> Result<Vec<SyncCommitteeSelection>> {
+        if selections.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.stall("sync_committee_selections").await?;
+        self.guard("sync_committee_selections")?;
+        self.sync_selection_requests
+            .lock()
+            .expect("lock")
+            .push(selections.to_vec());
+        let answered: Vec<_> = {
+            let combined = self.combined_sync_selections.lock().expect("lock");
+            selections
+                .iter()
+                .filter_map(|selection| {
+                    let proof = combined.get(&selection.key())?;
+                    Some(SyncCommitteeSelection {
+                        selection_proof: *proof,
+                        ..*selection
+                    })
+                })
+                .collect()
+        };
+        if self.hold_uncombined_sync_selections && answered.len() < selections.len() {
+            std::future::pending::<()>().await;
+        }
+        Ok(answered)
     }
 }

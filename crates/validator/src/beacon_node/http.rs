@@ -45,18 +45,20 @@ use libssz::SszDecode as _;
 
 use crate::beacon_node::block_contents::{ProducedBlock, Producer};
 use crate::beacon_node::dto::{
-    AttestationDataDto, AttestationDto, AttesterDutyDto, BlockRootResponse,
-    CommitteeSubscriptionDto, DataResponse, DutiesResponse, ErrorMessageDto, GenesisDto,
-    IndexedErrorResponse, LivenessDto, ProduceBlockV3Response, ProposerDutyDto,
+    AttestationDataDto, AttestationDto, AttesterDutyDto, BeaconCommitteeSelectionDto,
+    BlockRootResponse, CommitteeSubscriptionDto, DataResponse, DutiesResponse, ErrorMessageDto,
+    GenesisDto, IndexedErrorResponse, LivenessDto, ProduceBlockV3Response, ProposerDutyDto,
     ProposerPreparationDto, PtcDutyDto, SignedAggregateAndProofOutDto, SingleAttestationDto,
-    SyncCommitteeSubscriptionDto, SyncDutyDto, SyncingDto, ValidatorDetailsDto, ValidatorEntryDto,
-    VersionedResponse, config_from_spec_response, encode_hex, parse_pubkey, parse_root,
+    SyncCommitteeSelectionDto, SyncCommitteeSubscriptionDto, SyncDutyDto, SyncingDto,
+    ValidatorDetailsDto, ValidatorEntryDto, VersionedResponse, config_from_spec_response,
+    encode_hex, parse_pubkey, parse_root,
 };
 use crate::beacon_node::health::SyncStatus;
 use crate::beacon_node::{
-    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Delivery,
-    Genesis, Liveness, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorDetails,
-    ValidatorEntry, validate_attestation_data, validate_liveness, validate_produced_block,
+    AggregateAttestation, AggregateKind, AttesterDuties, BeaconCommitteeSelection, BeaconNodeApi,
+    BlockRequest, Delivery, Genesis, Liveness, ProposerDuties, PtcDuties, Published,
+    SignedAggregates, SyncCommitteeSelection, ValidatorDetails, ValidatorEntry,
+    validate_attestation_data, validate_liveness, validate_produced_block, validate_selections,
     validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
@@ -1782,6 +1784,54 @@ impl BeaconNodeApi for HttpBeaconNode {
         });
         futures_util::future::try_join_all(queries).await
     }
+
+    async fn beacon_committee_selections(
+        &self,
+        selections: &[BeaconCommitteeSelection],
+    ) -> Result<Vec<BeaconCommitteeSelection>> {
+        if selections.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body: Vec<BeaconCommitteeSelectionDto> = selections.iter().map(Into::into).collect();
+        let response: DataResponse<Vec<BeaconCommitteeSelectionDto>> = self
+            .post("/eth/v1/validator/beacon_committee_selections", &body, None)
+            .await?;
+        let answers = response
+            .data
+            .into_iter()
+            .map(BeaconCommitteeSelection::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        validate_selections(
+            "beacon_committee_selections",
+            selections.iter().map(BeaconCommitteeSelection::key),
+            answers.iter().map(BeaconCommitteeSelection::key),
+        )?;
+        Ok(answers)
+    }
+
+    async fn sync_committee_selections(
+        &self,
+        selections: &[SyncCommitteeSelection],
+    ) -> Result<Vec<SyncCommitteeSelection>> {
+        if selections.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body: Vec<SyncCommitteeSelectionDto> = selections.iter().map(Into::into).collect();
+        let response: DataResponse<Vec<SyncCommitteeSelectionDto>> = self
+            .post("/eth/v1/validator/sync_committee_selections", &body, None)
+            .await?;
+        let answers = response
+            .data
+            .into_iter()
+            .map(SyncCommitteeSelection::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        validate_selections(
+            "sync_committee_selections",
+            selections.iter().map(SyncCommitteeSelection::key),
+            answers.iter().map(SyncCommitteeSelection::key),
+        )?;
+        Ok(answers)
+    }
 }
 
 #[cfg(test)]
@@ -3209,6 +3259,141 @@ mod tests {
         let (node, seen) = serve_liveness(false, serde_json::json!({ "data": [] })).await;
         let answers = node.liveness(&[12], &[]).await.expect("empty");
         assert_eq!(answers, vec![Vec::new()]);
+        assert!(seen.lock().expect("lock").is_empty());
+    }
+
+    /// Every body a selections route received, by path.
+    type SelectionsSeen = std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// A middleware answering both selections routes with `reply`, recording
+    /// what it was sent.
+    async fn serve_selections(reply: serde_json::Value) -> (HttpBeaconNode, SelectionsSeen) {
+        use axum::extract::{Json, State};
+        use axum::http::Uri;
+        use axum::routing::post;
+
+        let seen: SelectionsSeen = Default::default();
+        let handler = |State((seen, reply)): State<(SelectionsSeen, serde_json::Value)>,
+                       uri: Uri,
+                       Json(body): Json<serde_json::Value>| async move {
+            seen.lock()
+                .expect("lock")
+                .push((uri.path().to_string(), body));
+            Json(reply)
+        };
+        let app = axum::Router::new()
+            .route(
+                "/eth/v1/validator/beacon_committee_selections",
+                post(handler),
+            )
+            .route("/eth/v1/validator/sync_committee_selections", post(handler))
+            .with_state((seen.clone(), reply));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let node = HttpBeaconNode::new(format!("http://{address}")).expect("builds");
+        (node, seen)
+    }
+
+    fn proof(byte: u8) -> ethlambda_types::beacon::primitives::BlsSignature {
+        ethlambda_types::beacon::primitives::BlsSignature([byte; 96])
+    }
+
+    /// The wire shape both ways: a bare array of entries with quoted
+    /// integers and a hex proof, and the answer's `data` read back.
+    #[tokio::test]
+    async fn beacon_committee_selections_post_partials_and_read_combined_proofs_back() {
+        let reply = serde_json::json!({ "data": [
+            { "validator_index": "7", "slot": "100", "selection_proof": encode_hex(&[2; 96]) },
+        ]});
+        let (node, seen) = serve_selections(reply).await;
+        let asked = [BeaconCommitteeSelection {
+            validator_index: 7,
+            slot: 100,
+            selection_proof: proof(1),
+        }];
+        let answers = node
+            .beacon_committee_selections(&asked)
+            .await
+            .expect("answers");
+        assert_eq!(
+            answers,
+            vec![BeaconCommitteeSelection {
+                selection_proof: proof(2),
+                ..asked[0]
+            }]
+        );
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "/eth/v1/validator/beacon_committee_selections");
+        assert_eq!(
+            seen[0].1,
+            serde_json::json!([
+                { "validator_index": "7", "slot": "100", "selection_proof": encode_hex(&[1; 96]) },
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_committee_selections_carry_the_subcommittee_both_ways() {
+        let reply = serde_json::json!({ "data": [
+            { "validator_index": "7", "slot": "100", "subcommittee_index": "3",
+              "selection_proof": encode_hex(&[2; 96]) },
+        ]});
+        let (node, seen) = serve_selections(reply).await;
+        let asked = [SyncCommitteeSelection {
+            validator_index: 7,
+            slot: 100,
+            subcommittee_index: 3,
+            selection_proof: proof(1),
+        }];
+        let answers = node
+            .sync_committee_selections(&asked)
+            .await
+            .expect("answers");
+        assert_eq!(answers[0].selection_proof, proof(2));
+        assert_eq!(answers[0].key(), (7, 100, 3));
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen[0].0, "/eth/v1/validator/sync_committee_selections");
+        assert_eq!(seen[0].1[0]["subcommittee_index"], "3");
+    }
+
+    /// An answer about another validator or slot is one to fail over from.
+    #[tokio::test]
+    async fn a_selections_answer_naming_an_entry_not_asked_is_refused() {
+        let reply = serde_json::json!({ "data": [
+            { "validator_index": "8", "slot": "100", "selection_proof": encode_hex(&[2; 96]) },
+        ]});
+        let (node, _) = serve_selections(reply).await;
+        let asked = [BeaconCommitteeSelection {
+            validator_index: 7,
+            slot: 100,
+            selection_proof: proof(1),
+        }];
+        let err = node
+            .beacon_committee_selections(&asked)
+            .await
+            .expect_err("not an answer");
+        assert!(matches!(err, Error::InconsistentResponse(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn no_selections_request_is_sent_for_no_entries() {
+        let (node, seen) = serve_selections(serde_json::json!({ "data": [] })).await;
+        assert!(
+            node.beacon_committee_selections(&[])
+                .await
+                .expect("empty")
+                .is_empty()
+        );
+        assert!(
+            node.sync_committee_selections(&[])
+                .await
+                .expect("empty")
+                .is_empty()
+        );
         assert!(seen.lock().expect("lock").is_empty());
     }
 }

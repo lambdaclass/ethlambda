@@ -257,6 +257,21 @@ pub(crate) struct ValidatorOptions {
     #[arg(long, default_value = "false")]
     pub(crate) enable_doppelganger_protection: bool,
 
+    /// Distributed validator mode, for keys that are shares behind
+    /// middleware such as Obol Charon: whether a validator aggregates
+    /// attestations or sync committee contributions is decided by the
+    /// combined selection proofs the middleware returns, not by this
+    /// client's own. `--beacon-nodes` must then point at the middleware.
+    ///
+    /// Refused with `--enable-doppelganger-protection`: the cluster's other
+    /// operators keep the validator live, so the check would stop this client.
+    #[arg(
+        long,
+        default_value = "false",
+        conflicts_with = "enable_doppelganger_protection"
+    )]
+    pub(crate) distributed: bool,
+
     /// Stop when the chain reports one of the loaded validators slashed, and
     /// exit with code 3, which a supervisor should be told not to restart on
     /// (systemd: `RestartPreventExitStatus=3`).
@@ -511,6 +526,7 @@ async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
         doppelganger_protection: options.enable_doppelganger_protection,
         network,
         broadcast: options.broadcast.into_iter().collect(),
+        distributed: options.distributed,
         shut_down_when_slashed: options.shut_down_when_slashed,
         event_stream: !options.disable_event_stream,
     };
@@ -662,6 +678,7 @@ mod tests {
             self_build_only: false,
             init_slashing_protection: false,
             enable_doppelganger_protection: false,
+            distributed: false,
             shut_down_when_slashed: false,
             disable_event_stream: false,
         }
@@ -867,6 +884,15 @@ mod tests {
         assert!(!parse(&[]).expect("parses").enable_doppelganger_protection);
         let options = parse(&["--enable-doppelganger-protection"]).expect("parses");
         assert!(options.enable_doppelganger_protection);
+    }
+
+    /// Opt-in, as in every other client, and refused with doppelganger
+    /// protection, which the cluster's other operators would trip.
+    #[test]
+    fn distributed_mode_is_off_unless_asked_for_and_excludes_doppelganger_protection() {
+        assert!(!parse(&[]).expect("parses").distributed);
+        assert!(parse(&["--distributed"]).expect("parses").distributed);
+        assert!(parse(&["--distributed", "--enable-doppelganger-protection"]).is_err());
     }
 
     /// Opt-in, as Teku's `--shut-down-when-validator-slashed-enabled` is:

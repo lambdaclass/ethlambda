@@ -705,6 +705,21 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             .unwrap_or_default()
     }
 
+    /// The duties of `epoch` at `slot` or after it, slashed validators' left
+    /// out as in [`Self::at_slot`].
+    pub fn from_slot(&self, slot: Slot, epoch: Epoch) -> Vec<AttesterDutyDto> {
+        self.by_epoch
+            .get(&epoch)
+            .map(|held| {
+                held.duties
+                    .iter()
+                    .filter(|duty| duty.slot >= slot && self.serves(duty.validator_index))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Every duty held, across the epochs currently loaded.
     pub fn all(&self) -> Vec<AttesterDutyDto> {
         self.by_epoch
