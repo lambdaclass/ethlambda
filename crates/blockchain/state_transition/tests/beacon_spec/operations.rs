@@ -103,7 +103,7 @@
 //!   lists `consolidation_request`, `withdrawal_request`, `withdrawals`,
 //!   `process_attestation`, and `process_voluntary_exit` as unmodified, so
 //!   electra's functions serve fulu's cases for those five too, and it lists
-//!   `process_deposit` as removed outright rather than modified (beta.2 ships
+//!   `process_deposit` as removed outright rather than modified (beta.5 ships
 //!   no fulu `operations/deposit` fixtures, so that arm is untested either
 //!   way). `deposit_request` is the one exception with a genuine fulu-only
 //!   function: it drops the statement that sets
@@ -441,36 +441,19 @@ fn run(
             ForkName::Lean => lean_is_not_a_fixture_fork("attester_slashing"),
         },
         // `ProposerSlashing` never changes shape, container included, gloas's
-        // own not excepted. What changes at gloas is the function: it clears
-        // the `BuilderPendingPayment` tied to a slashed proposal (EIP-7732),
-        // which every earlier fork's `process_proposer_slashing` has no
-        // notion of, so this alone needs the routing every other fork's
-        // `proposer_slashing` handler above already has.
+        // own not excepted, and since consensus-specs #5719 neither does the
+        // function: gloas's clearing of the slashed proposer's
+        // `BuilderPendingPayment`s lives in `slash_validator`, which every
+        // fork's copy reaches.
         "proposer_slashing" => {
             let slashing: shared::ProposerSlashing = case.ssz("proposer_slashing");
-            match case.fork {
-                ForkName::Phase0
-                | ForkName::Altair
-                | ForkName::Bellatrix
-                | ForkName::Capella
-                | ForkName::Deneb
-                | ForkName::Electra
-                | ForkName::Fulu => operations::process_proposer_slashing(
-                    state,
-                    &slashing,
-                    config,
-                    &active_balances,
-                    signatures,
-                ),
-                ForkName::Gloas => gloas_stf::process_proposer_slashing(
-                    state,
-                    &slashing,
-                    config,
-                    &active_balances,
-                    signatures,
-                ),
-                ForkName::Lean => lean_is_not_a_fixture_fork("proposer_slashing"),
-            }
+            operations::process_proposer_slashing(
+                state,
+                &slashing,
+                config,
+                &active_balances,
+                signatures,
+            )
         }
         "deposit" => match case.fork {
             // The `Deposit` container never changes shape; through deneb a
@@ -489,7 +472,7 @@ fn run(
             // specification removes `process_deposit` outright rather than
             // modifying it (`beacon-chain.md`'s "Modified `process_operations`":
             // `assert len(body.deposits) == 0`, no call at all), so this
-            // fulu arm is dead in practice: beta.2 ships no fulu
+            // fulu arm is dead in practice: beta.5 ships no fulu
             // `operations/deposit` fixtures. Kept rather than dropped so a
             // future fixture release that does ship one fails loudly through
             // whatever electra's function rejects it for, not silently

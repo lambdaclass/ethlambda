@@ -1139,7 +1139,7 @@ impl BlockChainServer {
                 // last call, so a tick delayed by a long import still resets
                 // proposer boost and pulls up unrealized checkpoints for each
                 // slot it skipped, not just the latest one.
-                fork_choice::on_tick(&mut self.store, timestamp_ms / 1000, &config);
+                fork_choice::on_tick_ms(&mut self.store, timestamp_ms, &config);
                 // Between the clock and the head: an aggregate for the slot
                 // that just ended becomes applicable exactly now, and its
                 // votes have to be in fork choice before the head this tick
@@ -4173,8 +4173,9 @@ impl BlockChainServer {
     /// across a slot boundary: crossing one is the tick's job, since it also
     /// drains deferred aggregates and recomputes the head, which this does
     /// not. An event from a later slot than the store reads is clamped to the
-    /// last instant of the current one. The specification's clock is whole
-    /// seconds, so the deadlines are judged on the second the event fell in.
+    /// last instant of the current one. The specification's clock is in
+    /// milliseconds since consensus-specs v1.7.0-beta.3 (#5667), so the
+    /// deadlines are judged on the millisecond the event arrived at.
     fn advance_beacon_clock_to(&mut self, event_ms: u64) {
         if self.store.chain() != Chain::Beacon {
             return;
@@ -4189,10 +4190,10 @@ impl BlockChainServer {
                     .saturating_mul(config.slot_duration_ms),
             )
             .saturating_sub(1);
-        let time = event_ms.min(slot_end_ms) / 1000;
+        let time_ms = event_ms.min(slot_end_ms);
         let store_time_ms = self.store.time_ms().expect("store time exists");
-        if fork_choice::seconds_to_milliseconds(time) > store_time_ms {
-            fork_choice::on_tick(&mut self.store, time, &config);
+        if time_ms > store_time_ms {
+            fork_choice::on_tick_ms(&mut self.store, time_ms, &config);
         }
     }
 

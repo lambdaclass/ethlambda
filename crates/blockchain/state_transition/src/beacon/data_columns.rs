@@ -129,7 +129,8 @@ fn header_with_body_root(
 }
 
 /// The specification's `get_data_column_sidecars`. `cells_and_proofs[i]` is
-/// blob `i`'s cells and its `CELLS_PER_EXT_BLOB` proofs.
+/// blob `i`'s cells and its `CELLS_PER_EXT_BLOB` proofs. A block without
+/// commitments has no sidecars (consensus-specs #5767).
 ///
 /// # Panics
 ///
@@ -146,6 +147,9 @@ pub fn get_data_column_sidecars(
         kzg_commitments.len(),
         "one cells-and-proofs entry per commitment"
     );
+    if kzg_commitments.is_empty() {
+        return Vec::new();
+    }
     (0..NUMBER_OF_COLUMNS)
         .map(|column_index| {
             column_sidecar(

@@ -644,7 +644,7 @@ the chain actor writes, so no request waits on the actor.
 - **`pool/proposer_slashings`, `pool/attester_slashings`, `pool/voluntary_exits`
   and `pool/bls_to_execution_changes`**: `GET` lists the pool. `POST` runs the
   specification's `validate_*_gossip` rule for the topic against the head's
-  post-state as it is (consensus-specs v1.7.0-beta.1; no `process_*` and no
+  post-state as it is (consensus-specs v1.7.0-beta.5; no `process_*` and no
   state advance, and an attester slashing's range and slashability checks run
   before its BLS checks), pools the operation and gossips it on the topic. A
   rejected operation is a `400`. `bls_to_execution_changes` takes an array: on

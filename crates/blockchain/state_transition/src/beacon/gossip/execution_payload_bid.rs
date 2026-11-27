@@ -3,7 +3,8 @@
 //! of building its own payload.
 //!
 //! The rules are the specification's `validate_execution_payload_bid_gossip`
-//! (`specs/gloas/p2p-interface.md`), split like [`super::envelope`]:
+//! (`specs/gloas/p2p-interface.md`, as of consensus-specs v1.7.0-beta.5),
+//! split like [`super::envelope`]:
 //! [`cheap_checks`] reads only the message, the market's seen state and the
 //! clock, so the p2p actor runs it inline; [`stateful_checks`] reads cached
 //! states and verifies the signature, so it runs on a blocking thread. The
@@ -37,7 +38,9 @@ use crate::beacon::constants::PAYLOAD_BUILDER_VERSION;
 use crate::beacon::containers::{BeaconState, SignedBeaconBlock, gloas};
 use crate::beacon::fork_choice::{self, ForkChoiceNode, PayloadStatus, Store};
 use crate::beacon::helpers::accessors::{get_current_epoch, get_randao_mix};
-use crate::beacon::helpers::gloas::{can_builder_cover_bid, is_active_builder};
+use crate::beacon::helpers::gloas::{
+    can_builder_cover_bid, get_pending_balance_to_withdraw_for_builder, is_active_builder,
+};
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
 use crate::beacon::lean_boundary::lean_state_unreachable;
 use crate::beacon::preset;
@@ -47,6 +50,21 @@ use crate::beacon::stf::gloas::verify_execution_payload_bid_signature;
 
 /// Gloas p2p preset: the largest decompressed `SignedExecutionPayloadBid`.
 pub const MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE: usize = 196_932;
+
+/// The specification's `ETH_TO_GWEI`.
+const ETH_TO_GWEI: u64 = 1_000_000_000;
+
+/// The spec's `get_builder_bid_limit` (consensus-specs #5805, #5843): how many
+/// bids `builder_index` may have accepted per slot and parent, one per whole
+/// ETH of its balance net of the withdrawals already queued against it.
+pub fn get_builder_bid_limit(
+    state: &gloas::BeaconState,
+    builder_index: gloas::BuilderIndex,
+) -> Option<u64> {
+    let balance = state.builders.get(builder_index as usize)?.balance;
+    let pending = get_pending_balance_to_withdraw_for_builder(state, builder_index).ok()?;
+    Some(balance.saturating_sub(pending) / ETH_TO_GWEI)
+}
 
 /// The spec's `is_gas_limit_target_compatible`: whether `gas_limit` is what
 /// the EIP-1559 transition rule from `parent_gas_limit` allows when steering
@@ -86,12 +104,27 @@ pub fn cheap_checks(
 ) -> Result<(), Outcome> {
     let bid = &signed.message;
     let config = store.config();
-    // [IGNORE] The first bid for this slot, parent and builder, and [IGNORE]
-    // the highest value seen for the slot and parent.
+    // [IGNORE] The highest value seen for the slot and parent. The bid limit
+    // that replaced "the first bid per builder" (consensus-specs #5805) needs
+    // the builder's balance, so it is a stateful rule.
     market.check_bid_seen(bid).map_err(Outcome::Ignore)?;
     // [IGNORE] The bid's slot is the current slot or the next slot.
     if !is_current_or_next_slot(&config, bid.slot, now_ms) {
         return Err(Outcome::Ignore(IgnoreReason::NotCurrentOrNextSlot));
+    }
+    // [IGNORE] The bid arrives after the previous slot's payload attestation
+    // deadline (consensus-specs #5803). A bid for slot zero has no previous
+    // slot, and before the fork's first slot no gloas deadline; both reach
+    // the pre-gloas IGNORE below.
+    if let Some(previous) = bid.slot.checked_sub(1) {
+        let deadline_ms = config.genesis_time_ms()
+            + previous.saturating_mul(config.slot_duration_ms)
+            + fork_choice::get_payload_attestation_due_ms(&config);
+        if now_ms < deadline_ms {
+            return Err(Outcome::Ignore(
+                IgnoreReason::BeforePayloadAttestationDeadline,
+            ));
+        }
     }
     // [REJECT] The bid's execution payment is zero.
     if bid.execution_payment != 0 {
@@ -147,6 +180,7 @@ fn pre_gloas_payload(state: &BeaconState) -> Option<(ExecutionBlockHash, u64)> {
 enum HeadView {
     Gloas {
         node: ForkChoiceNode,
+        slot: Slot,
         parent_root: Root,
         bid_parent_hash: ExecutionBlockHash,
         bid_block_hash: ExecutionBlockHash,
@@ -174,6 +208,7 @@ fn head_view(store: &Store) -> Result<HeadView, Outcome> {
         return match &*state {
             BeaconState::Gloas(inner) => Ok(HeadView::Gloas {
                 node,
+                slot: inner.latest_block_header.slot,
                 parent_root: inner.latest_block_header.parent_root,
                 bid_parent_hash: inner.latest_execution_payload_bid.parent_block_hash,
                 bid_block_hash: inner.latest_execution_payload_bid.block_hash,
@@ -196,6 +231,7 @@ fn head_view(store: &Store) -> Result<HeadView, Outcome> {
             let bid = &block.message.body.signed_execution_payload_bid.message;
             Ok(HeadView::Gloas {
                 node,
+                slot: block.message.slot,
                 parent_root: block.message.parent_root,
                 bid_parent_hash: bid.parent_block_hash,
                 bid_block_hash: bid.block_hash,
@@ -216,6 +252,11 @@ fn head_view(store: &Store) -> Result<HeadView, Outcome> {
 /// A pre-gloas head has no bid, so a bid is compatible when it builds on that
 /// head and its payload (the boundary rule: pre-gloas parent payloads count as
 /// full).
+///
+/// A bid on the head's own parent is compatible only for the slot right after
+/// the head, and only when the head is late or its proposer equivocated
+/// (consensus-specs #5803): those are the only cases in which the next
+/// proposer reorgs the head and so can select such a bid.
 pub fn is_bid_compatible_with_head(
     store: &Store,
     bid: &gloas::ExecutionPayloadBid,
@@ -226,14 +267,25 @@ pub fn is_bid_compatible_with_head(
         }
         HeadView::Gloas {
             node,
+            slot,
             parent_root,
             bid_parent_hash,
             bid_block_hash,
         } => {
+            let internal = |_| Outcome::Ignore(IgnoreReason::Internal);
             let builds_on_parent_block = bid.parent_block_root == parent_root;
             let builds_on_parent_payload = bid.parent_block_hash == bid_parent_hash;
             if builds_on_parent_block && builds_on_parent_payload {
-                return Ok(true);
+                // A proposer only builds on the head's parent to reorg the head.
+                if slot.checked_add(1) != Some(bid.slot) {
+                    return Ok(false);
+                }
+                if fork_choice::is_head_late(store, node.root).map_err(internal)? {
+                    return Ok(true);
+                }
+                let index = store.block_index();
+                return fork_choice::is_proposer_equivocation(store, &index, node.root)
+                    .map_err(internal);
             }
             if bid.parent_block_root != node.root {
                 return Ok(false);
@@ -421,6 +473,13 @@ fn stateful_rules(
     if !is_active_builder(inner, bid.builder_index).unwrap_or(false) {
         return Err(reject(RejectReason::InactiveBuilder));
     }
+    // [IGNORE] The builder has not reached its bid limit for this slot and
+    // parent (consensus-specs #5805, #5843).
+    let bid_limit =
+        get_builder_bid_limit(inner, bid.builder_index).ok_or(ignore(IgnoreReason::Internal))?;
+    if market.bid_count(bid) >= bid_limit {
+        return Err(ignore(IgnoreReason::BidLimitReached));
+    }
     // [IGNORE] The builder can cover the bid.
     if !can_builder_cover_bid(inner, bid.builder_index, bid.value).unwrap_or(false) {
         return Err(ignore(IgnoreReason::BuilderCannotCover));
@@ -605,13 +664,29 @@ mod tests {
         cheap_checks(&scene.market, &scene.store, bid, scene.now_ms())
     }
 
+    /// consensus-specs #5805: a builder's higher second bid for a parent
+    /// passes the cheap rules; only its bid limit, a stateful rule, caps it.
     #[test]
-    fn a_builders_second_bid_for_a_parent_is_already_seen() {
+    fn a_builders_higher_second_bid_for_a_parent_passes_the_cheap_rules() {
         let scene = scene();
         assert!(scene.market.record_bid(scene.bid.clone()));
+        let higher = scene.signed(|bid| bid.value += 1);
+        assert_eq!(cheap(&scene, &higher), Ok(()));
+    }
+
+    #[test]
+    fn a_bid_before_the_previous_slots_payload_attestation_deadline_is_ignored() {
+        let scene = scene();
+        let config = scene.store.config();
+        let deadline = slot_start_ms(&scene.store, scene_bid_slot() - 1)
+            + fork_choice::get_payload_attestation_due_ms(&config);
         assert_eq!(
-            cheap(&scene, &scene.signed(|bid| bid.value = 9)),
-            Err(ignore(IgnoreReason::AlreadySeen))
+            cheap_checks(&scene.market, &scene.store, &scene.bid, deadline - 1),
+            Err(ignore(IgnoreReason::BeforePayloadAttestationDeadline))
+        );
+        assert_eq!(
+            cheap_checks(&scene.market, &scene.store, &scene.bid, deadline),
+            Ok(())
         );
     }
 
@@ -974,6 +1049,7 @@ mod tests {
         let proposer = fixed_proposer(&scene.state, slot).expect("in the lookahead window");
         let preferences = sign_preferences(
             &scene.state,
+            &scene.store.config(),
             gloas::ProposerPreferences {
                 dependent_root: dependent,
                 proposal_slot: slot,
@@ -1052,6 +1128,7 @@ mod tests {
         let dependent_root = dependent_root_at(&state, parent, slot).expect("in the window");
         let preferences = sign_preferences(
             &state,
+            &store.config(),
             gloas::ProposerPreferences {
                 dependent_root,
                 proposal_slot: slot,

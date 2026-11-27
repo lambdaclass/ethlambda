@@ -208,6 +208,15 @@ pub enum IgnoreReason {
     BeforeFork,
     /// A voluntary exit for a validator that has already initiated its exit.
     AlreadyExiting,
+    /// A voluntary exit for a validator with pending partial withdrawals,
+    /// which `process_voluntary_exit` would refuse (consensus-specs #5764).
+    PendingPartialWithdrawals,
+    /// A bid that arrived before the previous slot's payload attestation
+    /// deadline (consensus-specs #5803).
+    BeforePayloadAttestationDeadline,
+    /// A builder already has as many bids for this slot and parent as its
+    /// balance allows (consensus-specs #5805).
+    BidLimitReached,
     /// The head state's sync committees cannot answer for the message's period.
     SyncCommitteeUnavailable,
 }
@@ -252,6 +261,9 @@ impl IgnoreReason {
             Self::PtcUnavailable => "ptc_unavailable",
             Self::BeforeFork => "before_fork",
             Self::AlreadyExiting => "already_exiting",
+            Self::PendingPartialWithdrawals => "pending_partial_withdrawals",
+            Self::BeforePayloadAttestationDeadline => "before_payload_attestation_deadline",
+            Self::BidLimitReached => "bid_limit_reached",
             Self::SyncCommitteeUnavailable => "sync_committee_unavailable",
         }
     }
@@ -340,6 +352,25 @@ pub enum RejectReason {
     ExecutionRequestsRootMismatch,
     /// A gloas envelope's payload carries more withdrawals than its limit.
     TooManyWithdrawals,
+    /// A gloas envelope's parent beacon block root is not its block's parent
+    /// root (consensus-specs #5821).
+    ParentBeaconBlockRootMismatch,
+    /// A gloas envelope's payload gas limit is not its bid's (#5821).
+    GasLimitMismatch,
+    /// A gloas envelope's payload carries more transactions than the parent
+    /// payload's gas limit allows (#5802).
+    TooManyTransactions,
+    /// A gloas envelope's payload does not build on its block's post-state's
+    /// execution head (#5821).
+    ParentHashMismatch,
+    /// A gloas envelope's payload carries an empty transaction (#5821).
+    EmptyTransaction,
+    /// A gloas envelope's payload withdrawals are not the ones its block's
+    /// post-state expects (#5821).
+    WithdrawalsMismatch,
+    /// A gloas envelope's payload block hash is not the hash of the header
+    /// its own fields describe (#5770).
+    BlockHashIncorrect,
     /// A payload attestation's slot lies before the gloas fork.
     PreGloasSlot,
     /// A payload attestation's validator is not in its slot's payload
@@ -401,6 +432,13 @@ impl RejectReason {
             Self::BlockHashMismatch => "block_hash_mismatch",
             Self::ExecutionRequestsRootMismatch => "execution_requests_root_mismatch",
             Self::TooManyWithdrawals => "too_many_withdrawals",
+            Self::ParentBeaconBlockRootMismatch => "parent_beacon_block_root_mismatch",
+            Self::GasLimitMismatch => "gas_limit_mismatch",
+            Self::TooManyTransactions => "too_many_transactions",
+            Self::ParentHashMismatch => "parent_hash_mismatch",
+            Self::EmptyTransaction => "empty_transaction",
+            Self::WithdrawalsMismatch => "withdrawals_mismatch",
+            Self::BlockHashIncorrect => "block_hash_incorrect",
             Self::PreGloasSlot => "pre_gloas_slot",
             Self::NotInPtc => "not_in_ptc",
             Self::InvalidOperation => "invalid_operation",

@@ -199,8 +199,8 @@ does not follow gets a separate, explicit warning at startup, since the chain
 follower would stop tracking the chain there regardless of what parsed
 cleanly; none exists today. The keys this
 build runs on compile-time constants for (the custody and subnet counts, the
-`MAX_REQUEST_*` limits, `MAX_PAYLOAD_SIZE`, the snappy message domains and
-`MAXIMUM_GOSSIP_CLOCK_DISPARITY`) must equal those
+`MAX_REQUEST_*` limits, `MAX_PAYLOAD_SIZE`, the snappy message domains,
+`MAXIMUM_GOSSIP_CLOCK_DISPARITY` and `MIN_TRANSACTION_GAS`) must equal those
 constants, or startup fails naming each key that differs: the node cannot
 follow a network that sets them otherwise, and `/eth/v1/config/spec` would
 report values it does not use. For a directory, both checks run before its
@@ -865,7 +865,8 @@ The slot length and the duty offsets are read from the beacon node's
 `/eth/v1/config/spec`, not divided out of a compiled-in constant. The
 specification states them as `SLOT_DURATION_MS` plus basis points of it,
 `ATTESTATION_DUE_BPS` and `AGGREGATE_DUE_BPS`, which on mainnet's 12-second slot
-work out at 3999 ms and 8000 ms. Gloas moves both earlier
+work out at 4000 ms and 8000 ms, rounded to the nearest millisecond since
+consensus-specs #5756. Gloas moves both earlier
 (`ATTESTATION_DUE_BPS_GLOAS`, `AGGREGATE_DUE_BPS_GLOAS`) and adds
 `PAYLOAD_ATTESTATION_DUE_BPS` (and `PAYLOAD_DUE_BPS`, which the node uses), so
 the clock picks the pair by the fork of each slot's own epoch. The sync

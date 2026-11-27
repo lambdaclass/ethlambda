@@ -315,10 +315,11 @@ Everything coarser is derived from it, exactly and in one direction:
 | Slot | `Store::current_slot` | both chains, including the beacon `get_slots_since_genesis` |
 
 Nothing stores a derived reading, so none of them can fall out of step with
-the row or with each other. The beacon specification denominates its own
-`Store.time` in seconds, so `on_tick` and `on_tick_per_slot` convert on the
-way in and the fixture harness divides on the way out; that conversion lives
-at those edges rather than in a second row.
+the row or with each other. The beacon specification keeps `Store.time_ms` in
+milliseconds too (consensus-specs #5667), which `on_tick_ms` and
+`on_tick_per_slot_ms` take as is; the seconds-taking `on_tick` the fixture
+harness ticks with multiplies on the way in, and the harness divides on the way
+out for the fixtures' `time` check, a whole-second reading.
 
 Lean's `on_tick` writes the row only at interval boundaries, since the
 boundary is what it has actually processed: it walks forward one interval at a

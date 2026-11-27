@@ -91,8 +91,14 @@ fn max_aggregation_bits() -> usize {
 /// bitfield as a `Tuple[bool, ...]`; packing here keeps a whole committee's
 /// bits (up to `MAX_VALIDATORS_PER_COMMITTEE`, thousands on mainnet) to a
 /// handful of words instead of one heap-allocated `bool` per bit.
+///
+/// The bit length is kept beside the words, since two bitfields of different
+/// lengths can pack into the same number of words.
 #[derive(Clone, PartialEq, Eq)]
-struct PackedBits(Vec<u64>);
+struct PackedBits {
+    len: usize,
+    words: Vec<u64>,
+}
 
 impl PackedBits {
     fn from_bits(bits: &[bool]) -> Self {
@@ -102,24 +108,28 @@ impl PackedBits {
                 words[index / 64] |= 1 << (index % 64);
             }
         }
-        Self(words)
+        Self {
+            len: bits.len(),
+            words,
+        }
     }
 
     /// The specification's `is_non_strict_superset` (`phase0/p2p-interface.md`):
     /// every bit `other` sets is also set here.
     ///
-    /// A `other` longer than `self` is never covered, however much the
-    /// overlapping words agree: the extra bits are positions `self` has no
-    /// opinion on. In practice the two are always the same length, since both
-    /// come from aggregates sharing one `(data_root, committee_index)` key
-    /// and so the same committee, but nothing here relies on that.
+    /// A bitfield of a different length is never covered, however much the
+    /// overlapping words agree (consensus-specs #5766, v1.7.0-beta.5). Two
+    /// aggregates sharing one `(data_root, committee_index)` key are for the
+    /// same committee, so an honest pair always agrees on the length; one that
+    /// does not is a malformed aggregate, which must reach the length rule and
+    /// be rejected rather than be ignored as already covered.
     fn is_superset_of(&self, other: &PackedBits) -> bool {
-        if other.0.len() > self.0.len() {
+        if other.len != self.len {
             return false;
         }
-        self.0
+        self.words
             .iter()
-            .zip(other.0.iter())
+            .zip(other.words.iter())
             .all(|(mine, theirs)| theirs & !mine == 0)
     }
 }
@@ -668,6 +678,15 @@ mod tests {
     #[test]
     fn a_longer_candidate_is_never_covered() {
         let seen = PackedBits::from_bits(&[true]);
+        assert!(!seen.is_superset_of(&PackedBits::from_bits(&[true, true])));
+    }
+
+    /// consensus-specs #5766: a shorter candidate is not covered either, even
+    /// when every bit it sets is set in the seen one and both pack into one
+    /// word. It is malformed, and must reach the length rule's REJECT.
+    #[test]
+    fn a_shorter_candidate_is_never_covered() {
+        let seen = PackedBits::from_bits(&[true, true, true]);
         assert!(!seen.is_superset_of(&PackedBits::from_bits(&[true, true])));
     }
 

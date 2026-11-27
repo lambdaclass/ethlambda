@@ -554,7 +554,8 @@ the preset sets that state's container bounds:
 - `check_constants`: every key the node runs on a compile-time constant for
   instead of reading `Config` (the custody counts, subnet counts,
   `MAX_REQUEST_*`, `MAX_PAYLOAD_SIZE`, the snappy message domains,
-  `MAXIMUM_GOSSIP_CLOCK_DISPARITY`) must equal that constant.
+  `MAXIMUM_GOSSIP_CLOCK_DISPARITY`, `MIN_TRANSACTION_GAS`) must equal that
+  constant.
   `/eth/v1/config/spec` reports these keys off the stored `Config`, so this is
   what keeps it from reporting a value the node does not use. A new such
   constant needs a line in `check_constants`.
@@ -808,6 +809,17 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   target, which read `consensus-spec-tests`); `make test-beacon-mainnet` runs
   them, and without the feature they report as ignored, so a plain `cargo test`
   needs no download.
+- Signature checks are never switched off, in the node or in a test: do not
+  add a cargo feature, flag or thread-local that skips them, even a test-only
+  one. It could easily end up skipping checks in a production build (feature
+  unification, or one mistaken call). To test the other checks without
+  signatures, split the code into a signature-checking half and the rest, so
+  a test calls only the half it needs and production calls both (fork
+  choice's `verified_attesting_indices`/`attesting_indices` already work this
+  way; block processing does not yet). Until then, a fixture generated with
+  BLS ignored (`bls_setting: 2`, whose blocks carry stub signatures) is
+  reported as ignored by name instead of run; at v1.7.0-beta.5 that is every
+  `fast_confirmation` case.
 - Every fixture case is its own test, named `<runner>/<fork>/<handler>/<suite>/<case>`,
   so a failure names the case and not the suite around it. The spec binary
   therefore supplies its own harness (`harness = false`), since a case is only
@@ -1055,8 +1067,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   [`docs/beacon_stf.md`](docs/beacon_stf.md) has the design and
   [`docs/spec_deviations.md`](docs/spec_deviations.md) the deliberate departures
   from the spec, in particular the fulu-to-gloas fork-choice boundary rule.
-- **Fast Confirmation Rule** (`beacon/fast_confirmation.rs`, consensus-specs
-  `master` @ `f993cf2`, not the pinned release): run once per slot by the beacon
+- **Fast Confirmation Rule** (`beacon/fast_confirmation.rs`, at the pinned
+  release; its minimal `fast_confirmation` vectors are collected by
+  `tests/beacon_spec/fast_confirmation.rs` but all ignored, being unsigned): run once per slot by the beacon
   actor's tick after the head recompute and before `forkchoiceUpdated` (not
   past the slot's attestation deadline; a run after a slot without one starts
   over like a restart, offering the last reported root to
@@ -1214,12 +1227,13 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 7: `States` and `StateDiffs` moved from root keys to
-  slot||root keys (the block's slot, looked up from `BlockHeaders` by readers)
-  so `Store::prune_finalized_states` can range-delete finalized states; a
-  directory written by an earlier version holds rows no lookup finds. (6 was
-  the gloas schedule, timing and churn keys in `Config`, which is SSZ-encoded
-  under `KEY_CONFIG`; 5 was the unrealized-justifications table, since a
+- `DB_VERSION` is 8: consensus-specs v1.7.0-beta.5's `MIN_TRANSACTION_GAS`
+  joined `Config`, which is SSZ-encoded under `KEY_CONFIG`, so a version 7
+  directory decodes into the wrong fields. (7 moved `States` and `StateDiffs`
+  from root keys to slot||root keys (the block's slot, looked up from
+  `BlockHeaders` by readers) so `Store::prune_finalized_states` can
+  range-delete finalized states, leaving an older directory's rows unfindable;
+  6 was the gloas schedule, timing and churn keys in `Config`; 5 was the unrealized-justifications table, since a
   directory written before it has no row there for any block it already
   imported; 4 was `PRESET_BASE`/`CONFIG_NAME` at the front of `Config`; 3 was
   the runtime keys a `config.yaml` supplies.) `Store::from_db_state` refuses

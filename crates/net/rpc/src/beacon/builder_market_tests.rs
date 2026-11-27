@@ -245,6 +245,13 @@ impl World {
         Self::at_clock(SLOT)
     }
 
+    /// [`World::new`] on a clock where [`SLOT`] is running too: a bid for a
+    /// slot is ignored until the previous slot's payload attestation deadline
+    /// (consensus-specs #5803), which slot 32's first second is before.
+    fn bidding() -> Self {
+        Self::at_clock(SLOT)
+    }
+
     fn at_clock(clock_slot: u64) -> Self {
         Self::build(chain_config(), chain_state(), clock_slot)
     }
@@ -423,11 +430,14 @@ impl World {
             fee_recipient,
             target_gas_limit: gas,
         };
-        let domain = get_domain(
-            &self.state,
-            DOMAIN_PROPOSER_PREFERENCES,
-            Some(compute_epoch_at_slot(SLOT)),
-        );
+        // The proposal epoch's fork version off the schedule, as the spec's
+        // `get_signed_proposer_preferences` signs and the gossip rule verifies.
+        let domain =
+            ethlambda_state_transition::beacon::gossip::proposer_preferences::proposer_preferences_domain(
+                &self.config,
+                self.state.genesis_validators_root(),
+                compute_epoch_at_slot(SLOT),
+            );
         let signing_root = compute_signing_root(message.hash_tree_root(), domain);
         SignedProposerPreferences {
             signature: sign_for(validator as usize, signing_root),
@@ -942,7 +952,7 @@ fn bid_request(bid: &SignedExecutionPayloadBid) -> Request<Body> {
 /// A world where a bid of builder 0 passes every rule: the preferences for the
 /// slot are cached and the parent payload is known.
 fn world_ready_for_bids() -> World {
-    let world = World::new();
+    let world = World::bidding();
     world.prime_preferences(address(0xaa), 30_000_000);
     world.reveal_parent_payload();
     world
@@ -1022,7 +1032,7 @@ async fn a_bid_with_a_bad_signature_is_a_400_naming_the_verdict() {
 
 #[tokio::test]
 async fn a_bid_for_a_slot_without_preferences_is_a_400() {
-    let world = World::new();
+    let world = World::bidding();
     world.reveal_parent_payload();
     let bid = world.bid(5, address(0xaa));
 
@@ -1237,13 +1247,13 @@ async fn preferences_signed_by_the_validator_client_pass_this_nodes_gossip_rules
 
 /// The same across a fulu-to-gloas boundary, for a slot in the first gloas
 /// epoch: the one case where the fork of the proposal's epoch (gloas, what
-/// consensus-specs v1.7.0-beta.4 and every client sign and verify with) and
-/// the fork of the epoch before it (fulu, beta.2's gossip rule) differ.
+/// consensus-specs since v1.7.0-beta.4 and every client sign and verify with)
+/// and the fork of the epoch before it (fulu, beta.2's gossip rule) differ.
 ///
-/// This node accepts both, so its verdict alone would also pass a client still
-/// signing by beta.2. The signature is therefore also checked against the two
-/// domains directly: it must verify under gloas's version, which Lighthouse
-/// and the others demand, and not under fulu's, which Lighthouse refused.
+/// The signature is also checked against the two domains directly, so the
+/// test says which one the client used rather than only that this node
+/// accepted it: gloas's version, which this node's rule and Lighthouse and the
+/// others demand, and not fulu's, which Lighthouse refused.
 #[tokio::test]
 async fn a_first_gloas_epoch_preference_from_the_validator_client_passes_this_nodes_gossip_rules() {
     let world = World::at_the_gloas_fork();

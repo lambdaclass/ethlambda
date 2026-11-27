@@ -577,6 +577,10 @@ pub struct Config {
     pub min_epochs_for_blob_sidecars_requests: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_epochs_for_data_column_sidecars_requests: u64,
+    /// Gloas: the gas floor per transaction that bounds an envelope's
+    /// transaction count on gossip (consensus-specs #5802).
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub min_transaction_gas: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub subnets_per_node: u64,
 
@@ -798,6 +802,7 @@ impl Config {
             message_domain_valid_snappy: [0x01, 0x00, 0x00, 0x00],
             min_epochs_for_blob_sidecars_requests: 4_096,
             min_epochs_for_data_column_sidecars_requests: 4_096,
+            min_transaction_gas: 4_096,
             subnets_per_node: 2,
 
             deposit_chain_id: 1,
@@ -919,6 +924,7 @@ impl Config {
             message_domain_valid_snappy: [0x01, 0x00, 0x00, 0x00],
             min_epochs_for_blob_sidecars_requests: 4_096,
             min_epochs_for_data_column_sidecars_requests: 4_096,
+            min_transaction_gas: 4_096,
             subnets_per_node: 2,
 
             // configs/minimal.yaml: Ethereum Goerli testnet's chain and

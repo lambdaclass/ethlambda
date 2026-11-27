@@ -2,7 +2,9 @@
 //! `SignedExecutionPayloadEnvelope`, revealing the payload its bid committed to.
 //!
 //! The rules are the specification's `validate_execution_payload_envelope_gossip`
-//! (`specs/gloas/p2p-interface.md`), split the way [`super::column`]'s are:
+//! (`specs/gloas/p2p-interface.md`, as of consensus-specs v1.7.0-beta.5, whose
+//! #5821, #5770 and #5802 hold the payload to its bid, its block's post-state
+//! and its own block hash), split the way [`super::column`]'s are:
 //! [`cheap_checks`] reads only the message, the seen cache and the store's
 //! finalized checkpoint, so the p2p actor runs it inline; [`stateful_checks`]
 //! reads the envelope's block and its post-state and verifies the signature, so
@@ -16,9 +18,9 @@
 //!   specification's "MAY be queued"), and so is a block whose post-state
 //!   exists but is not cached, since the chain actor verifies the signature
 //!   itself.
-//! - The block-independent limits (withdrawal and request counts) run in
-//!   [`cheap_checks`], so a message that no block could make valid is never
-//!   queued.
+//! - The block-independent limits (withdrawal and request counts, and no
+//!   empty transaction) run in [`cheap_checks`], so a message that no block
+//!   could make valid is never queued.
 //! - The finalized-slot `IGNORE` runs in [`cheap_checks`], ahead of the block
 //!   lookups the specification places before it. Both outcomes are `IGNORE`, so
 //!   only the metric label can differ, and an envelope too old to matter is
@@ -35,12 +37,21 @@ use super::{
     finalized_start_slot,
 };
 use crate::beacon::containers::gloas::BuilderIndex;
-use crate::beacon::containers::{SignedBeaconBlock, gloas};
-use crate::beacon::fork_choice::Store;
+use crate::beacon::containers::{BeaconState, SignedBeaconBlock, gloas};
+use crate::beacon::execution_block_hash::compute_execution_block_hash;
+use crate::beacon::fork_choice::{self, PayloadStatus, Store};
 use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{HashTreeRoot as _, Root};
+use crate::beacon::stf::bellatrix::compute_timestamp_at_slot;
 use crate::beacon::stf::gloas::verify_execution_payload_envelope_signature;
+
+/// Gloas p2p config: a lower bound on the gas one transaction uses, which
+/// bounds how many transactions a payload of a given gas limit can carry
+/// (consensus-specs #5802). Well below the cheapest Glamsterdam transaction
+/// (12,000 gas). A network's `config.yaml` names it as `MIN_TRANSACTION_GAS`,
+/// and startup refuses one that disagrees with this (`check_constants`).
+pub const MIN_TRANSACTION_GAS: u64 = 4096;
 
 /// The first valid envelope per `(block root, builder index)`: the
 /// specification's `seen.execution_payload_envelopes`.
@@ -99,7 +110,100 @@ pub fn cheap_checks(
     if !execution_requests_within_limits(&message.execution_requests) {
         return Err(Outcome::Reject(RejectReason::OperationLimit));
     }
+    // [REJECT] The payload contains no empty transactions (consensus-specs
+    // #5821). Block-independent too, so it runs here with the limits.
+    if message.payload.transactions.iter().any(|tx| tx.is_empty()) {
+        return Err(Outcome::Reject(RejectReason::EmptyTransaction));
+    }
     Ok(())
+}
+
+/// The gas limit of `block`'s parent payload, as `get_max_payload_gas_limit`
+/// reads it: the payload of the closest full ancestor, or `None` when no
+/// ancestor in the store is full. A pre-gloas ancestor counts as full (the
+/// fulu-to-gloas boundary rule), its payload the one in its own body.
+///
+/// Reads each block's recorded payload link where `on_block` left one, so the
+/// ordinary walk (a full parent, or one empty step before a full one) decodes
+/// only the full ancestor whose payload it needs.
+fn parent_payload_gas_limit(
+    store: &Store,
+    block_root: Root,
+    block: &gloas::BeaconBlock,
+) -> Result<Option<u64>, Outcome> {
+    fn internal<E>(_: E) -> Outcome {
+        Outcome::Ignore(IgnoreReason::Internal)
+    }
+    let mut root = block_root;
+    let mut parent_root = block.parent_root;
+    while store.has_block(&parent_root) {
+        let parent_full = match store.payload_link(&root) {
+            Some(link) => link.parent_status() == Some(PayloadStatus::Full),
+            None => {
+                let block = store
+                    .get_signed_block(&root)
+                    .map_err(internal)?
+                    .ok_or(Outcome::Ignore(IgnoreReason::Internal))?;
+                fork_choice::is_parent_node_full(store, &block).map_err(internal)?
+            }
+        };
+        if parent_full {
+            let parent = store
+                .get_signed_block(&parent_root)
+                .map_err(internal)?
+                .ok_or(Outcome::Ignore(IgnoreReason::Internal))?;
+            if let Some(gas_limit) = pre_gloas_payload_gas_limit(&parent) {
+                return Ok(Some(gas_limit));
+            }
+            // A child of a full parent is imported only once the parent's
+            // envelope is verified, which stores it.
+            let envelope = store
+                .get_execution_payload_envelope(&parent_root)
+                .map_err(internal)?
+                .ok_or(Outcome::Ignore(IgnoreReason::Internal))?;
+            return Ok(Some(envelope.message.payload.gas_limit));
+        }
+        root = parent_root;
+        parent_root = match store.block_entry(&parent_root) {
+            Some((_slot, grandparent)) => grandparent,
+            None => break,
+        };
+    }
+    Ok(None)
+}
+
+/// A pre-gloas block's own payload gas limit; `None` for a gloas block (and
+/// for one before bellatrix, which no gloas block descends from unbroken).
+fn pre_gloas_payload_gas_limit(block: &SignedBeaconBlock) -> Option<u64> {
+    match block {
+        SignedBeaconBlock::Bellatrix(b) => Some(b.message.body.execution_payload.gas_limit),
+        SignedBeaconBlock::Capella(b) => Some(b.message.body.execution_payload.gas_limit),
+        SignedBeaconBlock::Deneb(b) => Some(b.message.body.execution_payload.gas_limit),
+        SignedBeaconBlock::Electra(b) | SignedBeaconBlock::Fulu(b) => {
+            Some(b.message.body.execution_payload.gas_limit)
+        }
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Gloas(_) => None,
+        SignedBeaconBlock::Lean(_) => {
+            lean_block_unreachable("envelope::pre_gloas_payload_gas_limit")
+        }
+    }
+}
+
+/// The spec's `get_max_payload_gas_limit` (consensus-specs #5802): the highest
+/// gas limit the EIP-1559 transition rule allows `block`'s payload, from the
+/// parent payload's, or the bid's own gas limit when no ancestor is full.
+fn get_max_payload_gas_limit(
+    store: &Store,
+    block_root: Root,
+    block: &gloas::BeaconBlock,
+) -> Result<u64, Outcome> {
+    let bid = &block.body.signed_execution_payload_bid.message;
+    Ok(match parent_payload_gas_limit(store, block_root, block)? {
+        Some(parent) => parent.saturating_add((parent / 1024).saturating_sub(1)),
+        None => bid.gas_limit,
+    })
 }
 
 /// The rules that need the envelope's block and its post-state, then the
@@ -143,9 +247,22 @@ pub fn stateful_checks(store: &Store, envelope: &gloas::SignedExecutionPayloadEn
     if block.slot != payload.slot_number {
         return Outcome::Reject(RejectReason::SlotMismatch);
     }
+    // [REJECT] The envelope's parent beacon block root is the block's parent
+    // root (#5821).
+    if message.parent_beacon_block_root != block.parent_root {
+        return Outcome::Reject(RejectReason::ParentBeaconBlockRootMismatch);
+    }
     // [REJECT] The envelope is from the builder committed to by the bid.
     if message.builder_index != bid.builder_index {
         return Outcome::Reject(RejectReason::BuilderIndexMismatch);
+    }
+    // [REJECT] The payload's previous randao is the bid's (#5821).
+    if payload.prev_randao != bid.prev_randao {
+        return Outcome::Reject(RejectReason::PrevRandao);
+    }
+    // [REJECT] The payload's gas limit is the bid's (#5821).
+    if payload.gas_limit != bid.gas_limit {
+        return Outcome::Reject(RejectReason::GasLimitMismatch);
     }
     // [REJECT] The payload's block hash matches the bid's block hash.
     if payload.block_hash != bid.block_hash {
@@ -156,12 +273,50 @@ pub fn stateful_checks(store: &Store, envelope: &gloas::SignedExecutionPayloadEn
         return Outcome::Reject(RejectReason::ExecutionRequestsRootMismatch);
     }
     // The request-count and withdrawal-count limits ran in `cheap_checks`.
-    // [REJECT] The envelope signature is valid. Read off the block's cached
-    // post-state, never rebuilt: a miss would stall the verdict gossipsub
-    // waits on.
+    // [REJECT] The transaction count is within what the parent payload's gas
+    // limit allows (#5802).
+    let max_gas_limit = match get_max_payload_gas_limit(store, message.beacon_block_root, block) {
+        Ok(gas_limit) => gas_limit,
+        Err(outcome) => return outcome,
+    };
+    if payload.transactions.len() as u64 > max_gas_limit / MIN_TRANSACTION_GAS {
+        return Outcome::Reject(RejectReason::TooManyTransactions);
+    }
+    // The rest reads the block's cached post-state, never rebuilt: a miss
+    // would stall the verdict gossipsub waits on.
     let Some(state) = store.cached_state(CacheKey::BlockState(message.beacon_block_root)) else {
         return Outcome::Queue(QueueReason::StateNotCached);
     };
+    let BeaconState::Gloas(inner) = &*state else {
+        // A gloas block's post-state is gloas.
+        return Outcome::Ignore(IgnoreReason::Internal);
+    };
+    // [REJECT] The payload builds on the execution head of the block's
+    // post-state (#5821).
+    if payload.parent_hash != inner.latest_block_hash {
+        return Outcome::Reject(RejectReason::ParentHashMismatch);
+    }
+    // [REJECT] The payload's timestamp is the block slot's (#5821).
+    if payload.timestamp != compute_timestamp_at_slot(&state, block.slot, &store.config()) {
+        return Outcome::Reject(RejectReason::PayloadTimestamp);
+    }
+    // The empty-transaction rule ran in `cheap_checks`.
+    // [REJECT] The withdrawals are the ones the post-state expects (#5821).
+    // Equal lists are exactly the ones with equal roots.
+    if payload.withdrawals != inner.payload_expected_withdrawals {
+        return Outcome::Reject(RejectReason::WithdrawalsMismatch);
+    }
+    // [REJECT] The block hash is the hash of the header the payload describes
+    // (#5770).
+    let computed = compute_execution_block_hash(
+        payload,
+        message.parent_beacon_block_root,
+        &message.execution_requests,
+    );
+    if payload.block_hash != computed {
+        return Outcome::Reject(RejectReason::BlockHashIncorrect);
+    }
+    // [REJECT] The envelope signature is valid.
     // An error (a builder the state has no entry for) is a signature that
     // cannot be valid.
     if !matches!(

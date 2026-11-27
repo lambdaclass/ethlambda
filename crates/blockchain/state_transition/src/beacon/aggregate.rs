@@ -23,10 +23,11 @@ use crate::beacon::preset;
 /// later aggregate, that aggregate can add no vote and is dropped before any
 /// pairing.
 ///
-/// A `candidate` longer than `seen` is not covered, whatever the overlap says:
-/// the extra bits are positions `seen` has no opinion on.
+/// A `candidate` of a different length is not covered, whatever the overlap
+/// says (consensus-specs #5766, v1.7.0-beta.5): a bitset of a different length
+/// cannot be a superset.
 pub fn is_non_strict_superset(seen: &[bool], candidate: &[bool]) -> bool {
-    if candidate.len() > seen.len() {
+    if candidate.len() != seen.len() {
         return false;
     }
     candidate
@@ -84,6 +85,12 @@ mod tests {
     fn a_longer_candidate_is_never_covered() {
         assert!(!is_non_strict_superset(&[true], &[true, true]));
         assert!(!is_non_strict_superset(&[true, true], &[true, true, false]));
+    }
+
+    /// Nor a shorter one (consensus-specs #5766).
+    #[test]
+    fn a_shorter_candidate_is_never_covered() {
+        assert!(!is_non_strict_superset(&[true, true, true], &[true, true]));
     }
 
     /// Pinned per preset rather than against the definition, which would

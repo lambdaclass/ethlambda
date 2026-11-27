@@ -134,13 +134,13 @@ async fn post_bid(
         );
         return bad_request(describe(&verdict));
     }
-    // The state a stateful check read can have moved on, and another bid can
-    // have taken the key meanwhile: recording re-runs the seen rules under the
-    // market's lock.
+    // The state a stateful check read can have moved on, and a higher bid for
+    // the slot and parent can have been recorded meanwhile: recording re-runs
+    // the best-value rule under the market's lock.
     let slot = bid.message.slot;
     let builder_index = bid.message.builder_index;
     if !market.record_bid(bid.clone()) {
-        return bad_request(describe(&Outcome::Ignore(IgnoreReason::AlreadySeen)));
+        return bad_request(describe(&Outcome::Ignore(IgnoreReason::NotHighestBid)));
     }
     let for_event = copy_if_listened(events.as_deref(), &bid);
     match p2p.publish_execution_payload_bid(bid) {

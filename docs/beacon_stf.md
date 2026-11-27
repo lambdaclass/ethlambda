@@ -501,9 +501,11 @@ A gloas block has no execution payload. Its body commits to a builder's bid
 a `SignedExecutionPayloadEnvelope`. The payload is applied by the *next*
 block: `process_parent_execution_payload` compares that block's bid against the
 parent's committed one to tell whether the parent was full or empty, and for a
-full parent `apply_parent_execution_payload` runs the execution-layer requests
-carried in `parent_execution_requests` and settles the builder's payment. An
-empty parent must carry no requests.
+full parent `apply_parent_execution_payload` settles the builder's payment and
+then runs the execution-layer requests carried in `parent_execution_requests`,
+in that order since consensus-specs #5695, so that a builder exit request is
+refused while its payment is still pending. An empty parent must carry no
+requests.
 
 `verify_execution_payload_envelope` is the checking half that used to sit in
 `process_execution_payload`, and it mutates nothing: fork choice calls it on a
@@ -622,11 +624,15 @@ debug assertion bounds it).
 
 `beacon::fast_confirmation` implements the Fast Confirmation Rule (FCR) of
 consensus-specs' `phase0`, `bellatrix` and `gloas` `fast-confirmation.md`, at
-**consensus-specs `master`, commit `f993cf2`** rather than the pinned
-`v1.7.0-beta.2`. The release ships no FCR fixtures, and `master` has fixes it
-lacks (the gloas empty-slot support discount, precise committee weight, the
-restart-resilient confirmed root, the `support_discount <= maximum_support`
-assertion). A later bump should diff those three files against that commit.
+the pinned release. Its `fast_confirmation` fixtures (minimal only, altair
+through gloas) are collected by `tests/beacon_spec/fast_confirmation.rs`, which
+would replay them with the fork-choice runner and, at each `checks` step
+naming a `confirmed_root`, run `on_fast_confirmation` and compare every FCR
+variable and `safe_execution_block_hash`. Every v1.7.0-beta.5 vector is
+generated with BLS ignored (`bls_setting: 2`), with stub signatures that are
+not curve points, and signature checks are never switched off, so each is
+reported as ignored instead. Until a release ships signed vectors, the rule is
+checked by its unit tests only.
 
 - **Shape.** One Rust function per specification function, named as the
   specification names it. `FastConfirmationStore` is the specification's own
@@ -834,23 +840,26 @@ All eight forks, phase0 through gloas, have containers, fork upgrades, state
 transitions, and epoch processing. At the pinned fixture release every case
 that is not ignored passes on both presets:
 
-| Preset | Fixture cases passed | Ignored | Lib tests |
-|--------|----------------------|---------|-----------|
-| mainnet | 7175 | 1285 | 433 passed, 1 ignored |
-| minimal | 49261 | 5403 | 434 passed, 1 ignored |
+| Preset | Fixture cases passed | Ignored |
+|--------|----------------------|---------|
+| mainnet | 7556 | 986 |
+| minimal | 49650 | 6410 |
 
-The lib counts are with `beacon-spec-tests` on, and include lean's own unit
-tests, since the two chains share one lib target. The one ignored lib test is
-a timing measurement, not a fixture.
+These are the counts at `v1.7.0-beta.5`, each the spec binary's own run
+(`make test-beacon-mainnet` also runs the lib tests, which are not counted
+here).
 
 Minimal runs more cases because the release ships more fixtures for it, and it
-runs two runners mainnet does not: `genesis`'s `initialization` and `validity`.
-The release ships no mainnet `genesis` fixtures, so that whole runner is added
-to minimal runs only (`tests/beacon_spec/genesis.rs`).
+runs two runners mainnet does not. `genesis`'s `initialization` and `validity`:
+the release ships no mainnet `genesis` fixtures, so that whole runner is added
+to minimal runs only (`tests/beacon_spec/genesis.rs`). And `fast_confirmation`,
+1294 cases from altair through gloas, which the release likewise ships for
+minimal alone, all of them ignored (see below).
 
 The gossip validation vectors this crate's `gossip.rs` runner covers come from
-the same tree as every other suite. The node validates four topics under fulu's
-rules; every other case is ignored by name rather than left unmatched.
+the same tree as every other suite. The node validates the topics in
+`HANDLERS`, each under the forks `validated_forks` names; every other case is
+ignored by name rather than left unmatched.
 
 Nothing is ignored for being unimplemented in the state transition or fork
 choice: `HIGHEST_IMPLEMENTED_FORK` is gloas, and every gloas case that is not
@@ -865,6 +874,10 @@ ignored runs. The ignored cases are deliberate exclusions:
   and gloas), and the vectors in `SKIPPED`, which assume a bad-block cache.
 - The `heze` fixture tree, one ignored entry. See "Accounting for every fork
   directory" below.
+- Cases generated with BLS ignored (`bls_setting: 2`), whose stub signatures
+  are not curve points: every `fast_confirmation` case at v1.7.0-beta.5.
+  Signature checks are never switched off to run them, since a switch like
+  that could easily skip checks in a production build.
 
 ## Accounting for every fork directory
 

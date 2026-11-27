@@ -9,7 +9,7 @@
 //! chain actor.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     num::NonZeroUsize,
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -25,7 +25,8 @@ pub type SharedBuilderMarket = Arc<BuilderMarket>;
 
 /// Bids pooled per `(slot, parent hash, parent root)`, top values kept.
 pub const MAX_BIDS_PER_PARENT: usize = 16;
-/// A full slot refuses new keys: `record_bid` answers `false`.
+/// A full slot refuses new `(parent, builder)` keys: `record_bid` answers
+/// `false`.
 pub const MAX_SEEN_BID_KEYS_PER_SLOT: usize = 4096;
 /// Over the cap, the lowest `proposal_slot` is dropped first.
 pub const MAX_PREFERENCES: usize = 1024;
@@ -56,9 +57,11 @@ type ParentKey = (ExecutionBlockHash, Root);
 
 #[derive(Debug, Default)]
 struct SlotBids {
-    /// The spec's `seen.execution_payload_bids`: one bid per builder per
-    /// `(slot, parent_hash, parent_root)`.
-    seen: BTreeSet<(ParentKey, u64)>,
+    /// The spec's `seen.execution_payload_bid_counts`: how many bids each
+    /// builder has had accepted per `(slot, parent_hash, parent_root)`, which
+    /// the gossip rule holds to the builder's bid limit (consensus-specs
+    /// #5805; until v1.7.0-beta.5 a builder had one bid per key).
+    counts: BTreeMap<(ParentKey, u64), u64>,
     parents: BTreeMap<ParentKey, ParentBids>,
 }
 
@@ -73,15 +76,21 @@ impl BidPool {
             return Ok(());
         };
         let parent = (bid.parent_block_hash, bid.parent_block_root);
-        if slot.seen.contains(&(parent, bid.builder_index)) {
-            return Err(IgnoreReason::AlreadySeen);
-        }
         if let Some(best) = slot.parents.get(&parent).and_then(|p| p.best_value)
             && bid.value <= best
         {
             return Err(IgnoreReason::NotHighestBid);
         }
         Ok(())
+    }
+
+    fn count(&self, bid: &gloas::ExecutionPayloadBid) -> u64 {
+        let parent = (bid.parent_block_hash, bid.parent_block_root);
+        self.slots
+            .get(&bid.slot)
+            .and_then(|slot| slot.counts.get(&(parent, bid.builder_index)))
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -115,18 +124,34 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl BuilderMarket {
-    // Bids: seen.execution_payload_bids + seen.best_execution_payload_bid + pool.
+    // Bids: seen.execution_payload_bid_counts + seen.best_execution_payload_bid
+    // + pool.
 
-    /// The spec's two seen rules, in order: `(slot, parent_hash, parent_root,
-    /// builder)` recorded -> `AlreadySeen`; value <= best for `(slot,
-    /// parent_hash, parent_root)` -> `NotHighestBid`.
+    /// The spec's seen rule that reads no state: value <= best for `(slot,
+    /// parent_hash, parent_root)` -> `NotHighestBid`. The other one, the
+    /// builder's bid limit, needs the builder's balance; see
+    /// [`Self::bid_count`].
     pub fn check_bid_seen(&self, bid: &gloas::ExecutionPayloadBid) -> Result<(), IgnoreReason> {
         lock(&self.bids).check(bid)
     }
 
-    /// Re-runs [`Self::check_bid_seen`] under the lock. If it passes, records
-    /// both seen keys and pools the bid. `false` = not recorded (race, or the
-    /// per-slot key cap). Prunes slots below `bid.slot - 1`.
+    /// The spec's `seen.execution_payload_bid_counts[(slot, parent_hash,
+    /// parent_root, builder)]`: how many bids this builder has had recorded
+    /// for the bid's slot and parent.
+    pub fn bid_count(&self, bid: &gloas::ExecutionPayloadBid) -> u64 {
+        lock(&self.bids).count(bid)
+    }
+
+    /// Re-runs [`Self::check_bid_seen`] under the lock. If it passes, counts
+    /// the bid against its builder, raises the slot and parent's best value
+    /// and pools the bid. `false` = not recorded (race, or the per-slot key
+    /// cap). Prunes slots below `bid.slot - 1`.
+    ///
+    /// The bid limit is not re-checked here, since it needs a state: two of a
+    /// builder's bids validated at once can both pass the gossip rule's count,
+    /// and the later of the two is still recorded if it beats the earlier on
+    /// value. A builder gains at most one bid per race, and each must outbid
+    /// the last.
     pub fn record_bid(&self, signed: gloas::SignedExecutionPayloadBid) -> bool {
         let mut pool = lock(&self.bids);
         if pool.check(&signed.message).is_err() {
@@ -134,14 +159,15 @@ impl BuilderMarket {
         }
         let bid_slot = signed.message.slot;
         let slot = pool.slots.entry(bid_slot).or_default();
-        if slot.seen.len() >= MAX_SEEN_BID_KEYS_PER_SLOT {
-            return false;
-        }
         let parent = (
             signed.message.parent_block_hash,
             signed.message.parent_block_root,
         );
-        slot.seen.insert((parent, signed.message.builder_index));
+        let key = (parent, signed.message.builder_index);
+        if !slot.counts.contains_key(&key) && slot.counts.len() >= MAX_SEEN_BID_KEYS_PER_SLOT {
+            return false;
+        }
+        *slot.counts.entry(key).or_default() += 1;
         let entry = slot.parents.entry(parent).or_default();
         entry.best_value = Some(signed.message.value);
         entry.bids.push(signed);
@@ -327,14 +353,22 @@ pub mod test_support {
         }
     }
 
-    /// `prefs` signed by its own `validator_index` under `state`'s preferences
-    /// domain at the proposal slot's epoch (the spec's).
+    /// `prefs` signed by its own `validator_index` under the preferences
+    /// domain of the proposal slot's epoch, as the spec's
+    /// `get_signed_proposer_preferences` signs (consensus-specs #5665): the
+    /// fork version `config` schedules for that epoch, and `state`'s genesis
+    /// validators root.
     pub fn sign_preferences(
         state: &BeaconState,
+        config: &crate::beacon::config::Config,
         prefs: gloas::ProposerPreferences,
     ) -> gloas::SignedProposerPreferences {
         let epoch = compute_epoch_at_slot(prefs.proposal_slot);
-        let domain = get_domain(state, constants::DOMAIN_PROPOSER_PREFERENCES, Some(epoch));
+        let domain = crate::beacon::gossip::proposer_preferences::proposer_preferences_domain(
+            config,
+            state.genesis_validators_root(),
+            epoch,
+        );
         let root = compute_signing_root(prefs.hash_tree_root(), domain);
         let signature = sign_for(prefs.validator_index as usize, root);
         gloas::SignedProposerPreferences {
@@ -429,19 +463,24 @@ mod tests {
         }
     }
 
+    /// consensus-specs #5805: a builder may bid again for a parent, as long
+    /// as each bid beats the best; the market counts them for the gossip
+    /// rule's bid limit.
     #[test]
-    fn a_builder_bids_once_per_parent() {
+    fn a_builders_bids_per_parent_are_counted() {
         let market = BuilderMarket::default();
+        assert_eq!(market.bid_count(&bid(10, 1, 5).message), 0);
         assert!(market.record_bid(bid(10, 1, 5)));
-        assert_eq!(
-            market.check_bid_seen(&bid(10, 1, 9).message),
-            Err(IgnoreReason::AlreadySeen)
-        );
-        assert!(!market.record_bid(bid(10, 1, 9)));
-        // Another parent hash is another key.
-        let mut other = bid(10, 1, 9);
+        assert_eq!(market.check_bid_seen(&bid(10, 1, 9).message), Ok(()));
+        assert!(market.record_bid(bid(10, 1, 9)));
+        assert_eq!(market.bid_count(&bid(10, 1, 10).message), 2);
+        // Another builder, and another parent hash, are other keys.
+        assert_eq!(market.bid_count(&bid(10, 2, 10).message), 0);
+        let mut other = bid(10, 1, 11);
         other.message.parent_block_hash = hash(9);
-        assert!(market.record_bid(other));
+        assert_eq!(market.bid_count(&other.message), 0);
+        assert!(market.record_bid(other.clone()));
+        assert_eq!(market.bid_count(&other.message), 1);
     }
 
     #[test]

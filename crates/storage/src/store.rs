@@ -224,7 +224,11 @@ const KEY_STATES_PRUNED_BELOW: &[u8] = b"states_pruned_below";
 /// [`Store::prune_finalized_states`]). A directory written by the previous
 /// version holds rows no lookup can find, and there is no migration, by the
 /// same policy every previous change followed.
-pub const DB_VERSION: u64 = 7;
+///
+/// 8 widened `Config` with consensus-specs v1.7.0-beta.5's
+/// `MIN_TRANSACTION_GAS`, so a directory written by version 7 decodes into the
+/// wrong fields, the same reason as 3, 4 and 6.
+pub const DB_VERSION: u64 = 8;
 
 /// The consensus protocol a data directory holds.
 ///
