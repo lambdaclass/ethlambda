@@ -61,10 +61,14 @@
 //!
 //! With `--shut-down-when-slashed`, the first refresh that finds a slashed key
 //! stops the client before it sends or fetches anything else for the epoch,
-//! and `ethlambda validator` exits with [`EXIT_CODE`]. It is off by default,
-//! as Teku's `--shut-down-when-validator-slashed-enabled` is: without it the
-//! other keys go on, and the error line and the gauge are what tell the
-//! operator.
+//! and `ethlambda validator` exits with [`EXIT_CODE`]. An epoch's refresh
+//! usually runs after the slot's block, beside the slot's other duties, and
+//! the stop drops those where they stand rather than waiting for them: no key
+//! attests, aggregates or serves a committee once the slashing is seen.
+//!
+//! It is off by default, as Teku's `--shut-down-when-validator-slashed-enabled`
+//! is: without it the other keys go on, and the error line and the gauge are
+//! what tell the operator.
 //!
 //! Every start finds the same key again, so a supervisor that restarts the
 //! client on failure would restart it into the same stop for as long as the

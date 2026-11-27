@@ -888,9 +888,13 @@ where
             // slots it will not serve, and the refresh could use up the stop's
             // wait for nothing (see `run_until_stopped`), while the slot's own
             // duties beside it run to their end.
+            //
+            // Settled as soon as it ends, not once the slot's duties have: a
+            // refresh that stops the client stops them too (see
+            // `beside_slot_duties`).
             let refresh = async {
                 if !defer_refresh {
-                    return None;
+                    return Ok(None);
                 }
                 let budget = clock.remaining_in(slot, SystemTime::now());
                 let refreshed = bounded_refresh(
@@ -903,11 +907,21 @@ where
                     &context,
                     budget,
                 );
-                tokio::select! {
+                let outcome = tokio::select! {
                     biased;
-                    () = shutdown.cancelled() => None,
-                    outcome = refreshed => Some(outcome),
-                }
+                    () = shutdown.cancelled() => return Ok(None),
+                    outcome = refreshed => outcome,
+                };
+                let settled = settle_refresh(
+                    epoch,
+                    outcome,
+                    &mut last_epoch,
+                    &mut resolved,
+                    &mut node_syncing,
+                );
+                // As for a refresh run ahead of the block.
+                resolved = mark_slashed(&resolved, context.slashed());
+                settled
             };
             let slot_work = async {
                 // The rest of the way to the first of the slot's remaining
@@ -934,33 +948,18 @@ where
                 )
                 .await;
             };
-            let (deferred, ()) = tokio::join!(refresh, slot_work);
-            if let Some(outcome) = deferred {
-                let settled = settle_refresh(
+            let deferred = beside_slot_duties(refresh, slot_work).await?;
+            if let Some(owed) = deferred {
+                report_refreshed(&health, &duties, epoch, resolved.len());
+                send_owed(
+                    owed,
                     epoch,
-                    outcome,
-                    &mut last_epoch,
-                    &mut resolved,
-                    &mut node_syncing,
+                    &beacon_node,
+                    &duties,
+                    &store,
+                    &context,
+                    &registration,
                 );
-                // As for a refresh run ahead of the block.
-                resolved = mark_slashed(&resolved, context.slashed());
-                match settled {
-                    Ok(Some(owed)) => {
-                        report_refreshed(&health, &duties, epoch, resolved.len());
-                        send_owed(
-                            owed,
-                            epoch,
-                            &beacon_node,
-                            &duties,
-                            &store,
-                            &context,
-                            &registration,
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(err) => return Err(err),
-                }
             }
 
             // Off the slot loop, like the epoch's full send: a keymanager change
@@ -1716,6 +1715,36 @@ async fn bounded_refresh<B: BeaconNodeApi>(
     tokio::time::timeout(budget, refreshed)
         .await
         .unwrap_or(Err(Error::DutyRefreshDeadline { epoch, slot }))
+}
+
+/// Run the epoch's refresh, deferred past the slot's block, beside the slot's
+/// duties (`slot_work`), and hand back what it settled to. `refresh` has been
+/// through [`settle_refresh`] already, so an error from it is one that stops
+/// the client.
+///
+/// Such an error stops the slot's duties at once, where they stand, rather
+/// than once they end. With `--shut-down-when-slashed` a refresh that finds a
+/// key slashed returns one, and waiting would leave every other key
+/// attesting, aggregating and serving its committees for the rest of the
+/// slot after the stop was decided; the refresh asks for the slashed flags
+/// before anything else, so it usually ends ahead of the slot's attestations.
+/// A doppelganger sighting stops the duty loop the same way (see
+/// `doppelganger_watch` in [`run`]), and dropping the duties mid-flight is
+/// safe for the same reason: slashing protection records before signing (see
+/// [`attest_and_aggregate`]).
+///
+/// Anything else, a refresh that failed and is retried included, waits for
+/// both, so the slot's duties run to their end.
+async fn beside_slot_duties<T>(
+    refresh: impl Future<Output = Result<T>>,
+    slot_work: impl Future<Output = ()>,
+) -> Result<T> {
+    let slot_work = async {
+        slot_work.await;
+        Ok::<(), Error>(())
+    };
+    let (settled, ()) = tokio::try_join!(refresh, slot_work)?;
+    Ok(settled)
 }
 
 /// Record a refresh's outcome in the duty loop's state, and hand back what it
@@ -3149,6 +3178,83 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert!(owed.moved, "the first schedule is a move");
         assert_eq!(owed.registrable.len(), 2);
+    }
+
+    /// `outcome` settled as the duty loop settles a refresh deferred past the
+    /// slot's block.
+    async fn settled(outcome: Result<Refreshed>) -> Result<Option<Refreshed>> {
+        let (mut last_epoch, mut resolved, mut node_syncing) = (Some(2), Arc::default(), false);
+        settle_refresh(
+            3,
+            outcome,
+            &mut last_epoch,
+            &mut resolved,
+            &mut node_syncing,
+        )
+    }
+
+    /// A deferred refresh that stops the client, as one that finds a key
+    /// slashed does under `--shut-down-when-slashed`, stops the slot's duties
+    /// beside it there and then: waiting for them would leave every other key
+    /// attesting and aggregating for the rest of the slot after the stop was
+    /// decided. The duties here never end, so only that stop returns.
+    #[tokio::test]
+    async fn a_refresh_that_stops_the_client_stops_the_slots_duties_with_it() {
+        let refresh = settled(Err(Error::ValidatorSlashed {
+            validators: vec![22],
+        }));
+        let stopped = beside_slot_duties(refresh, std::future::pending());
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), stopped)
+            .await
+            .expect("the slot's duties are not waited for");
+        assert!(
+            matches!(&stopped, Err(Error::ValidatorSlashed { validators }) if *validators == [22]),
+            "got {stopped:?}"
+        );
+    }
+
+    /// Any other deferred refresh leaves the slot's duties beside it to run
+    /// to their end: one that got through, one that failed and is retried
+    /// next slot, and one a shutdown cut off, which settles nothing.
+    #[tokio::test]
+    async fn a_refresh_that_does_not_stop_the_client_waits_for_the_slots_duties() {
+        /// Whether `refresh` returned only once the slot's duties ended, and
+        /// what it settled to.
+        async fn beside(
+            refresh: impl Future<Output = Result<Option<Refreshed>>>,
+        ) -> (Result<Option<Refreshed>>, bool) {
+            let served = std::sync::atomic::AtomicBool::new(false);
+            let slot_work = async {
+                // Not done at its first poll, unlike every refresh here.
+                tokio::task::yield_now().await;
+                served.store(true, std::sync::atomic::Ordering::Relaxed);
+            };
+            let outcome = beside_slot_duties(refresh, slot_work).await;
+            (outcome, served.load(std::sync::atomic::Ordering::Relaxed))
+        }
+
+        let node = Arc::new(node());
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+        let outcome =
+            refresh_epoch(&node, &mut duties, &keys, 3, &settings(None), &context()).await;
+        let (got_through, served) = beside(settled(outcome)).await;
+        assert!(matches!(got_through, Ok(Some(_))), "got {got_through:?}");
+        assert!(served, "the duties ran to their end");
+
+        let retried = [
+            Error::BeaconNodeSyncing,
+            Error::DutyRefreshDeadline { epoch: 3, slot: 96 },
+        ];
+        for err in retried {
+            let (failed, served) = beside(settled(Err(err))).await;
+            assert!(matches!(failed, Ok(None)), "got {failed:?}");
+            assert!(served, "the duties ran to their end");
+        }
+
+        let (cut_off, served) = beside(async { Ok(None) }).await;
+        assert!(matches!(cut_off, Ok(None)), "got {cut_off:?}");
+        assert!(served, "the duties ran to their end");
     }
 
     /// A refresh abandoned after it moved the attester schedule still owes

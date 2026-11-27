@@ -894,7 +894,10 @@ node's earlier answer was wrong.
 
 With `--shut-down-when-slashed` the first refresh that finds a slashed key
 stops the client instead, before it sends anything else for the epoch, with an
-error saying not to restart it until the cause is found. The process exits
+error saying not to restart it until the cause is found. An epoch's refresh
+usually runs after the slot's block, beside the slot's other duties, and the
+stop drops those where they stand: no key attests, aggregates or serves a
+committee once the slashing is seen. The process exits
 with code **3**, distinct from the `1` of any other failure, clap's `2` for a
 bad command line and the `101` of a panic. Every start finds the same key
 again, so tell the supervisor not to restart on it: systemd's
