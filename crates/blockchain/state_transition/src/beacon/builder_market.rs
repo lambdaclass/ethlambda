@@ -275,7 +275,7 @@ impl BuilderMarket {
                 proposal_slot.is_none_or(|wanted| wanted == *slot)
                     && dependent_root.is_none_or(|wanted| wanted == *root)
             })
-            .map(|(_, signed)| signed.clone())
+            .map(|(_, pooled)| pooled.signed.clone())
             .collect()
     }
 
