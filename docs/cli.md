@@ -876,7 +876,10 @@ A key reported slashed:
   that finds it, and counted in `ethlambda_validator_validators_slashed` while
   it stays loaded;
 - gets no more proposals (the chain refuses a block from a slashed proposer),
-  attestations or attestation aggregations (its attestations earn nothing);
+  attestations or attestation aggregations (its attestations earn nothing).
+  When the refresh that finds it runs beside the slot's duties, as an epoch's
+  usually does after its block, that slot still serves the ones it read before
+  the answer came;
 - keeps its sync committee duties, contributions as a selected aggregator
   included, and its payload timeliness committee duties, which the chain
   still counts: a slashed sync committee member is rewarded for taking

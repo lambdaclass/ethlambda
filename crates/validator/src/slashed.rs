@@ -40,7 +40,11 @@
 //! - It gets no more proposals, attestations or attestation aggregations,
 //!   the ones the chain refuses or does not reward.
 //!   [`crate::duties::DutiesService`] still fetches those duties, and hands
-//!   none out (see [`crate::duties::DutiesService::set_slashed`]).
+//!   none out (see [`crate::duties::DutiesService::set_slashed`]). When the
+//!   refresh that finds it runs beside the slot's duties, as an epoch's
+//!   usually does after its block, that slot still serves the ones it read
+//!   before the answer came: one more vote from a key the chain cannot slash
+//!   again costs nothing.
 //! - It keeps its sync committee and payload timeliness committee duties,
 //!   since the chain still counts both. `process_sync_aggregate` rewards every
 //!   participating member with no slashed check and penalises one that
