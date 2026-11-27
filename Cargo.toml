@@ -119,15 +119,15 @@ secp256k1 = { version = "0.30.0", default-features = false, features = ["global-
 # `init_network` and the binary's `server_shutdown` against
 # `crates/execution/ethrex/src/lib.rs`, which repeats them, then running
 # `make test-ethrex`.
-ethrex = { git = "https://github.com/lambdaclass/ethrex", tag = "v31.0.0", default-features = false }
-ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex", tag = "v31.0.0" }
-ethrex-common = { git = "https://github.com/lambdaclass/ethrex", tag = "v31.0.0" }
-ethrex-config = { git = "https://github.com/lambdaclass/ethrex", tag = "v31.0.0" }
-ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex", tag = "v31.0.0" }
-ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", tag = "v31.0.0" }
-ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", tag = "v31.0.0" }
-ethrex-rpc = { git = "https://github.com/lambdaclass/ethrex", tag = "v31.0.0" }
-ethrex-storage = { git = "https://github.com/lambdaclass/ethrex", tag = "v31.0.0" }
+ethrex = { git = "https://github.com/lambdaclass/ethrex", tag = "v32.0.0", default-features = false }
+ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex", tag = "v32.0.0" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex", tag = "v32.0.0" }
+ethrex-config = { git = "https://github.com/lambdaclass/ethrex", tag = "v32.0.0" }
+ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex", tag = "v32.0.0" }
+ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", tag = "v32.0.0" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", tag = "v32.0.0" }
+ethrex-rpc = { git = "https://github.com/lambdaclass/ethrex", tag = "v32.0.0" }
+ethrex-storage = { git = "https://github.com/lambdaclass/ethrex", tag = "v32.0.0" }
 
 # Merkleizing a beacon state is almost entirely SHA-256 compressions, so which
 # implementation `sha2` picks matters. What `asm` actually buys is aarch64: on
