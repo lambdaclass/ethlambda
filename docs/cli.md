@@ -123,6 +123,7 @@ from a normal build.
 | `--custody-group-count` | `CUSTODY_REQUIREMENT` (4) | The fewest custody groups this node custodies, advertised as the ENR's `cgc` and `MetaData`'s `custody_group_count`. Validator custody can raise it (see below) |
 | `--execution-endpoint` | none | Base URL of the execution client's Engine API endpoint, e.g. `http://127.0.0.1:8551`. Must be given together with `--execution-jwt-secret` |
 | `--execution-jwt-secret` | none | File holding the 32-byte hex JWT secret shared with the execution client |
+| `--ethrex.*` | see [Embedded ethrex](./ethrex.md#flags) | Only in a build with the `include-ethrex` feature: configure the ethrex that build runs in-process when `--execution-endpoint` is not given (data directory, network, sync mode, devp2p ports and bootnodes, the optional execution JSON-RPC and metrics servers), and are refused together with it |
 | `--safe-slots-to-import-optimistically` | the specification's own value | How far behind the wall clock a block must be before it may be imported optimistically on age alone |
 | `--always-prepare-payload` | off | Publish the `payload_attributes` event for every slot, not only for proposers a validator client registered through `prepare_beacon_proposer`. For an external block builder reading this node's event stream (ethereum-package's buildoor). With `--execution-endpoint` it also has the execution client start a payload build for every slot, a third of a slot ahead, whether or not anything is subscribed to the event stream. For a proposer no validator client registered, that build pays the fee recipient of the proposer's signed preferences on gloas, else `--fallback-fee-recipient`, else the zero address. Lighthouse's flag of the same name |
 | `--fallback-fee-recipient` | none | Execution address (20 bytes of hex, `0x` optional) a locally built payload pays when no validator client named a fee recipient for the proposer through `prepare_beacon_proposer` or a builder registration (and, on gloas, no signed proposer preferences name one). Without it such a payload pays the zero address and its fees are lost. The zero address itself is accepted but reported at error at startup, since a proposal that falls back to it logs only at debug. It does not register the proposer: `payload_attributes` events still need `prepare_beacon_proposer` or `--always-prepare-payload`. Lighthouse's beacon-node `--suggested-fee-recipient` |
@@ -176,9 +177,11 @@ it. The ENR's `cgc` keeps its startup value until a restart, the same
 limitation as the fork digest's `eth2` entry (ethrex's `DiscoveryServer`
 cannot replace the record it serves).
 
-With neither execution flag, the follower contacts no execution client and
-imports blocks without validating their payloads, which is what it did before
-those flags existed. It then answers `attestation_data`,
+With neither execution flag, what happens depends on the build. A build with
+the `include-ethrex` feature starts its embedded ethrex and validates payloads
+through it (see [Embedded ethrex](./ethrex.md)). Any other build contacts no
+execution client and imports blocks without validating their payloads, which is
+what it did before those flags existed. It then answers `attestation_data`,
 `aggregate_attestation` and block production with `503`, so a validator
 client cannot use it. Supplying one without the other is refused at startup: an
 Engine API endpoint always requires authentication. See
