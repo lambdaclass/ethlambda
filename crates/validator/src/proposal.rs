@@ -524,12 +524,14 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         // reaches this proposal. Alongside the RANDAO signature, a round trip
         // when a remote signer holds the key, so a slow file delays the block
         // request only by what it takes beyond the signature, and by at most
-        // `READ_TIMEOUT` (nothing once a stalled read has run that long).
-        let (randao_reveal, graffiti) = tokio::join!(
-            self.context.sign_randao(store, &pubkey, epoch),
-            self.settings.next_graffiti(&pubkey)
-        );
-        let randao_reveal = randao_reveal?;
+        // `READ_TIMEOUT` (nothing once a stalled read has run that long). A
+        // failed signature ends the proposal at once, without waiting for the
+        // file; the file never fails it, since `next_graffiti` goes on to the
+        // next source when the read does.
+        let (randao_reveal, graffiti) =
+            tokio::try_join!(self.context.sign_randao(store, &pubkey, epoch), async {
+                Ok::<_, Error>(self.settings.next_graffiti(&pubkey).await)
+            })?;
 
         // Read once, before the block is asked for, so the check below
         // compares against the address in force when the request went out.
@@ -1354,6 +1356,31 @@ mod tests {
         settings.clear_graffiti(&pubkey);
         let graffiti = proposed_graffiti(&settings, &store, &pubkey, slot() + 1).await;
         assert_eq!(graffiti, Some(Bytes32::repeat_byte(0xab)));
+    }
+
+    /// A RANDAO signature that fails ends the proposal at once: it does not
+    /// wait for the graffiti file, whose read here has stalled and would only
+    /// be given up on after `PATIENT_READ_TIMEOUT`.
+    #[tokio::test]
+    async fn a_failed_randao_signature_does_not_wait_for_the_graffiti_file() {
+        use crate::graffiti_file::PATIENT_READ_TIMEOUT;
+
+        let store = RwLock::new(ValidatorStore::new());
+        let (_dir, _path, file) = graffiti_file("default: wall\n");
+        // Held, so the read stays running and never answers.
+        let _answering = file.start_stalled_read();
+        let settings =
+            ProposerSettings::new(Bytes32::repeat_byte(0xab), None).with_graffiti_file(Some(file));
+        let (node, service) = service_at(&Arc::new(settings), slot());
+
+        let unknown = duty(&BlsPubkey([9; 48]), 7, slot());
+        let proposal = service.propose(slot(), &unknown, &store);
+        let err = tokio::time::timeout(PATIENT_READ_TIMEOUT / 2, proposal)
+            .await
+            .expect("the failed signature did not wait for the graffiti file")
+            .expect_err("no key to sign the RANDAO reveal with");
+        assert!(matches!(err, Error::UnknownValidator(_)), "got {err:?}");
+        assert!(node.block_requests().is_empty());
     }
 
     /// With no graffiti anywhere the request carries none, so the beacon node
