@@ -1,6 +1,8 @@
 pub(crate) mod behaviour;
 pub(crate) mod codec;
 pub(crate) mod encoding;
+#[cfg(test)]
+mod encoding_properties;
 mod envelope_client;
 mod envelopes;
 pub mod handlers;
