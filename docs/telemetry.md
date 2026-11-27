@@ -82,7 +82,7 @@ as `gossip`, starting at the hand-off, with no `decode_*` rows.
 | Stage | Meaning |
 |---|---|
 | `import_start`, `import_end` | The whole import, the log line's end to end: from the block coming off the wire (gossip) or reaching the chain actor (req/resp) to the last section written. `import_end` carries the outcome in `verdict`: `Imported` or `Failed` |
-| `decode_*`, `queue_*` | Gossip only, decompressing and decoding the block; then the chain actor's mailbox. `decode_end` and `queue_start` are one instant, and so are `import_start` and the first of `decode_start` and `queue_start` |
+| `decode_*`, `queue_*` | Decompressing and decoding the block, gossip only; then the chain actor's mailbox, for every source. `decode_end` and `queue_start` are one instant, and so are `import_start` and the first of `decode_start` and `queue_start` |
 | `da_check_start`, `da_check_end` | The data-availability check. Ending it is no claim that the block needed data: one with no blobs, or a gloas block (whose data gates the envelope instead), is checked too. A block that needed columns has `column_*` rows |
 | `el_start`, `el_end` | Beacon, the execution client's half: `engine_newPayload` sent and answered; only when an execution client answered. `el_end` carries the verdict in `verdict` |
 | `cl_start`, `cl_end` | Beacon, the consensus half: the block's state transition, computed ahead of `fork_choice::on_block` (below) |
