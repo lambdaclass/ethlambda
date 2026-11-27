@@ -210,6 +210,25 @@ impl BuilderMarket {
             .cloned()
     }
 
+    /// Every held preference whose proposal slot and dependent root match the
+    /// filters given (`None` matches anything), in `(proposal_slot,
+    /// dependent_root)` order: what `GET /eth/v1/beacon/proposer_preferences`
+    /// serves a builder that subscribed after they were broadcast.
+    pub fn preferences_matching(
+        &self,
+        proposal_slot: Option<Slot>,
+        dependent_root: Option<Root>,
+    ) -> Vec<gloas::SignedProposerPreferences> {
+        lock(&self.preferences)
+            .iter()
+            .filter(|((slot, root), _)| {
+                proposal_slot.is_none_or(|wanted| wanted == *slot)
+                    && dependent_root.is_none_or(|wanted| wanted == *root)
+            })
+            .map(|(_, signed)| signed.clone())
+            .collect()
+    }
+
     /// The first valid preferences per key win. `false` if one is held. Prunes
     /// `proposal_slot < current_slot`.
     pub fn record_preferences(
@@ -541,6 +560,32 @@ mod tests {
         // Another dependent root is another key.
         assert!(market.record_preferences(prefs(40, 2, 3), 38));
         assert_eq!(market.preferences(41, Root::repeat_byte(1)), None);
+    }
+
+    #[test]
+    fn preferences_are_listed_by_slot_and_dependent_root() {
+        let market = BuilderMarket::default();
+        let (a, b, c) = (prefs(40, 1, 3), prefs(40, 2, 4), prefs(41, 1, 5));
+        for signed in [&c, &b, &a] {
+            assert!(market.record_preferences(signed.clone(), 38));
+        }
+        assert_eq!(
+            market.preferences_matching(None, None),
+            vec![a.clone(), b.clone(), c.clone()]
+        );
+        assert_eq!(
+            market.preferences_matching(Some(40), None),
+            vec![a.clone(), b.clone()]
+        );
+        assert_eq!(
+            market.preferences_matching(None, Some(Root::repeat_byte(1))),
+            vec![a.clone(), c]
+        );
+        assert_eq!(
+            market.preferences_matching(Some(40), Some(Root::repeat_byte(2))),
+            vec![b]
+        );
+        assert!(market.preferences_matching(Some(42), None).is_empty());
     }
 
     #[test]

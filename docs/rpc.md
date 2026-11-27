@@ -329,6 +329,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v1/beacon/execution_payload_envelopes` | *(status only)* | Gossip a signed envelope and its data columns (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/execution_payload_bids` | *(status only)* | Validate, pool and gossip a builder's `SignedExecutionPayloadBid` (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/validator/proposer_preferences` | *(status only)* | Validate, cache and gossip `SignedProposerPreferences` (gloas; JSON or SSZ body) |
+| `GET` | `/eth/v1/beacon/proposer_preferences` | JSON / SSZ | The signed preferences the node holds for proposal slots not yet past (from gossip and the POST above), narrowed by `?slot` and `?dependent_root`, versioned `gloas` |
 | `POST` | `/eth/v1/beacon/states/{state_id}/builders` | JSON | The gloas builder registry, filtered by id and status |
 | `GET` | `/eth/v1/beacon/states/{state_id}/ptc` | JSON / SSZ | The payload timeliness committee of `?slot` (default: the state's slot), from the state's `ptc_window`; a slot before gloas or outside the window is a `400` |
 | `GET` | `/eth/v1/beacon/states/{state_id}/builder_pending_payments` | JSON / SSZ | The gloas state's `builder_pending_payments`, versioned |

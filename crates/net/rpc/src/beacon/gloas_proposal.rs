@@ -1063,7 +1063,7 @@ async fn get_envelope(
     with_consensus_version(response, ForkName::Gloas)
 }
 
-fn parse_root(text: &str) -> Option<H256> {
+pub(crate) fn parse_root(text: &str) -> Option<H256> {
     let bytes: [u8; 32] = hex::decode(text.strip_prefix("0x")?)
         .ok()?
         .try_into()

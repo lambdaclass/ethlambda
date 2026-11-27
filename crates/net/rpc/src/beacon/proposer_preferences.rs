@@ -2,6 +2,10 @@
 //! from a validator client, validated with the gossip rules, cached in the
 //! shared `BuilderMarket` and gossiped on `proposer_preferences`.
 //!
+//! `GET /eth/v1/beacon/proposer_preferences` lists what that market holds, from
+//! gossip and this route alike, for a builder that subscribed to the
+//! `proposer_preferences` event after the preferences were broadcast.
+//!
 //! Not gated on the sync status: the specification lists no 503, and a node
 //! that lacks the dependent block simply answers `ignore: unknown_block` per
 //! entry.
@@ -9,10 +13,10 @@
 use axum::{
     Extension, Router,
     body::Bytes,
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{Query, State},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use ethlambda_blockchain::EventBus;
 use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
@@ -23,14 +27,17 @@ use ethlambda_state_transition::beacon::{
 };
 use ethlambda_storage::Store;
 use ethlambda_types::beacon::{containers::gloas::SignedProposerPreferences, fork::ForkName};
-use serde::Serialize;
+use libssz::SszEncode as _;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::beacon::{
     ApiError,
     bids::{describe, require_version, unix_ms},
     copy_if_listened, decode_list, emit_accepted,
+    gloas_proposal::parse_root,
 };
+use crate::shared::content::{Encoding, ssz_response, with_consensus_version};
 
 /// The most entries one request may carry: the SSZ list's bound,
 /// `(MIN_SEED_LOOKAHEAD + 1) * SLOTS_PER_EPOCH`.
@@ -39,10 +46,58 @@ fn max_entries() -> usize {
 }
 
 pub(crate) fn routes() -> Router<Store> {
-    Router::new().route(
-        "/eth/v1/validator/proposer_preferences",
-        post(post_proposer_preferences),
-    )
+    Router::new()
+        .route(
+            "/eth/v1/validator/proposer_preferences",
+            post(post_proposer_preferences),
+        )
+        .route(
+            "/eth/v1/beacon/proposer_preferences",
+            get(get_proposer_preferences),
+        )
+}
+
+#[derive(Debug, Deserialize)]
+struct PreferencesQuery {
+    slot: Option<String>,
+    dependent_root: Option<String>,
+}
+
+/// `GET /eth/v1/beacon/proposer_preferences`.
+///
+/// Every signed preference the market holds for an upcoming proposal slot,
+/// narrowed by `?slot` and `?dependent_root`, in `(proposal_slot,
+/// dependent_root)` order. The market keeps only slots not yet past, so that
+/// is what "upcoming" means here. Always versioned `gloas`, the one fork
+/// whose preferences exist. The SSZ form is `ProgressiveList[SignedProposerPreferences]`,
+/// whose bytes are the fixed-size entries in order.
+async fn get_proposer_preferences(
+    Query(query): Query<PreferencesQuery>,
+    Extension(market): Extension<SharedBuilderMarket>,
+    headers: HeaderMap,
+) -> Response {
+    let slot = match query.slot.as_deref().map(str::parse::<u64>) {
+        None => None,
+        Some(Ok(slot)) => Some(slot),
+        Some(Err(_)) => return ApiError::BadRequest("Invalid slot parameter").into_response(),
+    };
+    let dependent_root = match query.dependent_root.as_deref().map(parse_root) {
+        None => None,
+        Some(Some(root)) => Some(root),
+        Some(None) => {
+            return ApiError::BadRequest("Invalid dependent_root parameter").into_response();
+        }
+    };
+    let held = market.preferences_matching(slot, dependent_root);
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    let response = match Encoding::from_accept(accept) {
+        Encoding::Ssz => ssz_response(held.iter().flat_map(|signed| signed.to_ssz()).collect()),
+        Encoding::Json => crate::json_response(serde_json::json!({
+            "version": ForkName::Gloas.as_str(),
+            "data": held,
+        })),
+    };
+    with_consensus_version(response, ForkName::Gloas)
 }
 
 /// One refused entry, in the Beacon API's `IndexedErrorMessage` shape.
