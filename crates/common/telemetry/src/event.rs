@@ -21,7 +21,7 @@ pub struct BlockEvent {
     pub block_root: [u8; 32],
     /// How the block or column reached this node.
     pub source: &'static str,
-    /// The execution client's verdict, on `el_verdict` rows only.
+    /// The execution client's verdict, on `el_end` rows only.
     pub verdict: Option<&'static str>,
     /// The data column's index, on `column_*` rows only.
     pub column_index: Option<u64>,

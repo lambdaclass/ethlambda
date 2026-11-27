@@ -230,8 +230,8 @@ pub struct ImportTimings {
     /// `lean_engine_new_payload_seconds`, not this.
     pub engine_start: Option<Instant>,
     pub engine_end: Option<Instant>,
-    /// Beacon: the execution client's answer, for the `el_sent` and
-    /// `el_verdict` rows. `None` when no client answered, which is what keeps
+    /// Beacon: the execution client's answer, for the `el_start` and
+    /// `el_end` rows. `None` when no client answered, which is what keeps
     /// those rows off a node with no `--execution-endpoint`.
     pub engine_answer: Option<EngineAnswer>,
 
@@ -626,14 +626,15 @@ impl BlockImportReport {
             ("verify_struct_end", t.verify_structural_end),
             ("verify_crypto_start", t.verify_crypto_start),
             ("verify_crypto_end", t.verify_crypto_end),
-            // Beacon's transition computed while `engine_newPayload` was in
-            // flight. It runs before `stf_start` and the import may use it in
-            // place of its own transition, so without these rows
-            // `stf_start`..`stf_done` reads as the whole transition while
-            // missing most of it. Written whether or not it was used, as the
-            // log line's `stf` row counts it.
-            ("stf_spec_start", t.stf_speculative_start),
-            ("stf_spec_end", t.stf_speculative_end),
+            // Beacon: the consensus half of the `engine_newPayload` question,
+            // the block's transition computed while the request (`el_start`
+            // .. `el_end`) is in flight. It runs before `stf_start` and the
+            // import may use it in place of its own transition, so without
+            // these rows `stf_start`..`stf_done` reads as the whole transition
+            // while missing most of it. Written whether or not it was used, as
+            // the log line's `stf` row counts it.
+            ("cl_start", t.stf_speculative_start),
+            ("cl_end", t.stf_speculative_end),
             ("stf_start", t.stf_start),
             (stf_end, t.stf_end),
             ("writer_wait_start", t.writer_wait_start),
@@ -653,8 +654,8 @@ impl BlockImportReport {
             .filter_map(|(stage, at)| Some(self.event(stage, at?, source, None)))
             .collect();
         if let Some(answer) = t.engine_answer {
-            events.push(self.event("el_sent", answer.sent, source, None));
-            events.push(self.event("el_verdict", answer.answered, source, Some(answer.verdict)));
+            events.push(self.event("el_start", answer.sent, source, None));
+            events.push(self.event("el_end", answer.answered, source, Some(answer.verdict)));
         }
         events
     }
@@ -809,7 +810,7 @@ pub struct CascadeTimings {
     pub head_ok: bool,
 }
 
-/// An `engine_newPayload` answer as the `el_sent` and `el_verdict` rows
+/// An `engine_newPayload` answer as the `el_start` and `el_end` rows
 /// record it.
 ///
 /// Its own instants rather than the `engine` pair: that pair runs from
@@ -1522,8 +1523,8 @@ mod tests {
                 // Beacon `attestable` waits for the head recomputation, which
                 // is per arrival: `CascadeTelemetry` writes it.
                 "block_atts_end",
-                "el_sent",
-                "el_verdict",
+                "el_start",
+                "el_end",
             ]
         );
         let events = report.telemetry_events();
@@ -1531,10 +1532,7 @@ mod tests {
             && event.slot == 12_345
             && event.column_index.is_none()));
         assert_eq!(events[0].at, base, "arrival is the wire, not the hand-off");
-        let verdict = events
-            .iter()
-            .find(|event| event.stage == "el_verdict")
-            .unwrap();
+        let verdict = events.iter().find(|event| event.stage == "el_end").unwrap();
         assert_eq!(verdict.verdict, Some("Valid"));
         assert_eq!(verdict.at, base + Duration::from_millis(40));
     }
@@ -1563,8 +1561,8 @@ mod tests {
                 .find(|event| event.stage == stage)
                 .map(|event| event.at)
         };
-        assert_eq!(at_of("el_sent"), at(base, 4));
-        assert_eq!(at_of("el_verdict"), at(base, 20));
+        assert_eq!(at_of("el_start"), at(base, 4));
+        assert_eq!(at_of("el_end"), at(base, 20));
     }
 
     /// The transition computed while the request was in flight gets rows of
@@ -1584,8 +1582,8 @@ mod tests {
         let stages = stages(&report);
         let position = |name| stages.iter().position(|stage| *stage == name);
         let (Some(spec_start), Some(spec_end), Some(stf_start)) = (
-            position("stf_spec_start"),
-            position("stf_spec_end"),
+            position("cl_start"),
+            position("cl_end"),
             position("stf_start"),
         ) else {
             panic!("missing a transition row: {stages:?}");
@@ -1599,8 +1597,8 @@ mod tests {
                 .find(|event| event.stage == stage)
                 .map(|event| event.at)
         };
-        assert_eq!(at_of("stf_spec_start"), at(base, 5));
-        assert_eq!(at_of("stf_spec_end"), at(base, 35));
+        assert_eq!(at_of("cl_start"), at(base, 5));
+        assert_eq!(at_of("cl_end"), at(base, 35));
     }
 
     /// A speculation the import discarded is written too, as the log line's
@@ -1618,7 +1616,7 @@ mod tests {
         failed.outcome = "failed";
 
         let stages = stages(&failed);
-        for name in ["stf_spec_start", "stf_spec_end", "stf_start", "stf_end"] {
+        for name in ["cl_start", "cl_end", "stf_start", "stf_end"] {
             assert!(stages.contains(&name), "missing {name}: {stages:?}");
         }
     }
@@ -1723,7 +1721,7 @@ mod tests {
             ..beacon_gossip(Instant::now())
         });
         let stages = stages(&no_engine);
-        assert!(!stages.contains(&"el_sent") && !stages.contains(&"el_verdict"));
+        assert!(!stages.contains(&"el_start") && !stages.contains(&"el_end"));
     }
 
     #[test]

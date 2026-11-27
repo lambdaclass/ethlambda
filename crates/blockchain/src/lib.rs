@@ -1945,7 +1945,7 @@ impl BlockChainServer {
                 // speculation as this one's.
                 (timings.stf_speculative_start, timings.stf_speculative_end) = (None, None);
                 timings.speculation = None;
-                // Likewise the `el_sent` and `el_verdict` rows: only this
+                // Likewise the `el_start` and `el_end` rows: only this
                 // pass's answer, if it got one.
                 timings.engine_answer = None;
                 let parent_root = beacon_block.parent_root();
@@ -1985,8 +1985,8 @@ impl BlockChainServer {
                         let (answer, answered_at) = match task.await {
                             Ok((answer, sent, answered_at)) => {
                                 // The request's own instants, taken on the
-                                // task that sent it, for the `el_sent` and
-                                // `el_verdict` rows: the `engine` pair also
+                                // task that sent it, for the `el_start` and
+                                // `el_end` rows: the `engine` pair also
                                 // spans building the request and the
                                 // transition computed meanwhile.
                                 if let Some(verdict) = answer.as_ref().ok().and_then(verdict_label)
@@ -4724,7 +4724,7 @@ impl Handler<AggregationDeadline> for BlockChainServer {
 ///
 /// `NotRequired` is never one: a block that needs no verdict is not sent, and
 /// a status the execution client returns always reads as one of the other
-/// three (see `beacon_engine::outcome_label`). It writes no `el_verdict` row
+/// three (see `beacon_engine::outcome_label`). It writes no `el_end` row
 /// rather than a value outside the documented set.
 fn verdict_label(validity: &fork_choice::PayloadValidity) -> Option<&'static str> {
     match validity {
