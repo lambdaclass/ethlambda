@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ee1da32d.js";
+            window.path_to_searchindex_js = "searchindex-2eb573ae.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-26bf4b2e.js"></script>
@@ -5191,6 +5191,7 @@ slot’s end, so a node serving a wrong one cannot park a duty past its slot.</p
 <tr><td><code>--self-build-only</code></td><td>off</td><td>Never sign a block built on a builder’s payload (Lodestar’s <code>executiononly</code>). From gloas each block request asks for no bid (<code>builder_boost_factor</code> <code>0</code>, <code>min_bid</code> <code>2^64 - 1</code>), and a block whose bid names a builder anyway, from a node that ignores <code>min_bid</code>, is refused before slashing protection records the slot. When the beacon node cannot build the payload itself, the slot is missed rather than built on a bid. Before gloas nothing changes: without <code>--builder-proposals</code> a blinded block is already refused. Conflicts with <code>--builder-proposals</code>, <code>--builder-boost-factor</code>, <code>--prefer-builder-proposals</code> and <code>--builder-min-bid</code></td></tr>
 <tr><td><code>--init-slashing-protection</code></td><td>off</td><td>Register every loaded key with no slashing-protection record as never having signed, instead of refusing to start. Dangerous: only for keys that have signed nothing anywhere for at least two epochs, and even then it rules out a double vote only, not a surround of an older vote; a key with a history should bring it instead. Never lowers an existing record; remove it once the keys are registered, and startup warns while it is set for nothing</td></tr>
 <tr><td><code>--enable-doppelganger-protection</code></td><td>off</td><td>Sign no attestation or block for a validator until the beacon node has seen it stay silent for a full epoch, and stop if it sees one act meanwhile. Applies at every start and to every key the keymanager API imports, and costs two to three epochs of attestations each time. See <a href="#doppelganger-protection">Doppelganger protection</a></td></tr>
+<tr><td><code>--distributed</code></td><td>off</td><td>Distributed validator mode, for keys that are shares behind middleware such as Obol Charon: whether a validator aggregates attestations or sync committee contributions is decided by the combined selection proofs the middleware returns. <code>--beacon-nodes</code> must point at the middleware. Refused with <code>--enable-doppelganger-protection</code>. See <a href="#distributed-validators">Distributed validators</a></td></tr>
 <tr><td><code>--shut-down-when-slashed</code></td><td>off</td><td>Stop when the chain reports a loaded validator slashed, exiting with code <code>3</code>, rather than only dropping that key’s proposer, attester and aggregation duties. See <a href="#slashed-validators">Slashed validators</a></td></tr>
 <tr><td><code>--disable-event-stream</code></td><td>off</td><td>Read no beacon node’s event stream, so every attestation, sync committee message and payload timeliness committee vote waits for its offset into the slot. One flag for what Lighthouse splits between <code>--disable-beacon-head-monitor</code> and <code>--disable-payload-available-monitor</code>; Prysm’s nearest is <code>--disable-attest-timely</code>. For a node whose stream is broken, or a proxy in front of it that holds events back. See <a href="#duties-start-on-the-block">Duties start on the block</a></td></tr>
 </tbody>
@@ -5565,6 +5566,58 @@ both see silence and both start signing, and a doppelganger that is down for
 the epochs checked goes unseen until it comes back, when nothing is checking any
 more. <code>ethlambda_validator_doppelganger_detecting</code> counts the keys still
 withheld.</p>
+<h3 id="distributed-validators"><a class="header" href="#distributed-validators">Distributed validators</a></h3>
+<p>Off unless <code>--distributed</code> is passed. A distributed validator’s key is split
+into shares across several operators, each running a validator client with
+one share in front of middleware such as Obol Charon, which speaks the Beacon
+API and combines a threshold of partial signatures into one under the
+validator’s key. To run behind Charon, load the share keystores as usual
+(locally or in a Web3Signer), point <code>--beacon-nodes</code> at Charon’s validator
+API (<code>http://charon:3600</code> by default) and pass <code>--distributed</code>. Charon
+presents each share’s public key as the validator’s, so duties, slashing
+protection and a remote signer’s answers are keyed and checked by the share.</p>
+<p>Attestations and blocks need nothing more. Aggregation does: it is decided
+by hashing the selection proof, and a share’s partial proof hashes to a
+different value than the combined one. So the client asks the middleware for
+the combined proofs and decides on those:</p>
+<ul>
+<li>Each epoch, from the task the subnet subscriptions are sent from, it sends
+the partial proof of every attester duty whose slot has not passed to
+<code>POST /eth/v1/validator/beacon_committee_selections</code>, the current epoch’s
+and then the next epoch’s in separate requests, as the Beacon API asks.
+Each epoch’s subscriptions go out ahead of its request, since they are what
+puts the beacon node on the subnets and Charon may hold a request for as
+long as its timeout: with the aggregator role where a combined proof is
+already held, and sent again with it for the duties the answer then
+selects. The aggregation tick acts on the same combined proofs and
+publishes them in the <code>AggregateAndProof</code>.</li>
+<li>At the start of each slot it sends the partial proof of every sync
+committee subnet its validators sit in to
+<code>POST /eth/v1/validator/sync_committee_selections</code>, one request per
+validator and subnet, as Lighthouse does. Charon answers a request only
+once it has combined every entry in it, so a seat it cannot combine in time
+holds back only its own answer. The contribution deadline acts on the
+answers in by then. A seat whose answer has not come is given up on, with a
+warning, and goes without a contribution that slot.</li>
+</ul>
+<p>A duty with no combined proof aggregates for nobody: its subscription goes
+out without the role and no aggregate or contribution is asked for. The
+current epoch’s attester duties still missing one are asked for again every
+slot, one request per slot so that a duty the middleware cannot combine holds
+back only its own slot’s, and subscribed again with the role once a combined
+proof selects them. Each partial
+proof is signed once and sent again as it was, so a retry costs a remote
+signer nothing. Charon answers
+a request only once it has combined every entry in it, so the next-epoch
+request can go unanswered when the other operators’ clients do not look an
+epoch ahead; those duties are asked for again as the current epoch’s, and
+that request’s failure or short answer is logged at debug, not warned about.</p>
+<p><code>--enable-doppelganger-protection</code> is refused with it: the other operators
+keep the validator live, so the check would stop the client. Not yet run
+against real middleware. Builder registrations (each signed with its client’s
+own timestamp), gloas proposer preferences and payload envelopes, and
+voluntary exits are signed with the share as usual, and whether a middleware
+combines each of them is up to it.</p>
 <h3 id="slashed-validators"><a class="header" href="#slashed-validators">Slashed validators</a></h3>
 <p>Each epoch’s refresh resolves every loaded key through
 <code>POST /eth/v1/beacon/states/head/validators</code>, and reads each one’s
