@@ -257,9 +257,11 @@ REJECTed at decode. A phase0-shaped slashing (a pre-electra digest) is IGNOREd
 (`no_consumer`). Publishing sends the same bytes under any digest from electra
 on.
 
-`sync_committee_contribution_and_proof` is decoded, logged at `debug`, and
-IGNOREd, since nothing consumes it; an undecodable payload on any topic is
-REJECTed.
+`sync_committee_contribution_and_proof` and the `sync_committee_{subnet_id}`
+messages are validated in p2p on their own permit pool
+(`gossip::sync_committee`, `p2p/src/beacon/sync_committee.rs`), and accepted
+ones go into the shared `SyncCommitteePool`. An undecodable payload on any
+topic is REJECTed.
 
 Publication runs on the Beacon API's `POST /eth/v2/beacon/blocks`, the only
 path that puts a block of this node's own on the wire. It gossips the block on
