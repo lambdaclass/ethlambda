@@ -242,7 +242,7 @@ impl ProposerSettings {
     /// Set when the beacon node's `/eth/v1/config/spec` is in, which is after
     /// these settings are built and before anything that signs reads them,
     /// and again whenever the chain check takes another schedule from the
-    /// nodes (`chain_check::hand_over_gas_limit_schedule`). It leaves
+    /// nodes, as it swaps that one in (`chain_check::check_once`). It leaves
     /// [`Self::generation`] alone: that counts override writes, and the full
     /// registration send each epoch compares every gas limit it signs anyway.
     pub fn set_gas_limit_schedule(&self, schedule: GasLimitSchedule) {

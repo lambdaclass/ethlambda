@@ -475,6 +475,13 @@ pub fn merge_schedule(
 /// cannot take a fork the others, answering a moment later, do not have.
 /// After startup the client's schedule is only ever replaced here.
 ///
+/// A swap that changes `GAS_LIMIT_SCHEDULE` hands it to `settings` in the same
+/// step, with no await in between, so the default gas limit follows the
+/// schedule from the answer that moved it, not from the end of the round: a
+/// node that hangs until its timeout does not hold it back either. Startup
+/// gave `settings` the configuration's own schedule, so the two never differ
+/// past that step.
+///
 /// Disagreements between nodes are warned about only when
 /// `warn_disagreements`, once every answer is in: the caller asks once per
 /// epoch, since a round runs every slot.
@@ -482,6 +489,7 @@ pub async fn check_once<B: BeaconNodeApi>(
     nodes: &FallbackBeaconNode<B>,
     genesis: Genesis,
     context: &SigningContext,
+    settings: &ProposerSettings,
     epoch_now: impl Fn() -> Epoch,
     warn_disagreements: bool,
 ) {
@@ -493,6 +501,12 @@ pub async fn check_once<B: BeaconNodeApi>(
         let current = (*context.config()).clone();
         let served = nodes.served_configs(epoch);
         if let Some(config) = follow_schedule(&current, &served, epoch, warn_disagreements) {
+            // Proposer preferences, builder registrations and the
+            // keymanager's `gas_limit` read the default gas limit from the
+            // settings, which hold their own copy of the schedule.
+            if config.gas_limit_schedule != current.gas_limit_schedule {
+                settings.set_gas_limit_schedule(config.gas_limit_schedule.clone());
+            }
             context.replace_config(config);
         }
     };
@@ -549,9 +563,9 @@ pub fn follow_schedule(
 ///
 /// Disagreements are warned about once per epoch, at the epoch's first round.
 ///
-/// `settings` get the gas limit schedule each round leaves the client's
-/// configuration with ([`hand_over_gas_limit_schedule`]): they name the
-/// default gas limit from it, and hold their own copy of it.
+/// `settings` get every gas limit schedule a round swaps into the client's
+/// configuration (see [`check_once`]): they name the default gas limit from
+/// it, and hold their own copy of it.
 pub async fn run<B: BeaconNodeApi>(
     nodes: Arc<FallbackBeaconNode<B>>,
     genesis: Genesis,
@@ -560,8 +574,6 @@ pub async fn run<B: BeaconNodeApi>(
     settings: Arc<ProposerSettings>,
     shutdown: CancellationToken,
 ) {
-    // What startup handed the settings: the configuration's own.
-    let mut handed_over = context.config().gas_limit_schedule.clone();
     let mut warned_epoch = None;
     let epoch_now = || clock.now().map_or(0, |slot| clock.epoch_of(slot));
     loop {
@@ -579,33 +591,18 @@ pub async fn run<B: BeaconNodeApi>(
         let epoch = epoch_now();
         let warn_disagreements = warned_epoch != Some(epoch);
         warned_epoch = Some(epoch);
+        let round = check_once(
+            &nodes,
+            genesis,
+            &context,
+            &settings,
+            epoch_now,
+            warn_disagreements,
+        );
         tokio::select! {
             () = shutdown.cancelled() => return,
-            () = check_once(&nodes, genesis, &context, epoch_now, warn_disagreements) => {}
+            () = round => {}
         }
-        hand_over_gas_limit_schedule(&context, &settings, &mut handed_over);
-    }
-}
-
-/// Give `settings` the gas limit schedule the client's configuration carries
-/// now, when it is not `handed_over` (the one they were last given), and
-/// remember it.
-///
-/// Proposer preferences, builder registrations and the keymanager's
-/// `gas_limit` read the default gas limit from the settings, so a schedule
-/// the check took from the nodes after startup reaches them from the next
-/// read on. The settings' generation does not move, as for the startup
-/// schedule (see `ProposerSettings::set_gas_limit_schedule`).
-pub fn hand_over_gas_limit_schedule(
-    context: &SigningContext,
-    settings: &ProposerSettings,
-    handed_over: &mut GasLimitSchedule,
-) {
-    let config = context.config();
-    let current = &config.gas_limit_schedule;
-    if current != handed_over {
-        settings.set_gas_limit_schedule(current.clone());
-        *handed_over = current.clone();
     }
 }
 
@@ -949,34 +946,6 @@ mod tests {
         assert!(over.len() < full.len() + 64, "{} bytes", over.len());
     }
 
-    /// A schedule the check swapped into the configuration reaches the
-    /// proposer settings once, and the settings name the default gas limit
-    /// from it.
-    #[test]
-    fn a_followed_gas_limit_schedule_reaches_the_proposer_settings() {
-        let (context, _) = context_and_clock();
-        let settings =
-            ProposerSettings::new(ethlambda_types::beacon::primitives::Bytes32::ZERO, None);
-        let key = ethlambda_types::beacon::primitives::BlsPubkey([1; 48]);
-        let mut handed_over = context.config().gas_limit_schedule.clone();
-
-        hand_over_gas_limit_schedule(&context, &settings, &mut handed_over);
-        assert_eq!(
-            settings.gas_limit(&key, NOW + 10),
-            crate::proposer_settings::DEFAULT_GAS_LIMIT
-        );
-
-        let scheduled = with_gas_limit_schedule(NOW + 10, 200_000_000);
-        context.replace_config(scheduled.clone());
-        hand_over_gas_limit_schedule(&context, &settings, &mut handed_over);
-        assert_eq!(handed_over, scheduled.gas_limit_schedule);
-        assert_eq!(
-            settings.gas_limit(&key, NOW + 9),
-            crate::proposer_settings::DEFAULT_GAS_LIMIT
-        );
-        assert_eq!(settings.gas_limit(&key, NOW + 10), 200_000_000);
-    }
-
     /// The only node that scheduled the fork is out of the merge (restarting
     /// for the upgrade, say) and the one left reports it unscheduled: the
     /// client keeps the fork, so the upgraded node is still usable when it
@@ -1086,6 +1055,12 @@ mod tests {
         (context, clock)
     }
 
+    /// Proposer settings on `Config::mainnet()`'s empty gas limit schedule,
+    /// as startup leaves them for `context_and_clock()`'s configuration.
+    fn settings() -> ProposerSettings {
+        ProposerSettings::new(ethlambda_types::beacon::primitives::Bytes32::ZERO, None)
+    }
+
     /// The issue's failover case: node 1 is on another chain, so when node 0
     /// fails no duty call reaches it, and the error says it was skipped.
     #[tokio::test]
@@ -1114,7 +1089,7 @@ mod tests {
         for node in fallback.nodes() {
             node.set_spec(Config::mainnet().with_fork_version(ForkName::Phase0, [5, 5, 5, 5]));
         }
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
 
         let err = fallback
             .attester_duties(3, &[])
@@ -1199,7 +1174,7 @@ mod tests {
 
         // It comes up and the next unusable-nodes round lets it in.
         fallback.nodes()[1].failures.lock().expect("lock").clear();
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
         let duties = fallback.attester_duties(3, &[]).await.expect("node 1 now");
         assert_eq!(duties.dependent_root, Root::repeat_byte(7));
     }
@@ -1215,7 +1190,7 @@ mod tests {
         assert!(!clock.is_gloas(gloas_slot));
 
         fallback.nodes()[0].set_spec(with_gloas(gloas_epoch, [8, 0, 0, 0]));
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
 
         assert!(clock.is_gloas(gloas_slot), "the clock shares the handle");
         assert_eq!(
@@ -1269,18 +1244,18 @@ mod tests {
         let gloas_epoch = NOW + 1;
         let upgraded = node().with_spec(with_gloas(gloas_epoch, [8, 0, 0, 0]));
         let fallback = established(vec![node(), upgraded]).await;
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
         assert!(!clock.is_gloas(gloas_epoch * slots_per_epoch()));
 
         goes_quiet(&fallback, 0);
         for _ in 1..MISSES_BEFORE_SAY_IS_LOST {
-            check_once(&fallback, genesis(), &context, || NOW, true).await;
+            check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
             assert!(
                 !clock.is_gloas(gloas_epoch * slots_per_epoch()),
                 "still held off while the quiet node keeps its say"
             );
         }
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
 
         assert!(clock.is_gloas(gloas_epoch * slots_per_epoch()));
     }
@@ -1295,12 +1270,12 @@ mod tests {
         let gloas_epoch = NOW + 10;
         let misconfigured = node().with_spec(with_gloas(gloas_epoch, [8, 0, 0, 0]));
         let fallback = established(vec![node(), misconfigured]).await;
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
 
         goes_quiet(&fallback, 0);
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
         fallback.nodes()[0].failures.lock().expect("lock").clear();
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
 
         assert!(!clock.is_gloas(gloas_epoch * slots_per_epoch()));
         assert_eq!(*context.config(), Config::mainnet());
@@ -1318,10 +1293,10 @@ mod tests {
         ])
         .await;
         context.replace_config(scheduled);
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
 
         goes_quiet(&fallback, 0);
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
 
         assert_eq!(context.config().fork_epoch(ForkName::Gloas), NOW + 10);
     }
@@ -1343,11 +1318,11 @@ mod tests {
 
         goes_quiet(&fallback, 0);
         for _ in 1..MISSES_BEFORE_SAY_IS_LOST {
-            check_once(&fallback, genesis(), &context, || NOW, true).await;
+            check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
         }
         fallback.nodes()[1].failures.lock().expect("lock").clear();
         fallback.nodes()[1].set_spec(with_gloas(gloas_epoch, [8, 0, 0, 0]));
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
 
         assert!(clock.is_gloas(gloas_epoch * slots_per_epoch()));
     }
@@ -1365,11 +1340,11 @@ mod tests {
             .lock()
             .expect("lock")
             .insert("spec", "down".to_string());
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
         assert!(!clock.is_gloas(gloas_epoch * slots_per_epoch()));
 
         fallback.nodes()[0].failures.lock().expect("lock").clear();
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
 
         assert!(clock.is_gloas(gloas_epoch * slots_per_epoch()));
     }
@@ -1388,7 +1363,7 @@ mod tests {
             .expect("lock")
             .insert("spec", "down".to_string());
 
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
 
         assert_eq!(*context.config(), Config::mainnet());
     }
@@ -1415,7 +1390,15 @@ mod tests {
 
         // The fork's last epoch before it arrives.
         for _ in 0..MISSES_BEFORE_SAY_IS_LOST {
-            check_once(&fallback, genesis(), &context, || NOW + 1, true).await;
+            check_once(
+                &fallback,
+                genesis(),
+                &context,
+                &settings(),
+                || NOW + 1,
+                true,
+            )
+            .await;
         }
         assert_eq!(context.config().fork_epoch(ForkName::Gloas), NOW + 100);
     }
@@ -1486,9 +1469,50 @@ mod tests {
                 gloas_epoch
             }
         };
-        check_once(&fallback, genesis(), &context, epoch_now, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), epoch_now, true).await;
 
         assert!(clock.is_gloas(gloas_epoch * slots_per_epoch()));
+    }
+
+    /// A gas limit schedule the first node starts serving reaches the
+    /// proposer settings as its answer is swapped in, not once a node that
+    /// hangs until its timeout has answered: a preference signed in between
+    /// carries the new default, as it would after the round.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_node_does_not_hold_back_the_gas_limit_schedule() {
+        use crate::proposer_settings::DEFAULT_GAS_LIMIT;
+        use std::time::Duration;
+
+        let (context, _) = context_and_clock();
+        let settings = settings();
+        let key = ethlambda_types::beacon::primitives::BlsPubkey([1; 48]);
+        let hung = node().with_spec_delay(Duration::from_secs(8));
+        hung.failures
+            .lock()
+            .expect("lock")
+            .insert("genesis", "booting".to_string());
+        let fallback = established(vec![node(), hung]).await;
+        fallback.nodes()[1].failures.lock().expect("lock").clear();
+        let scheduled = with_gas_limit_schedule(NOW + 10, 200_000_000);
+        fallback.nodes()[0].set_spec(scheduled.clone());
+        assert_eq!(settings.gas_limit(&key, NOW + 10), DEFAULT_GAS_LIMIT);
+
+        // One second into the round: node 0 has answered, node 1 is still
+        // seven seconds from its own.
+        let round = check_once(&fallback, genesis(), &context, &settings, || NOW, true);
+        let during = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            settings.gas_limit(&key, NOW + 10)
+        };
+        let ((), during) = tokio::join!(round, during);
+
+        assert_eq!(during, 200_000_000);
+        assert_eq!(
+            context.config().gas_limit_schedule,
+            scheduled.gas_limit_schedule
+        );
+        assert_eq!(settings.gas_limit(&key, NOW + 9), DEFAULT_GAS_LIMIT);
+        assert_eq!(settings.gas_limit(&key, NOW + 10), 200_000_000);
     }
 
     /// A node skipped for being on another chain is not counted against a
@@ -1517,11 +1541,27 @@ mod tests {
         assert_eq!(fallback.readmissions(), 0);
 
         fallback.nodes()[1].failures.lock().expect("lock").clear();
-        check_once(&fallback, genesis(), &context_and_clock().0, || NOW, true).await;
+        check_once(
+            &fallback,
+            genesis(),
+            &context_and_clock().0,
+            &settings(),
+            || NOW,
+            true,
+        )
+        .await;
         assert_eq!(fallback.readmissions(), 1, "node 1 was let back in");
 
         // A node that was usable all along answering again is no readmission.
-        check_once(&fallback, genesis(), &context_and_clock().0, || NOW, true).await;
+        check_once(
+            &fallback,
+            genesis(),
+            &context_and_clock().0,
+            &settings(),
+            || NOW,
+            true,
+        )
+        .await;
         assert_eq!(fallback.readmissions(), 1);
     }
 
@@ -1535,7 +1575,7 @@ mod tests {
         fallback.nodes()[0]
             .set_spec(Config::mainnet().with_fork_epoch(ForkName::Electra, electra + 1));
 
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
 
         assert_eq!(*context.config(), Config::mainnet());
         let err = fallback
@@ -1556,7 +1596,7 @@ mod tests {
             .lock()
             .expect("lock")
             .insert("spec", "down".to_string());
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
         fallback.nodes()[0].failures.lock().expect("lock").clear();
 
         fallback
@@ -1573,11 +1613,11 @@ mod tests {
     async fn a_node_upgraded_mid_epoch_is_read_at_the_next_round() {
         let (context, clock) = context_and_clock();
         let fallback = established(vec![node()]).await;
-        check_once(&fallback, genesis(), &context, || NOW, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, true).await;
 
         let gloas_epoch = NOW + 1;
         fallback.nodes()[0].set_spec(with_gloas(gloas_epoch, [8, 0, 0, 0]));
-        check_once(&fallback, genesis(), &context, || NOW, false).await;
+        check_once(&fallback, genesis(), &context, &settings(), || NOW, false).await;
 
         assert!(clock.is_gloas(gloas_epoch * slots_per_epoch()));
     }
@@ -1602,7 +1642,7 @@ mod tests {
             assert!(asked > asked_at_startup, "read before the node answered");
             gloas_epoch
         };
-        check_once(&fallback, genesis(), &context, epoch_now, true).await;
+        check_once(&fallback, genesis(), &context, &settings(), epoch_now, true).await;
 
         assert!(!clock.is_gloas(gloas_epoch * slots_per_epoch()));
         let err = fallback
