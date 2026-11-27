@@ -481,6 +481,33 @@ thread, in this order:
    block's ancestor at the target epoch (REJECT), and the finalized checkpoint
    is an ancestor of the vote block (IGNORE).
 
+Steps 1 and 2 fail for a while on every block this node imports: validators
+vote as soon as the block reaches them, so the first votes for it arrive
+while this node is still waiting for its columns or running its state
+transition. Those IGNOREs are not reported straight away. The vote is parked
+under the block's root with its verdict withheld, so gossipsub keeps holding
+the message, and when the chain actor's import caches the post-state it tells
+p2p (`BlockChainToP2P::block_state_ready`), which runs the stateful checks
+again, in blocking batches, and reports what they answer then. An accepted
+vote propagates as the original message. This is lighthouse's reprocess
+queue, which the specification allows ("a client MAY queue attestations for
+processing once block is retrieved"). Without it, a devnet with ~130 ms
+imports lost 5 to 8% of each node's subnet votes, all of them the earliest.
+
+A vote is parked once: its second check reports whatever it answers. One
+still parked 2.5 s after it arrived gets its first verdict, since gossipsub
+drops a message awaiting a verdict as early as 3.5 s in (6 heartbeats of
+700 ms of history). The queue holds at most 16,384 votes, lighthouse's own
+cap, since nothing about a parked vote has been verified, and at most 2,048
+aggregates among them, since an aggregate's bits can reach 16 KiB before its
+signature is checked; past either, a vote gets its first verdict at once.
+Released votes are checked again on a permit pool of their own, so a big
+release takes no permit from the votes arriving meanwhile. A vote whose block
+was imported but whose state has left the cache is checked once more at once
+and not parked, since no release would come for it. Unlike lighthouse, a vote for a block this
+node has never seen does not start a lookup for that block: it waits for
+gossip or sync to bring it. See `crates/net/p2p/src/beacon/parked_votes.rs`.
+
 The seen caches (`SeenAggregates`, keyed both by `(target_epoch,
 aggregator_index)` and by `(hash_tree_root(data), committee_index)`;
 `SeenAttestations`, by `(target_epoch, attester_index)`) live in p2p now,
@@ -1040,6 +1067,8 @@ Known gaps:
 | `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed` / `unsupported_fork` |
 | `lean_beacon_gossip_validation_total{kind,outcome,reason}` | Gossip verdicts, now including `beacon_aggregate_and_proof` and `beacon_attestation`; see [metrics.md](./metrics.md#beacon-gossip-validation) |
 | `lean_beacon_gossip_verdict_expired_total{kind}` | Verdicts that came too late to propagate anything; should stay at zero |
+| `lean_beacon_gossip_parked_votes_total{kind,result}` | Votes whose verdict waited for their block's post-state: `parked`, `full`, `rechecked`, `expired` |
+| `lean_beacon_gossip_parked_votes` | Votes parked right now |
 | `lean_beacon_status_digest_mismatch_total` | Peers whose `Status` moved onto another fork digest, once per move (not per refresh) |
 | `lean_beacon_fork_digest{digest}` | The digest computed at startup, as a label |
 | `lean_beacon_aggregate_decode_seconds` | Time spent decoding one aggregate off the wire |

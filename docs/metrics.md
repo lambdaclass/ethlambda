@@ -417,6 +417,8 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.
 | `lean_beacon_gossip_validation_total` | Counter | Verdicts, by topic kind, outcome and reason | On every verdict reported to gossipsub | kind, outcome=accept,queue,ignore,reject, reason | |
 | `lean_beacon_gossip_validation_seconds` | Histogram | Time from a message's arrival to its verdict | On every verdict reported to gossipsub | kind | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8 |
 | `lean_beacon_gossip_verdict_expired_total` | Counter | Verdicts that arrived after gossipsub evicted the message, so an Accept propagated nothing | When `report_message_validation_result` returns `false` | kind | |
+| `lean_beacon_gossip_parked_votes_total` | Counter | Subnet attestations and aggregates whose verdict waited for their block's post-state, by what happened to them | When a vote is parked, refused by the full queue, checked again, or past its deadline. `rechecked` and `expired` also count a vote checked again at once because its block was announced before its first verdict arrived, which is never `parked` | kind, result=parked,full,rechecked,expired | |
+| `lean_beacon_gossip_parked_votes` | Gauge | Votes parked right now | On every park, release and sweep | | |
 
 `kind` is the topic kind, with every `data_column_sidecar_{subnet}` sharing the
 label `data_column_sidecar`, every `beacon_attestation_{subnet_id}` sharing
@@ -439,10 +441,19 @@ envelope verifies. When the execution client has found that parent's payload
 invalid, nothing will verify it, and the block is ignored instead
 (`parent_payload_invalid`). The aggregate, attestation,
 `payload_attestation_message`, `execution_payload_bid` and `proposer_preferences`
-topics never answer `queue`, since the vote
-block's post-state is either cached or it is not
-(`IgnoreReason::UnknownBlock`/`StateUnavailable`), with nothing to hold the
-message for. **`verdict_expired_total` should stay at
+topics never answer `queue`. An aggregate or a subnet attestation whose vote
+block is not stored yet, or has no cached post-state yet
+(`IgnoreReason::UnknownBlock`/`StateUnavailable`), is held anyway, though not
+as `queue`: its verdict is withheld while it waits for the block's import, then
+its checks run again, on a permit pool of their own (`pool="recheck"`)
+(`lean_beacon_gossip_parked_votes_total`, and
+`crates/net/p2p/src/beacon/parked_votes.rs`). A vote whose block was imported
+but whose state has left the cache is checked once more at once and not held. A vote counted under those two
+reasons is one still waiting at its deadline, 2.5 s after it arrived, one the
+full queue refused, or one whose second check still found its block or state
+missing. Its time to verdict includes the wait, so
+`lean_beacon_gossip_validation_seconds` for these two kinds reads up to that
+deadline. **`verdict_expired_total` should stay at
 zero**: a rising count means validation is too slow for gossipsub's message
 cache.
 
@@ -501,10 +512,10 @@ ethlambda-specific, not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
-| `lean_beacon_validation_permits_in_use` | Gauge | Permits held per pool: blocking tasks queued or running | A permit is acquired / released | pool=gossip,attestation,builder,sync,column_check | |
+| `lean_beacon_validation_permits_in_use` | Gauge | Permits held per pool: blocking tasks queued or running | A permit is acquired / released | pool=gossip,attestation,builder,sync,column_check,recheck | |
 | `lean_beacon_validation_permit_exhausted_total` | Counter | Objects reported `Ignore(Overloaded)` because their pool had no free permit | On each failed `try_acquire` | pool=gossip,attestation,builder,sync | |
 | `lean_beacon_validation_queue_seconds` | Histogram | Time from `spawn_blocking` being called to the closure starting (tokio blocking-pool queueing) | When the closure starts | kind | 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 |
-| `lean_beacon_validation_run_seconds` | Histogram | Run time of the closure itself | When the closure ends (panic included) | kind | same as above |
+| `lean_beacon_validation_run_seconds` | Histogram | Run time of the closure itself. A batch of up to 64 parked votes checked again is one closure, timed under `beacon_attestation_recheck` or `beacon_aggregate_and_proof_recheck` | When the closure ends (panic included) | kind | same as above |
 | `lean_beacon_column_check_permit_wait_seconds` | Histogram | Time a block's fetched or replayed columns (their prechecks, or a further KZG sub-batch) or a fetched envelope waited for a `column_check` permit | When the permit is granted | kind=column_check,envelope_check | same as above |
 | `lean_beacon_epoch_precompute_running` | Gauge | 1 while an epoch precompute worker runs its advance | Worker start / end | | |
 
