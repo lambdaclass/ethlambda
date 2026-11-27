@@ -44,3 +44,18 @@ pub(crate) fn inc_rows_dropped(rows: u64) {
 pub(crate) fn inc_insert_failures() {
     INSERT_FAILURES.inc();
 }
+
+/// Count one PQ timing event the export's queue had no room for, by class
+/// (`receipt`, `validation`, `work`, `status`). The run's `run.json` counts
+/// them too; this is where a running node says its export is falling behind.
+pub(crate) fn inc_pq_timing_dropped(class: &str) {
+    static DROPPED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_beacon_pq_timing_dropped_events_total",
+            "PQ timing events the export dropped because its queue was full, by class",
+            &["class"]
+        )
+        .unwrap()
+    });
+    DROPPED.with_label_values(&[class]).inc();
+}

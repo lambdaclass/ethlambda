@@ -10,6 +10,7 @@ mod keygen;
 mod network;
 mod pq_keys;
 mod pq_prover_check;
+mod pq_timing;
 mod shutdown;
 mod slashing_protection;
 mod validator;
@@ -493,6 +494,28 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     "Starting leanVM's prover for the PQ fork"
                 );
                 stark::install_leanvm(config).wrap_err("cannot start leanVM's prover")?;
+            }
+            // After the prover, whose backend the run names.
+            if let Some(output) = &mainnet.pq_timing_output {
+                if pq_epoch == ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH {
+                    warn!(
+                        network = source.name(),
+                        "--pq-timing-output is set, but this network does not schedule the PQ fork: nothing to record"
+                    );
+                } else {
+                    let run = pq_timing::run(
+                        output.clone(),
+                        source.name(),
+                        source.genesis(),
+                        source.config(),
+                        mainnet.pq_prover_threads,
+                    );
+                    let run_dir =
+                        ethlambda_telemetry::pq_timing::install(run).wrap_err_with(|| {
+                            format!("cannot record PQ timing under {}", output.display())
+                        })?;
+                    info!(run_dir = %run_dir.display(), "Recording PQ timing");
+                }
             }
             (Some(source), bootnodes)
         }
@@ -1242,6 +1265,9 @@ async fn wait_for_shutdown(node: RunningNode) {
     let _ = node.http.await;
     // After the actors, which are the only emitters, have stopped.
     ethlambda_telemetry::shutdown(TELEMETRY_FLUSH_TIMEOUT).await;
+    // The PQ timing run's last chunk and its end. A proof still running on a
+    // blocking thread reports to nobody after this.
+    ethlambda_telemetry::pq_timing::close();
 
     info!("Shutdown complete");
 }

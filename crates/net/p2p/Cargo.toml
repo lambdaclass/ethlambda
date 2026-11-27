@@ -91,3 +91,6 @@ hex.workspace = true
 # `test-utils` for `helpers::test_state`: a test that needs a stored post-state
 # builds one with it.
 ethlambda-state-transition = { workspace = true, features = ["test-utils"] }
+# `test-utils` for `pq_timing::testing`: the PQ timing events a gossip path
+# emits, captured in memory.
+ethlambda-telemetry = { workspace = true, features = ["test-utils"] }

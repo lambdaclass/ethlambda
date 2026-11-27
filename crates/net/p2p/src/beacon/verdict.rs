@@ -24,6 +24,7 @@ use ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_storage::{CacheKey, Store};
+use ethlambda_telemetry::pq_timing;
 use ethlambda_types::beacon::containers::altair::{
     SignedContributionAndProof, SyncCommitteeMessage,
 };
@@ -57,6 +58,9 @@ pub(crate) struct GossipId {
     pub(crate) received_at: Instant,
     /// The topic kind, as a metric label. See [`crate::beacon::topics::metric_kind`].
     pub(crate) kind: &'static str,
+    /// The PQ vote this message decoded as, when the timing export recorded
+    /// its receipt: what [`report`] names it by in the `validated` event.
+    pub(crate) pq_vote: Option<pq_timing::Vote>,
 }
 
 /// An object whose stateful checks run on a blocking thread.
@@ -897,6 +901,24 @@ const RECHECK_POOL: &str = "recheck";
 /// How many released votes one blocking task checks again.
 const RECHECK_BATCH: usize = 64;
 
+/// A PQ vote's verdict as the timing export names it. A vote the node had
+/// already seen, or whose bits an accepted aggregate covers, is a
+/// `duplicate` rather than `ignored`, and one refused for want of a
+/// validation permit is `queue_dropped`: neither says anything about the
+/// message. A vote is never queued, so `deferred` is only for completeness.
+fn pq_timing_outcome(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Accept => "accepted",
+        Outcome::Reject(_) => "rejected",
+        Outcome::Queue(_) => "deferred",
+        Outcome::Ignore(
+            IgnoreReason::AlreadySeen | IgnoreReason::AlreadyStored | IgnoreReason::CoveredBits,
+        ) => "duplicate",
+        Outcome::Ignore(IgnoreReason::Overloaded) => "queue_dropped",
+        Outcome::Ignore(_) => "ignored",
+    }
+}
+
 /// How an outcome maps onto gossipsub, and whether the object still goes on
 /// towards the chain actor (see [`Validated::forward`] for the route).
 pub(crate) fn disposition(outcome: Outcome) -> (MessageAcceptance, bool) {
@@ -919,6 +941,10 @@ pub(crate) fn report(server: &P2PServer, id: GossipId, outcome: Outcome) -> bool
         reason,
         id.received_at.elapsed(),
     );
+    if let Some(vote) = id.pq_vote {
+        let outcome = pq_timing_outcome(outcome);
+        pq_timing::validated(vote, &id.message_id.0, id.received_at, outcome);
+    }
     server.swarm_handle.report_validation(
         id.message_id,
         id.propagation_source,
@@ -2038,6 +2064,7 @@ mod tests {
             propagation_source: PeerId::random(),
             received_at,
             kind,
+            pq_vote: None,
         }
     }
 

@@ -427,6 +427,18 @@ pub(crate) struct MainnetOptions {
     #[arg(long, default_value_t = 0)]
     pub(crate) pq_prover_threads: usize,
 
+    /// Record PQ gossip and proving timings under this directory, one
+    /// sub-directory per run, in the format the PQ devnets' clients share
+    /// (schema 1 of Lighthouse's `scripts/pq-measurement`): when each PQ
+    /// attestation and aggregate arrived and what validation made of it, and
+    /// every committee proof and block-proof merge this node made.
+    ///
+    /// Off when unset, and read only on a network that schedules the PQ
+    /// fork. A run keeps at most 8 GiB, removing its oldest events first. See
+    /// `docs/pq_timing.md`.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) pq_timing_output: Option<PathBuf>,
+
     /// Base URL of a builder API endpoint, normally MEV-Boost (for example
     /// `http://127.0.0.1:18550`) or a relay directly. Without it every block
     /// is built locally, and `register_validator` answers 500 so a validator
@@ -1207,6 +1219,18 @@ mod tests {
             Command::Beacon(options) => options,
             other => panic!("the beacon argv must resolve to the beacon subcommand, got {other:?}"),
         }
+    }
+
+    /// `--pq-timing-output` names a directory, and is off without it.
+    #[test]
+    fn the_pq_timing_output_is_a_directory_and_off_by_default() {
+        assert_eq!(parse_beacon(beacon_args()).mainnet.pq_timing_output, None);
+        let mut args = beacon_args();
+        args.extend(["--pq-timing-output", "/data/pq-timing"]);
+        assert_eq!(
+            parse_beacon(args).mainnet.pq_timing_output,
+            Some(PathBuf::from("/data/pq-timing"))
+        );
     }
 
     /// A client name alone configures nothing, so it is a usage error rather

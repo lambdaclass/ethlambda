@@ -218,6 +218,7 @@ mod tests {
                 propagation_source: PeerId::random(),
                 received_at,
                 kind: "beacon_attestation",
+                pq_vote: None,
             },
             object: Validated::Attestation {
                 attestation: Box::new(SingleAttestation {
@@ -265,6 +266,7 @@ mod tests {
                 propagation_source: PeerId::random(),
                 received_at,
                 kind: "beacon_aggregate_and_proof",
+                pq_vote: None,
             },
             object: Validated::Aggregate {
                 aggregate: Box::new(aggregate),

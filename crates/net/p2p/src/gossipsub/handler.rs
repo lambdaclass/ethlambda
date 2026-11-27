@@ -82,6 +82,7 @@ pub async fn handle_gossip_message(
         propagation_source,
         received_at: wire_at,
         kind: metric_kind,
+        pq_vote: None,
     });
     trace!(
         kind,
@@ -230,7 +231,7 @@ async fn handle_lean_attestation(server: &mut P2PServer, payload: &[u8], compres
 fn handle_beacon_gossip(
     server: &P2PServer,
     ctx: &Context<P2PServer>,
-    id: GossipId,
+    mut id: GossipId,
     topic: &str,
     kind: &str,
     payload: &[u8],
@@ -250,7 +251,7 @@ fn handle_beacon_gossip(
     // A PQ digest's reshaped topics decode as PQ's containers; its block and
     // column topics take the shared path below.
     let pq_dispatch = (topic_fork == ForkName::Pq)
-        .then(|| crate::beacon::pq::triage(server, kind, payload, id.received_at))
+        .then(|| crate::beacon::pq::triage(server, kind, payload, &mut id))
         .flatten();
     let dispatch = if let Some(dispatch) = pq_dispatch {
         dispatch
