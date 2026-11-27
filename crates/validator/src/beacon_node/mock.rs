@@ -237,6 +237,9 @@ pub struct MockBeaconNode {
     pub head_root: Option<Root>,
     /// The head is one the execution client has not validated.
     pub head_optimistic: bool,
+    /// What `canonical_block_root` answers, by slot. A slot with no entry is
+    /// the node's 404: no canonical block there.
+    pub canonical_roots: HashMap<Slot, Root>,
     pub submitted_sync_messages: Mutex<Vec<altair::SyncCommitteeMessage>>,
     /// Contributions the mock holds; one is served by its `subcommittee_index`.
     /// A subcommittee with none answers like a node's 404.
@@ -918,6 +921,12 @@ impl MockBeaconNode {
     /// Answer `head_block_root` with `root`.
     pub fn with_head_root(mut self, root: Root) -> Self {
         self.head_root = Some(root);
+        self
+    }
+
+    /// Answer `canonical_block_root` for `slot` with `root`.
+    pub fn with_canonical_block(mut self, slot: Slot, root: Root) -> Self {
+        self.canonical_roots.insert(slot, root);
         self
     }
 
@@ -1626,6 +1635,11 @@ impl BeaconNodeApi for MockBeaconNode {
             failure: BeaconNodeFailure::Request,
             detail: "no head root".to_string(),
         })
+    }
+
+    async fn canonical_block_root(&self, slot: Slot) -> Result<Option<Root>> {
+        self.guard("canonical_block_root")?;
+        Ok(self.canonical_roots.get(&slot).copied())
     }
 
     async fn submit_sync_committee_messages(

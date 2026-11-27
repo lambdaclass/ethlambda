@@ -261,7 +261,9 @@ The bookkeeping an import triggers (chain-event emission, the finality eviction 
 
 On the beacon wire, `decode` for `source="gossip"` spans more than its name says. `BlockArrival::decode_start` is still the wire arrival, but `handed_off` is stamped only once the block has a gossip verdict, so the section also covers the cheap, stateless checks, the stateful check's own `spawn_blocking` task, and the verdict's trip back through the p2p actor's mailbox. There is no wait for a free validation slot to attribute here either: `try_acquire_owned` never blocks, and a message arriving with none free is reported `Ignore(Overloaded)` rather than queued. A block reported that way never reaches the chain actor, so it contributes no import timing at all. A rising `decode` on the beacon wire alone therefore does not mean decoding got slower; check `lean_beacon_gossip_validation_seconds` before assuming so.
 
-`engine` and `fcu` are execution-client waits. They are I/O waits rather than work, so a node whose import time is dominated by them is waiting on its execution client, not spending CPU. `engine` is only the part of the `engine_newPayload` question the import could not hide behind its own state transition: building the request (a copy of the payload), plus whatever of the round trip was left once that transition finished. For a block whose answer arrived first it is the request's construction alone; how often that is the case depends on the execution client being faster than the transition. The round trip itself is `lean_engine_new_payload_seconds`. The transition that ran meanwhile is charged to `stf` whether or not the import used it, and the log line's `speculation` field says which (`used`, `discarded_invalidated`, `discarded_held` or `discarded_mismatch`), so a block whose `stf` holds two transitions says so.
+`el_wait` and `fcu` are execution-client waits. They are I/O waits rather than work, so a node whose import time is dominated by them is waiting on its execution client, not spending CPU. `el_wait` is only the part of the `engine_newPayload` question the import could not hide behind its own state transition: building the request (a copy of the payload), plus whatever of the round trip was left once that transition finished. For a block whose answer arrived first it is the request's construction alone; how often that is the case depends on the execution client being faster than the transition. The round trip itself is `lean_engine_new_payload_seconds`. The transition that ran meanwhile is `cl` whether or not the import used it, and the log line's `speculation` field says which (`used`, `discarded_invalidated`, `discarded_held` or `discarded_mismatch`), so a block whose `store` holds a second transition says so.
+
+Before lambdaclass/ethlambda#917 a beacon block reported `engine` where it now reports `el_wait`, and one `stf` section where it now reports `cl` and `store` (`stf` was `cl` plus `store`, less `writer_wait`). A query over both needs both names; lean's `stf` is unchanged.
 
 The `source` label has two values, `gossip` and `sync` (req/resp backfill). Two populations are deliberately absent. A block re-delivered to itself because its slot had not started reports under the source it first arrived on, since the hold is already visible as its `defer` section and a third label value would take the block out of the population it belongs to for every section it has left. A block this node built itself is not measured at all: it crossed no wire, so it has no `decode` and an empty `queue` taken when the import began. Both still appear in the log, which names them `deferred` and `local`.
 
@@ -271,7 +273,7 @@ Series appear as blocks arrive rather than being seeded, since a third of the ph
 |------|------|-------|-------------------------|--------|---------|
 | `lean_block_import_phase_seconds` | Histogram | Time one section of a block's import, or of the arrival carrying it, took | Per section that ran, on each import, hold or failure | phase (see below); source=gossip,sync | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32 |
 | `lean_engine_speculation_total` | Counter | State transitions the chain actor ran while the `engine_newPayload` round trip was in flight, by what became of them | Per beacon block asked of an execution client that has its parent's post-state and passes the checks `on_block` makes before its transition (not from the future, past the finalized epoch's start, on the finalized chain); a block refused by one of those is asked about but gets no speculation and is not counted | outcome=used,discarded_invalidated,discarded_held,discarded_mismatch | |
-| `lean_engine_new_payload_seconds` | Histogram | Time the execution client took to answer `engine_newPayload*`, from the request to the answer, retry ladder included: a pre-gloas block's payload, or from gloas on the payload an envelope reveals. For a block the import runs the state transition meanwhile, so this is the execution client's processing time, not what the import waited (the `engine` phase) | Per request sent: each pre-gloas beacon block, and each gloas envelope that passed its consensus checks | outcome=valid,optimistic,invalidated,no_verdict (`no_verdict`: the whole retry ladder with no answer, or one attempt answered with a JSON-RPC error, which is not retried) | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32 |
+| `lean_engine_new_payload_seconds` | Histogram | Time the execution client took to answer `engine_newPayload*`, from the request to the answer, retry ladder included: a pre-gloas block's payload, or from gloas on the payload an envelope reveals. For a block the import runs the state transition meanwhile, so this is the execution client's processing time, not what the import waited (the `el_wait` phase) | Per request sent: each pre-gloas beacon block, and each gloas envelope that passed its consensus checks | outcome=valid,optimistic,invalidated,no_verdict (`no_verdict`: the whole retry ladder with no answer, or one attempt answered with a JSON-RPC error, which is not retried) | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32 |
 | `lean_block_import_cascade_blocks` | Histogram | Blocks one arrival put through the import path (attempts, so a block that ends held or pended counts) | Once per arriving block message | | 1, 2, 3, 5, 8, 16, 32, 64, 128 |
 
 Per-block phases, in the order a block crosses them, plus `total` for a completed import:
@@ -287,11 +289,13 @@ Per-block phases, in the order a block crosses them, plus `total` for a complete
 | `cascade_wait` | Between the parent's import finishing and this block being popped off the cascade queue | both |
 | `da_check` | The custody-column availability check itself, not the wait | beacon |
 | `columns_wait` | Held because custody columns had not all arrived | beacon |
-| `engine` | What the `engine_newPayload` question cost beyond the state transition that ran meanwhile: building and sending the request (a copy of the payload), and the wait for the verdict left once that transition finished. Observed as `0` for every block with no request to send (no execution client, pre-merge, gloas), and as the request's construction alone for a block whose answer was in before the transition finished. Larger when the execution client was slower than the transition, or gave no answer (the rest of its retry ladder, block held) | beacon |
+| `cl` | Beacon: the block's state transition, computed ahead of `fork_choice::on_block`, during the `engine_newPayload` round trip when there is one. It counts a transition that was then discarded (an `INVALIDATED` verdict, which makes `store` run it again) or whose block was held. At an epoch's first block it also builds the new checkpoint's balances and the unslashed target balances, which `store` would otherwise build | beacon |
+| `el_wait` | What the `engine_newPayload` question cost beyond the state transition that ran meanwhile: building and sending the request (a copy of the payload), and the wait for the verdict left once that transition finished. Observed as `0` for every block with no request to send (no execution client, pre-merge, gloas), and as the request's construction alone for a block whose answer was in before the transition finished. Larger when the execution client was slower than the transition, or gave no answer (the rest of its retry ladder, block held) | beacon |
 | `verify_struct` | Participant bounds checks and pubkey resolution | lean |
 | `verify_crypto` | The leanVM multi-message aggregate verification | lean |
-| `stf` | The state transition. On beacon this bundles the transition and the state root, and excludes `writer_wait`, which is nested inside it. It includes the transition that ran during the `engine_newPayload` round trip, also when that one was then discarded and run again (an `INVALIDATED` verdict) or the block was held | both |
-| `writer_wait` | Beacon only: the importer's blocking hand-off of the post-state to the storage crate's background writer, which waits while the writer's queue is full. Subtracted from `stf`, so `stf` and `writer_wait` do not overlap | beacon |
+| `stf` | Lean: the state transition | lean |
+| `store` | Beacon: `fork_choice::on_block` given the `cl` transition, after the verdict: the block, its post-state and its fork-choice node written to the store, timeliness and the proposer boost, gloas's payload attestations, the checkpoints and the unrealized justification. Excludes `writer_wait`, which is nested inside it | beacon |
+| `writer_wait` | Beacon only: the importer's blocking hand-off of the post-state to the storage crate's background writer, which waits while the writer's queue is full. Subtracted from `store`, so `store` and `writer_wait` do not overlap | beacon |
 | `db_write` | The block write and handing the post-state off to the storage crate's background writer; the state's own encode/diff/commit cost is `lean_state_write_seconds` instead, not this row | lean |
 | `fc_head` | `update_head` | lean |
 | `block_atts` | Replaying the block's own attestations and slashings into fork choice | beacon |
@@ -417,6 +421,8 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.
 | `lean_beacon_gossip_validation_total` | Counter | Verdicts, by topic kind, outcome and reason | On every verdict reported to gossipsub | kind, outcome=accept,queue,ignore,reject, reason | |
 | `lean_beacon_gossip_validation_seconds` | Histogram | Time from a message's arrival to its verdict | On every verdict reported to gossipsub | kind | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8 |
 | `lean_beacon_gossip_verdict_expired_total` | Counter | Verdicts that arrived after gossipsub evicted the message, so an Accept propagated nothing | When `report_message_validation_result` returns `false` | kind | |
+| `lean_beacon_gossip_parked_votes_total` | Counter | Subnet attestations and aggregates whose verdict waited for their block's post-state, by what happened to them | When a vote is parked, refused by the full queue (or by the half of it votes for a block not stored yet may take), checked again, or past its deadline. `rechecked` and `expired` also count a vote checked again at once because its block was announced before its first verdict arrived, which is never `parked` | kind, result=parked,full,rechecked,expired | |
+| `lean_beacon_gossip_parked_votes` | Gauge | Votes parked right now | On every park, release and sweep | | |
 
 `kind` is the topic kind, with every `data_column_sidecar_{subnet}` sharing the
 label `data_column_sidecar`, every `beacon_attestation_{subnet_id}` sharing
@@ -439,10 +445,19 @@ envelope verifies. When the execution client has found that parent's payload
 invalid, nothing will verify it, and the block is ignored instead
 (`parent_payload_invalid`). The aggregate, attestation,
 `payload_attestation_message`, `execution_payload_bid` and `proposer_preferences`
-topics never answer `queue`, since the vote
-block's post-state is either cached or it is not
-(`IgnoreReason::UnknownBlock`/`StateUnavailable`), with nothing to hold the
-message for. **`verdict_expired_total` should stay at
+topics never answer `queue`. An aggregate or a subnet attestation whose vote
+block is not stored yet, or has no cached post-state yet
+(`IgnoreReason::UnknownBlock`/`StateUnavailable`), is held anyway, though not
+as `queue`: its verdict is withheld while it waits for the block's import, then
+its checks run again, on a permit pool of their own (`pool="recheck"`)
+(`lean_beacon_gossip_parked_votes_total`, and
+`crates/net/p2p/src/beacon/parked_votes.rs`). A vote whose block was imported
+but whose state has left the cache is checked once more at once and not held. A vote counted under those two
+reasons is one still waiting at its deadline, 2.5 s after it arrived, one the
+full queue refused, or one whose second check still found its block or state
+missing. Its time to verdict includes the wait, so
+`lean_beacon_gossip_validation_seconds` for these two kinds reads up to that
+deadline. **`verdict_expired_total` should stay at
 zero**: a rising count means validation is too slow for gossipsub's message
 cache.
 
@@ -508,10 +523,10 @@ ethlambda-specific, not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
-| `lean_beacon_validation_permits_in_use` | Gauge | Permits held per pool: blocking tasks queued or running | A permit is acquired / released | pool=gossip,attestation,builder,sync,column_check | |
+| `lean_beacon_validation_permits_in_use` | Gauge | Permits held per pool: blocking tasks queued or running | A permit is acquired / released | pool=gossip,attestation,builder,sync,column_check,recheck | |
 | `lean_beacon_validation_permit_exhausted_total` | Counter | Objects reported `Ignore(Overloaded)` because their pool had no free permit | On each failed `try_acquire` | pool=gossip,attestation,builder,sync | |
 | `lean_beacon_validation_queue_seconds` | Histogram | Time from `spawn_blocking` being called to the closure starting (tokio blocking-pool queueing) | When the closure starts | kind | 0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4 |
-| `lean_beacon_validation_run_seconds` | Histogram | Run time of the closure itself | When the closure ends (panic included) | kind | same as above |
+| `lean_beacon_validation_run_seconds` | Histogram | Run time of the closure itself. A batch of up to 64 parked votes checked again is one closure, timed under `beacon_attestation_recheck` or `beacon_aggregate_and_proof_recheck` | When the closure ends (panic included) | kind | same as above |
 | `lean_beacon_column_check_permit_wait_seconds` | Histogram | Time a block's fetched or replayed columns (their prechecks, or a further KZG sub-batch) or a fetched envelope waited for a `column_check` permit | When the permit is granted | kind=column_check,envelope_check | same as above |
 | `lean_beacon_epoch_precompute_running` | Gauge | 1 while an epoch precompute worker runs its advance | Worker start / end | | |
 
@@ -549,8 +564,8 @@ sum(lean_beacon_validation_permits_in_use)
 histogram_quantile(0.99, sum by (le) (rate(lean_beacon_validation_queue_seconds_bucket[5m])))
 sum by (pool) (rate(lean_beacon_validation_permit_exhausted_total[5m]))
 
-# Against import's STF phase
-histogram_quantile(0.99, sum by (le) (rate(lean_block_import_phase_seconds_bucket{phase="stf"}[5m])))
+# Against import's state transition
+histogram_quantile(0.99, sum by (le) (rate(lean_block_import_phase_seconds_bucket{phase="cl"}[5m])))
 
 # Precompute overlap: fraction of the window a worker ran
 avg_over_time(lean_beacon_epoch_precompute_running[5m])
@@ -690,7 +705,7 @@ A `timer` start with no matching `head` start means the last slot was skipped.
 
 ### Beacon State Transition Phases
 
-Where the time of one beacon state transition goes. `lean_block_import_phase_seconds{phase="stf"}`
+Where the time of one beacon state transition goes. `lean_block_import_phase_seconds{phase="cl"}`
 says how long an import's transition took; this says which step.
 
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
@@ -917,6 +932,7 @@ and absent is not the same as zero.
 |---|---|---|
 | `ethlambda_validator_validators_loaded` | Gauge | Validator keys this client holds, local and remote, the count `/health` reports as `validators.loaded`. Set at startup and again on every scrape, so keys imported or deleted through the keymanager API show up |
 | `ethlambda_validator_validators_resolved` | Gauge | Loaded keys that have an index on chain, out of `validators_loaded`. A persistent gap means validators are deposited but not yet activated |
+| `ethlambda_validator_validators_slashed` | Gauge | Loaded keys the chain reports slashed (their `validator.slashed`), as of the last epoch refresh. Should read zero forever: a slashed key gets no more proposer, attester or aggregation duties, and its setup is likely to put the other keys at risk. See [Slashed validators](./cli.md#slashed-validators) |
 | `ethlambda_validator_duties_held` | Gauge | Attester duties currently scheduled |
 | `ethlambda_validator_attestations_published_total` | Counter | Attestations a beacon node accepted |
 | `ethlambda_validator_attestation_failures_total` | Counter | Slots whose attestation duty failed and returned |
@@ -936,6 +952,11 @@ and absent is not the same as zero.
 | `ethlambda_validator_sync_contributions_published_total` | Counter | Sync committee contributions this client published as an aggregator. Bursty, like `aggregates_published_total` |
 | `ethlambda_validator_sync_contribution_failures_total` | Counter | Sync aggregation duties that ended in an error or ran past their slot. A subnet with no contribution to fetch is skipped and not counted |
 | `ethlambda_validator_sync_duties_held` | Gauge | Sync committee duties held for the current period |
+| `ethlambda_validator_attestation_outcomes_total` | Counter | Attestation duties by `validator` and `outcome` (`published`, `failed`). See [Per-validator outcomes](#per-validator-outcomes) |
+| `ethlambda_validator_proposal_outcomes_total` | Counter | Proposal duties by `validator` and `outcome` (`published`, `failed`) |
+| `ethlambda_validator_sync_committee_message_outcomes_total` | Counter | Sync committee message duties by `validator` and `outcome` (`published`, `failed`) |
+| `ethlambda_validator_payload_attestation_outcomes_total` | Counter | Payload timeliness committee votes by `validator` and `outcome` (`published`, `failed`) (gloas) |
+| `ethlambda_validator_proposal_checks_total` | Counter | Blocks this client handed to a beacon node, by `validator` and by which block the canonical chain held at their slot four slots later: `result` is `canonical`, `replaced`, `orphaned` or `unknown` |
 | `ethlambda_validator_doppelganger_detecting` | Gauge | Keys doppelganger protection still withholds attestations and blocks for (`--enable-doppelganger-protection`). Non-zero for two to three epochs after a start or an import, then zero; a key that stays here has no validator index yet, or its beacon nodes keep failing the liveness query. Always zero with the protection off |
 | `ethlambda_validator_doppelganger_check_failures_total` | Counter | Doppelganger checks (one a slot while any key is withheld) that got no liveness answer, because a query failed or every beacon node was syncing. Only a failure at an epoch's last slot costs anything: it pushes the withheld keys' first signature back an epoch, and is logged at error. A count that climbs every slot is a beacon node that does not serve `/eth/v1/validator/liveness`, or one that is down |
 | `ethlambda_validator_aggregates_published_total` | Counter | Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment |
@@ -997,6 +1018,68 @@ ones worth alerting on at any non-zero value rather than on a rate:
 guards caught a duty they judged unsafe, and `fee_recipient_mismatches_total`
 means blocks are being proposed that pay someone else. `envelope_failures_total`
 belongs with them on a gloas network.
+
+### Per-validator outcomes
+
+Five series carry a `validator` label: the four `*_outcomes_total` and
+`proposal_checks_total` (`crates/validator/src/performance.rs`). Each duty a
+service takes up counts once, as `published` when a beacon node accepted the
+message, and as `failed` otherwise: the node refused it or did not answer, the
+signature failed, slashing protection refused it, or the duty ran past its
+deadline. What the unlabelled series count as neither is neither here too: a
+duty doppelganger protection withholds, an attestation for a key deleted since
+the schedule was fetched (once the slot's attestation data was fetched; a
+failed fetch, or one still out at the end of the slot, counts every duty of
+the slot `failed`), every duty of a slot the per-slot sync check withholds
+(`slots_skipped_syncing_total`), a sync committee message or payload vote
+when no beacon node has a head that is not optimistic,
+a payload vote for a slot the node knows no block for, and a blinded block the
+node did not confirm.
+
+The label is the validator's index for the first 64 validators an outcome is
+recorded for, which keep it for the life of the process, and `other` for every
+validator after them. A client with thousands of keys therefore has at most 65
+series per outcome, and `sum without (validator) (...)` is always the client's
+total. The `other` series exist from startup. A validator's own are all created
+at zero when it takes its label, with its first outcome, so every outcome after
+that one is an increase `rate()` and `increase()` see; the first is the series'
+starting value. Past 64 keys, which validators get their own label depends on
+which had a duty first, so it can change from one run to the next. A label is
+never given back: a key the keymanager deletes keeps its own, and once 64
+validators have had one, a key imported later is counted under `other` until
+the client restarts.
+
+A batch a node accepted only in part is counted under `other`: its accepted part
+as `published`, the rest as `failed`. The node's answer names the positions it
+refused, which the client logs, but `submit_attestations` and its sync committee
+and payload vote counterparts return a count, so no validator is credited with
+an outcome that may be another's.
+
+`proposal_checks_total` counts one check of each block this client handed to a
+node, made when the fourth slot after the block's starts, through
+`GET /eth/v1/beacon/headers/{slot}`. That includes an unconfirmed blinded block,
+a blinded block still publishing when the proposal stopped waiting unless the
+node then refused it, and a full block whose publish ran past the proposal's
+deadline. It runs on a task of its own, so it never delays a duty. `canonical`
+means the canonical chain holds this block at the slot, `replaced` another
+block, `orphaned` none (a 404, or a node answering with the block before the
+slot), and `unknown` that no node answered. The first node to answer is believed, so a node four
+slots behind the chain that does not report itself syncing reads as `orphaned`.
+Each check is also logged, at info when canonical and at warn otherwise.
+
+These series count what the client attempted, not what the chain did with it:
+an accepted attestation that was never included, or was included with the wrong
+head, reads `published`. That answer needs the standard rewards endpoints
+(`/eth/v1/beacon/rewards/attestations/{epoch}`), which ethlambda's beacon node
+does not serve yet.
+
+The same cap governs the log. When the first outcome of an epoch is recorded,
+every earlier epoch is summarized at info: one `Validator epoch summary` line
+per labelled validator with an outcome in it, each duty as `published/attempted`,
+and one more line for `other` when it has any. Its `validators` field counts the
+validators `other` covers: those past the cap, and those of a batch accepted in
+part. So a client writes at most 65 of these lines an epoch however many keys it
+holds.
 
 ## Troubleshooting
 

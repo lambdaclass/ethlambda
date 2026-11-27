@@ -401,8 +401,16 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
             return;
         }
         // Snapshotted with the guard dropped at once: nothing below awaits a
-        // node while holding the store.
-        let pubkeys: HashSet<BlsPubkey> = store.read().await.pubkeys().into_iter().collect();
+        // node while holding the store. A key the chain reports slashed is
+        // left out: its block would be refused, so there is no proposal for a
+        // preference to describe (see `crate::slashed`).
+        let pubkeys: HashSet<BlsPubkey> = store
+            .read()
+            .await
+            .pubkeys()
+            .into_iter()
+            .filter(|pubkey| !self.context.slashed().contains(pubkey))
+            .collect();
         if pubkeys.is_empty() {
             return;
         }
@@ -516,9 +524,11 @@ impl<B: BeaconNodeApi + 'static> PreferencesService<B> {
                 None => Before::Unsent,
             };
             // One read for both, so a keymanager write between two reads
-            // cannot pair an old address with a new gas limit.
+            // cannot pair an old address with a new gas limit. The gas limit
+            // is the one for the proposal's epoch, `target`, which is the next
+            // epoch's for a preference signed ahead.
             let Some((fee_recipient, target_gas_limit)) =
-                self.settings.fee_recipient_and_gas_limit(&pubkey)
+                self.settings.fee_recipient_and_gas_limit(&pubkey, target)
             else {
                 no_fee_recipient += 1;
                 continue;
@@ -932,6 +942,52 @@ mod tests {
         }
     }
 
+    /// Without `--gas-limit` or an override, each preference carries the gas
+    /// limit the schedule names for its proposal's epoch, not the wall
+    /// clock's: the next epoch's preference is signed now, at its own
+    /// epoch's limit.
+    #[tokio::test]
+    async fn the_target_gas_limit_is_the_one_scheduled_for_the_proposal_epoch() {
+        use crate::proposer_settings::DEFAULT_GAS_LIMIT;
+        use ethlambda_types::beacon::config::GasLimitScheduleEntry;
+
+        let (store, pubkeys) = store_with_keys(1);
+        let store = Arc::new(RwLock::new(store));
+        let settings = settings(Some(FEE_RECIPIENT));
+        settings.set_gas_limit_schedule(
+            vec![GasLimitScheduleEntry {
+                epoch: GLOAS_EPOCH + 1,
+                gas_limit: 200_000_000,
+            }]
+            .into(),
+        );
+        let node = MockBeaconNode::new()
+            .with_proposers_v2(
+                GLOAS_EPOCH,
+                Root::repeat_byte(0x11),
+                vec![duty(&pubkeys[0], 3, slot_in(GLOAS_EPOCH, 10))],
+            )
+            .with_proposers_v2(
+                GLOAS_EPOCH + 1,
+                Root::repeat_byte(0x22),
+                vec![duty(&pubkeys[0], 3, slot_in(GLOAS_EPOCH + 1, 4))],
+            );
+        let (service, node) = service(node, settings);
+
+        service.poll(slot_in(GLOAS_EPOCH, 1), store).await;
+
+        let mut entries: Vec<_> = submitted(&node)
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .collect();
+        entries.sort_by_key(|entry| entry.message.proposal_slot);
+        let gas_limits: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.message.target_gas_limit)
+            .collect();
+        assert_eq!(gas_limits, [DEFAULT_GAS_LIMIT, 200_000_000]);
+    }
+
     #[tokio::test]
     async fn a_second_poll_does_not_resubmit() {
         let (store, pubkeys) = store_with_keys(1);
@@ -1083,6 +1139,45 @@ mod tests {
         assert_eq!(sent[0].1.len(), 1);
         assert_eq!(sent[0].1[0].message.proposal_slot, slot_in(GLOAS_EPOCH, 12));
         assert_eq!(sent[0].1[0].message.validator_index, 3);
+    }
+
+    /// A key the chain reports slashed signs no preference, since its block
+    /// would be refused; the other keys' go out as usual.
+    #[tokio::test]
+    async fn a_slashed_validator_signs_no_preference() {
+        let (store, pubkeys) = store_with_keys(2);
+        let store = Arc::new(RwLock::new(store));
+        let node = Arc::new(MockBeaconNode::new().with_proposers_v2(
+            GLOAS_EPOCH,
+            Root::repeat_byte(0x11),
+            vec![
+                duty(&pubkeys[0], 3, slot_in(GLOAS_EPOCH, 10)),
+                duty(&pubkeys[1], 4, slot_in(GLOAS_EPOCH, 11)),
+            ],
+        ));
+        let context = context();
+        let slashed = crate::beacon_node::ValidatorEntry {
+            index: 3,
+            pubkey: pubkeys[0],
+            status: "active_slashed".to_string(),
+            slashed: true,
+        };
+        context
+            .slashed()
+            .observe(std::slice::from_ref(&slashed))
+            .expect("without the flag a slashed key stops nothing");
+        let service = Arc::new(PreferencesService::new(
+            node.clone(),
+            context,
+            settings(Some(FEE_RECIPIENT)),
+        ));
+
+        service.poll(slot_in(GLOAS_EPOCH, 1), store).await;
+
+        let sent = submitted(&node);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1.len(), 1);
+        assert_eq!(sent[0].1[0].message.validator_index, 4);
     }
 
     #[tokio::test]

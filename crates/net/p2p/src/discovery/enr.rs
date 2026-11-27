@@ -149,11 +149,14 @@ pub(crate) struct LocalEnrParams {
     pub(crate) fork_id: EnrForkId,
     /// The `cgc` entry to publish, or `None` to omit it.
     ///
-    /// `Some(CUSTODY_REQUIREMENT)` on the beacon wire: it is the floor a peer
-    /// may demand, and this node's actual custody only ever meets or exceeds
-    /// it (`sampling_size` never samples fewer groups than that), so
-    /// advertising it never overstates what this node stores and serves.
-    /// `None` on lean, which has no data-availability domain.
+    /// On the beacon wire, the custody group count the node started with
+    /// (`--custody-group-count`, or the recorded validator custody count when
+    /// higher). This node's actual custody only ever meets or exceeds it
+    /// (`sampling_size` never samples fewer groups than that), so advertising
+    /// it never overstates what this node stores and serves. Fixed for the
+    /// process: ethrex's discovery server cannot replace the record, so a
+    /// runtime raise reaches `MetaData` only. `None` on lean, which has no
+    /// data-availability domain.
     pub(crate) custody_group_count: Option<u64>,
 }
 

@@ -22,6 +22,7 @@ pub mod envelope_checks;
 pub mod fork_schedule;
 pub mod handler;
 pub mod messages;
+pub mod parked_votes;
 pub mod protocols;
 pub mod scoring;
 pub mod subnets;
@@ -29,6 +30,7 @@ pub mod swarm;
 pub mod sync_committee;
 pub mod topics;
 pub mod transition;
+pub mod validator_custody;
 pub mod verdict;
 
 use std::collections::BTreeMap;
@@ -72,13 +74,28 @@ pub struct BeaconWire {
     /// on. See [`encoding`]'s module docs for the rule.
     pub genesis_validators_root: Root,
     /// Advertised in `Ping` responses and in `MetaData`. Bumped through
-    /// [`Self::bump_metadata_seq_number`] when the digest switches and when
-    /// `syncnets` changes.
+    /// [`Self::bump_metadata_seq_number`] when the digest switches, when
+    /// `syncnets` changes, and when validator custody raises
+    /// `custody_group_count`.
     pub metadata_seq_number: u64,
     /// The columns this node custodies, carried alongside `topics` so the
     /// gossip handler and the request handlers can check what this node
     /// promises to serve without recomputing it from the node id.
     pub custody_columns: Vec<u64>,
+    /// The custody group count `MetaData` v3 advertises. Starts at the ENR's
+    /// `cgc`, the count startup custodied for; [`validator_custody`] may
+    /// raise it at runtime, never past what `custody_columns` covers, and
+    /// bumps the sequence number when it does.
+    pub custody_group_count: u64,
+    /// The first slot from which this node holds every column in
+    /// `custody_columns`: the anchor's, unless startup raised the custody
+    /// set past what the data directory held before (see
+    /// `ethlambda_storage::CustodyRecord`). `Status` v2 reports the later of
+    /// this and the anchor as `earliest_available_slot`.
+    pub custody_since_slot: Slot,
+    /// The attached validators and what the once-an-epoch run keeps between
+    /// runs. See [`validator_custody`].
+    pub validator_custody: validator_custody::ValidatorCustody,
     /// The attestation subnets this node backbones, from the same node id.
     ///
     /// Read by `build_metadata` for the `attnets` bitfield it advertises, so
@@ -196,8 +213,9 @@ pub mod constants {
     /// the sync subcommittee size divide by one value.
     pub use ethlambda_types::beacon::constants::SYNC_COMMITTEE_SUBNET_COUNT;
 
-    /// Re-exported rather than redefined: the subnet subscription, the `cgc`
-    /// ENR entry, the `MetaDataV3` field and the availability check must all
-    /// name one value, and das-core is where it is defined.
+    /// Re-exported rather than redefined: the floor of every custody count
+    /// this node advertises (the `cgc` ENR entry, the `MetaDataV3` field) and
+    /// accepts from a peer must name one value, and das-core is where it is
+    /// defined.
     pub use ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT;
 }

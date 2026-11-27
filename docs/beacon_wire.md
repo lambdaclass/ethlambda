@@ -71,7 +71,8 @@ spec's "Transitioning the gossip" rules, the next digest's topics are joined
 `SUBSCRIBE_LEAD_EPOCHS` before its boundary and the previous digest's topics
 are left `UNSUBSCRIBE_LAG_EPOCHS` after it. At the boundary the node
 publishes and advertises the new digest, bumps its metadata sequence number
-and moves its discv5 admission filter. While the window is open a gossip
+and moves its discv5 admission filter, then publishes again the proposer
+preferences whose earlier publish reached no peer (under Gossip). While the window is open a gossip
 message's fork comes from its own topic's digest, and a `Status` on either
 digest is answered, but range sync starts only from a peer on the current
 digest (or the next one, within clock skew of the boundary).
@@ -111,6 +112,43 @@ block is unknown is ignored. A bid is capped at 196,932 decompressed bytes
 its slot, preferences on the digest of the proposal slot, which in the epoch
 before gloas is the gloas digest already joined. Envelopes the node publishes
 itself are recorded as known payloads, since gossip never echoes them.
+
+This node joins that digest's topics an epoch ahead, as Lighthouse does since
+v8.3.0 and Prysm does, and so at the same moment as every peer that does: at
+the start of the epoch before the boundary, which is also when the validator
+client sends the next epoch's preferences. The first publish can therefore
+find no peer on the topic yet. So a preference publish waits for a peer, as
+Prysm's does. The market remembers, for each preference this node publishes,
+whether it is still owed a publish (`BuilderMarket::record_preferences_publish`):
+after a publish no peer was handed. One still owed is published again while
+its slot is ahead (`publish_owed_proposer_preferences`):
+
+- when a peer joins its topic (gossipsub's `Subscribed` event, which comes
+  once the peer is counted on the topic; `on_peer_subscribed`). A subscription
+  to any other topic, or to a digest this node does not hold, sends nothing;
+- at every fork-digest switch. The new digest's first slot has started by
+  then, so its preference is past helping and is left out.
+
+Only a publish that found no peer subscribed can be retried: it left no trace
+in the duplicate cache, so its retry goes out. One refused because every
+peer's queue was full did leave its id there, so its retry is answered as a
+duplicate, which ends the retries.
+
+A preference that reached one peer is not sent again. A message's gossipsub id
+is its topic and payload alone, and gossipsub keeps the id of every message it
+handed to a peer, or received from one, for `seen_ttl` (two epochs) and refuses
+to publish it again until then (`Duplicate`). Peers that join the topic later
+get it only if a peer already on it relays it to them, which gossip does not
+do for a message older than its gossip window. Lighthouse before v8.3.0 joins
+two slots before the boundary, and Grandine 2.0.6 five, so on a network with
+those they may miss the first epoch's preferences.
+
+A publish of a bid, a preference, an envelope or a payload attestation that no
+peer was handed is logged at `warn` with gossipsub's reason
+(`NoPeersSubscribedToTopic`, say), one gossipsub refuses as a duplicate at
+`debug`, and `Published ... to gossipsub` at `info` only once a peer has it.
+Every other topic's publish failures are logged by the swarm adapter, at
+`debug`.
 
 | Topic | Decoded as |
 | --- | --- |
@@ -153,8 +191,9 @@ joined on demand, see [Sync committee subnets](#sync-committee-subnets).
 for blobs, deprecated at fulu in favor of the column matrix below.
 
 `data_column_sidecar_{0..127}` is no longer in that absent list. This node
-subscribes to `sampling_size(CUSTODY_REQUIREMENT)` of them — the sampling size
-floored by `SAMPLES_PER_SLOT` above `CUSTODY_REQUIREMENT` itself — chosen by
+subscribes to `sampling_size(custody_group_count)` of them (the custody count
+it started with, see [Validator custody](#validator-custody), floored by
+`SAMPLES_PER_SLOT`; at the default `CUSTODY_REQUIREMENT` that is 8), chosen by
 `custody_columns(node_id, …)`, a public function of this node's own discv5
 node id (`das-core.md`), so any peer can compute the same set without asking.
 `NUMBER_OF_CUSTODY_GROUPS` and `DATA_COLUMN_SIDECAR_SUBNET_COUNT` are equal
@@ -409,7 +448,8 @@ scored by its role:
   but its mesh, formed before the boundary, can already be past the
   deliveries' activation (one epoch for blocks and aggregates). P3 on the new
   digest therefore waits `MESH_DELIVERY_WARMUP_SLOTS`, as after a catch-up.
-  Lighthouse joins two slots ahead, so activation alone covers it there.
+  Lighthouse before v8.3.0 joins two slots ahead, so activation alone covers
+  it there.
 
 ## Aggregate attestations
 
@@ -451,6 +491,42 @@ thread, in this order:
 6. Ancestry against the vote state's `block_roots`: the target is the vote
    block's ancestor at the target epoch (REJECT), and the finalized checkpoint
    is an ancestor of the vote block (IGNORE).
+
+Steps 1 and 2 fail for a while on every block this node imports: validators
+vote as soon as the block reaches them, so the first votes for it arrive
+while this node is still waiting for its columns or running its state
+transition. Those IGNOREs are not reported straight away. The vote is parked
+under the block's root with its verdict withheld, so gossipsub keeps holding
+the message, and when the chain actor's import caches the post-state it tells
+p2p (`BlockChainToP2P::block_state_ready`), which runs the stateful checks
+again, in blocking batches, and reports what they answer then. An accepted
+vote propagates as the original message. This is lighthouse's reprocess
+queue, which the specification allows ("a client MAY queue attestations for
+processing once block is retrieved"). Without it, a devnet with ~130 ms
+imports lost 5 to 8% of each node's subnet votes, all of them the earliest.
+
+A vote is parked once: its second check reports whatever it answers. One
+still parked 2.5 s after it arrived gets its first verdict, since gossipsub
+drops a message awaiting a verdict as early as 3.5 s in (6 heartbeats of
+700 ms of history). The queue holds at most 16,384 votes, lighthouse's own
+cap, since nothing about a parked vote has been verified, and at most 2,048
+aggregates among them, since an aggregate's bits can reach 16 KiB before its
+signature is checked; past either, a vote gets its first verdict at once.
+Released votes are checked again on a permit pool of their own, so a big
+release takes no permit from the votes arriving meanwhile, and each keeps its
+place under both caps until that check answers, since its batch may wait for
+a permit while the next releases come in. Votes for a block this node has
+not stored at all take at most half of each cap: any peer can name a
+root nobody signed, and since no import releases it, its votes would sit
+until their deadline and end in an IGNORE that costs the peer nothing. A
+vote for a block this node has stored names one it was handed and is still
+importing, nearly always after checking its proposer's signature, and those
+are nearly every early vote an honest network sends, so a peer flooding
+made-up roots cannot crowd them out. A vote whose block
+was imported but whose state has left the cache is checked once more at once
+and not parked, since no release would come for it. Unlike lighthouse, a vote for a block this
+node has never seen does not start a lookup for that block: it waits for
+gossip or sync to bring it. See `crates/net/p2p/src/beacon/parked_votes.rs`.
 
 The seen caches (`SeenAggregates`, keyed both by `(target_epoch,
 aggregator_index)` and by `(hash_tree_root(data), committee_index)`;
@@ -690,8 +766,10 @@ Both per-item lookups are lenient the way the block protocols are: a column
 this node never custodied, or a root it holds no header for, is left out of
 the answer rather than turned into an error, since the spec's own words are
 "Clients MUST respond with at least one sidecar, if they have it." A
-`data_column_sidecars_by_range/1` request starting before `Store::anchor_slot`
-gets `RESOURCE_UNAVAILABLE` instead of a merely-empty answer, the same
+`data_column_sidecars_by_range/1` request starting before `Store::anchor_slot`,
+or before the later slot from which a custody set grown at startup is complete
+(see Validator custody below), gets `RESOURCE_UNAVAILABLE` instead of a
+merely-empty answer, the same
 distinction the block-range handler draws and for the same reason: an empty
 window this node's canonical chain skipped is normal, but a window below where
 this node's chain begins cannot be served from any point onward. That floor is
@@ -920,7 +998,9 @@ checkpoint from `Store::beacon_finalized_checkpoint`, and
 `earliest_available_slot` from the anchor's own slot rather than
 `finalized_epoch * SLOTS_PER_EPOCH`, since this node keeps only the unfinalized
 window above its anchor and the epoch's first slot is not necessarily one it
-holds. Naming that slot tells a peer not to ask for anything older; naming zero
+holds. A start that custodies more groups than the data directory held moves it
+later, to the slot after that start's head: the new groups' columns are held
+only from there (see [Validator custody](#validator-custody)). Naming that slot tells a peer not to ask for anything older; naming zero
 would claim genesis is in reach. There is one window where `beacon_head` answers
 `None`, between `init_beacon` seeding `KEY_HEAD` and fork choice inserting the
 block that root names, and every field but the fork digest falls back to zero
@@ -934,7 +1014,7 @@ syncing" rather than as a conflicting chain.
 | --- | --- |
 | `eth2` | the computed `ENRForkID` |
 | `attnets` | 64 bits, with this node's `SUBNETS_PER_NODE` backbone subnets set |
-| `cgc` | `CUSTODY_REQUIREMENT` |
+| `cgc` | the custody count the node started with: `--custody-group-count`, or the recorded validator custody count when that is higher |
 | `quic` | `--gossipsub-port` |
 | `tcp` | `--gossipsub-port`, the same number: TCP and UDP are separate namespaces |
 | `udp` | `--discovery.port` |
@@ -949,17 +1029,56 @@ Two of these advertise less, or more, than they look like:
 - `syncnets` names the sync committee subnets joined on a validator client's
   request, so it is all-unset until one asks. It is advertised in MetaData
   only; the ENR has no `syncnets` entry.
-- `cgc` advertises `CUSTODY_REQUIREMENT`, the floor below which peers may
-  reject a record outright, not `sampling_size(CUSTODY_REQUIREMENT)`, the
-  larger number of columns this node actually custodies, stores and serves
-  (see [Data column sidecars](#data-column-sidecars)). That undersells rather
-  than oversells: a request for more than `cgc`'s worth of columns still
-  succeeds, since this node holds every column its own node id assigned it at
-  the sampling size, not merely `cgc`'s worth.
+- `cgc` advertises the startup custody count (`CUSTODY_REQUIREMENT` by
+  default), not its `sampling_size`, the number of groups this node actually
+  custodies, stores and serves when that is larger (see
+  [Data column sidecars](#data-column-sidecars)). That undersells rather than
+  oversells: a request for more than `cgc`'s worth of columns still succeeds,
+  since this node holds every column its own node id assigned it at the
+  sampling size, not merely `cgc`'s worth. `MetaData` v3's
+  `custody_group_count` starts at the same count (it used to say
+  `CUSTODY_REQUIREMENT` whatever the flag was) and may rise past `cgc` at
+  runtime; the record cannot follow until a restart.
 
 The `tcp` entry is what makes us discoverable in return: lighthouse's discovery
 predicate requires `enr.tcp4().is_some() || enr.tcp6().is_some()` and applies it
 as a query filter, so a `quic`-only record is invisible to it.
+
+## Validator custody
+
+Fulu `validator.md` ("Validator custody") has a node with validators attached
+custody `get_validators_custody_requirement` groups: their total effective
+balance over `BALANCE_PER_ADDITIONAL_CUSTODY_GROUP` (32 ETH), at least
+`VALIDATOR_CUSTODY_REQUIREMENT` (8) and at most `NUMBER_OF_CUSTODY_GROUPS`
+(128). A node whose validators' balance falls keeps custodying its highest
+count, across restarts too. What this node does about it, and what it does not
+yet:
+
+| Piece | Where | What it does |
+| --- | --- | --- |
+| Attached validators | `ethlambda_network_api::AttachedValidators`, filled by the Beacon API | Every index named to `beacon_committee_subscriptions` (aggregator or not) and `prepare_beacon_proposer`, with the epoch it was last named in. One not named again for `EXPIRY_EPOCHS` (2) epochs stops counting, so a detached validator client stops raising custody |
+| Requirement | `das::get_validators_custody_requirement` | Off the latest finalized state's effective balances, as the specification says, once an epoch. Not the head's: the record never falls, so a raise read off a branch that is later reorged out would stay for good. The p2p actor (`beacon::validator_custody::refresh`) starts the run; the computation goes to a `spawn_blocking` task (`compute`), which takes the effective balances from the fork choice's `JustifiedBalances` snapshot for the finalized checkpoint when it is cached (it keeps the last 8 epoch boundaries) and otherwise reads the state that snapshot is built from, whose rebuild would stall the actor: `fork_choice::checkpoint_state`, the checkpoint block's post-state advanced to its epoch's first slot, not the post-state itself, which is an epoch behind when that slot was empty and may hold other effective balances, so the count recorded for a checkpoint does not depend on what was cached; a panic there reports the run unavailable. The outcome comes back as `ValidatorCustodyComputed` (`finish`). An unreadable state retries the run at the next slot. With no attached validator in the registry there is no requirement at all, not the floor of 8: a plain follower is never raised. Indices the state does not know are skipped |
+| Highest count | `Store::raise_validator_custody_count`, metadata key `validator_custody_count` | Only ever raised. Absent in an older directory, which reads as nothing recorded; `DB_VERSION` did not change |
+| Startup | `beacon::startup_custody` in the binary | Custodies and advertises the larger of `--custody-group-count` and the recorded count. The record is the validators' requirement alone, so the flag stays the operator's floor above it |
+| Runtime | `beacon::validator_custody::apply` | Raises `MetaData` v3's `custody_group_count` (and `/eth/v1/node/identity`'s copy), under a new sequence number, up to the startup count's `sampling_size`: groups the node already subscribes to, stores, requires for availability and serves. At the default count that is 8, all one attached validator requires. A requirement past it is recorded and warned about; the next start applies it |
+| History | `ethlambda_storage::CustodyRecord`, metadata keys `custodied_group_count` and `custody_since_slot` | Each start records how many groups it holds, just before its chain actor spawns, so a start that fails earlier records nothing. A start that holds more than the previous one records the slot after the highest block the directory holds (the head's or a side branch's, whose blocks carry only the old set's columns), and `Status` v2 reports the later of that and the anchor as `earliest_available_slot`, since nothing backfills the new groups' older columns. A directory with no record is taken as holding its set from the anchor |
+
+Known gaps:
+
+- **The custody set is fixed for the life of the process.** The gossip
+  subscriptions (`BeaconWire::custody_columns`), the chain actor's
+  availability check and envelope gate, the engine's `forkchoiceUpdatedV4`
+  custody columns and the Beacon API's `CustodyColumns` each hold a copy made
+  at startup, so a requirement past the startup sampling size takes a restart.
+  Advertising and custodying therefore never disagree: the runtime raise stays
+  inside the held set.
+- **The ENR's `cgc` keeps its startup value until a restart.** ethrex's
+  `DiscoveryServer` cannot replace the record it serves, the same gap as the
+  `eth2` entry at a fork boundary. A runtime raise reaches `MetaData` only,
+  which understates nothing a peer relies on: a peer reading only the record
+  asks this node for fewer columns than it holds.
+- **No backfill.** After a start that grew the set, `earliest_available_slot`
+  stays at that start's slot rather than moving back as a backfill would let it.
 
 ## Metrics
 
@@ -968,6 +1087,8 @@ as a query filter, so a `quic`-only record is invisible to it.
 | `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed` / `unsupported_fork` |
 | `lean_beacon_gossip_validation_total{kind,outcome,reason}` | Gossip verdicts, now including `beacon_aggregate_and_proof` and `beacon_attestation`; see [metrics.md](./metrics.md#beacon-gossip-validation) |
 | `lean_beacon_gossip_verdict_expired_total{kind}` | Verdicts that came too late to propagate anything; should stay at zero |
+| `lean_beacon_gossip_parked_votes_total{kind,result}` | Votes whose verdict waited for their block's post-state: `parked`, `full`, `rechecked`, `expired` |
+| `lean_beacon_gossip_parked_votes` | Votes parked right now |
 | `lean_beacon_status_digest_mismatch_total` | Peers whose `Status` moved onto another fork digest, once per move (not per refresh) |
 | `lean_beacon_fork_digest{digest}` | The digest computed at startup, as a label |
 | `lean_beacon_aggregate_decode_seconds` | Time spent decoding one aggregate off the wire |

@@ -1,8 +1,15 @@
 //! What each validator proposes with: its fee recipient, graffiti and gas limit.
 //!
 //! Every validator starts on the process-wide defaults from the command line.
-//! The keymanager API's `feerecipient`, `graffiti` and `gas_limit` endpoints
+//! The gas limit's default without `--gas-limit` depends on the epoch: the
+//! network's `GAS_LIMIT_SCHEDULE`, read off the beacon node, names one per
+//! epoch, and [`DEFAULT_GAS_LIMIT`] covers every epoch it does not. The
+//! keymanager API's `feerecipient`, `graffiti` and `gas_limit` endpoints
 //! override them per key, and `DELETE` puts a key back on the defaults.
+//!
+//! Graffiti has one source more, `--graffiti-file`, read before every
+//! proposal and ahead of the other two. [`ProposerSettings::next_graffiti`]
+//! gives the order; [`crate::graffiti_file`] the format.
 //!
 //! # The definitions file is the record; this is the cache
 //!
@@ -41,10 +48,16 @@
 //! preference a node accepted.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock};
 
-use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, H160, H256};
+use ethlambda_types::beacon::config::GasLimitSchedule;
+use ethlambda_types::beacon::primitives::{
+    BlsPubkey, Bytes32, Epoch, ExecutionAddress, H160, H256,
+};
+use tracing::{debug, info, warn};
+
+use crate::graffiti_file::{GraffitiFile, GraffitiFileError, GraffitiTable};
 
 /// A block's graffiti field is exactly this wide.
 pub const GRAFFITI_BYTES: usize = 32;
@@ -77,16 +90,16 @@ pub fn graffiti_to_text(graffiti: &Bytes32) -> String {
     String::from_utf8_lossy(&graffiti.0[..GRAFFITI_BYTES - padding]).into_owned()
 }
 
-/// The gas limit a validator with no override reports, unless `--gas-limit`
-/// names another.
+/// The gas limit of last resort: what a validator with no override reports
+/// when `--gas-limit` was not given and the network's `GAS_LIMIT_SCHEDULE`
+/// schedules nothing for the epoch (the beacon node does not serve the key,
+/// the schedule is empty, or its first entry is still ahead).
 ///
-/// Lighthouse's and Nimbus's default (Lighthouse's when the network config
-/// names no gas limit schedule, which this client does not read). Builder
-/// registrations carry it as the gas limit the builder should target, from
-/// gloas the proposer preferences carry it as the target the node's own
-/// payload is built toward too, and the keymanager API serves it as the
-/// specification requires. A network whose gas limit is elsewhere needs
-/// `--gas-limit`, or every proposal pulls its limit toward this one.
+/// Lighthouse's and Nimbus's default, and what Lighthouse falls back to when
+/// its schedule names none. Builder registrations carry the resulting gas
+/// limit as the one the builder should target, from gloas the proposer
+/// preferences carry it as the target the node's own payload is built toward
+/// too, and the keymanager API serves it as the specification requires.
 pub const DEFAULT_GAS_LIMIT: u64 = 60_000_000;
 
 /// `text` as a fee recipient: `0x` and forty hex digits, the keymanager
@@ -156,9 +169,31 @@ pub enum SettingChange {
 #[derive(Debug)]
 struct Inner {
     default_fee_recipient: Option<ExecutionAddress>,
-    default_graffiti: Bytes32,
-    default_gas_limit: u64,
+    default_graffiti: Option<Bytes32>,
+    /// `--gas-limit`, or `None` when it was not given.
+    default_gas_limit: Option<u64>,
+    /// The network's `GAS_LIMIT_SCHEDULE`, from the beacon node's
+    /// `/eth/v1/config/spec`; empty until it is fetched, or when the node does
+    /// not serve the key.
+    gas_limit_schedule: GasLimitSchedule,
     overrides: HashMap<BlsPubkey, Overrides>,
+}
+
+impl Inner {
+    /// The gas limit at `epoch` of a validator with no override of its own:
+    /// `--gas-limit`, else the one the schedule names for `epoch`, else
+    /// [`DEFAULT_GAS_LIMIT`]. Lighthouse's order.
+    fn default_gas_limit(&self, epoch: Epoch) -> u64 {
+        self.default_gas_limit
+            .or_else(|| self.gas_limit_schedule.gas_limit_at(epoch))
+            .unwrap_or(DEFAULT_GAS_LIMIT)
+    }
+
+    /// `pubkey`'s gas limit at `epoch`: its override, else the default.
+    fn gas_limit(&self, pubkey: &BlsPubkey, epoch: Epoch) -> u64 {
+        let overridden = self.overrides.get(pubkey).and_then(|o| o.gas_limit);
+        overridden.unwrap_or_else(|| self.default_gas_limit(epoch))
+    }
 }
 
 /// The defaults and every per-key override, shared by the duty loop and the
@@ -178,31 +213,71 @@ pub struct ProposerSettings {
     /// builder registrations) can tell that nothing changed without reading
     /// every key. A graffiti write leaves it alone: nothing cached reads it.
     generation: AtomicU64,
+    /// `--graffiti-file`, read ahead of every other graffiti source. Outside
+    /// the lock: it is only a path, and each read parses the file afresh.
+    graffiti_file: Option<GraffitiFile>,
+    /// Whether the last read of [`Self::graffiti_file`] failed, so a run of
+    /// failures `GET graffiti` meets is warned about once. See
+    /// [`Self::graffiti_file_table`].
+    graffiti_file_failing: AtomicBool,
 }
 
 impl ProposerSettings {
     /// Settings with no overrides, where every validator gets `graffiti` and
-    /// `fee_recipient`.
-    pub fn new(graffiti: Bytes32, fee_recipient: Option<ExecutionAddress>) -> Self {
+    /// `fee_recipient`. A `graffiti` of `None` sends none, so the beacon node
+    /// applies its own default.
+    pub fn new(
+        graffiti: impl Into<Option<Bytes32>>,
+        fee_recipient: Option<ExecutionAddress>,
+    ) -> Self {
         Self {
             inner: RwLock::new(Inner {
                 default_fee_recipient: fee_recipient,
-                default_graffiti: graffiti,
-                default_gas_limit: DEFAULT_GAS_LIMIT,
+                default_graffiti: graffiti.into(),
+                default_gas_limit: None,
+                gas_limit_schedule: GasLimitSchedule::default(),
                 overrides: HashMap::new(),
             }),
             generation: AtomicU64::new(0),
+            graffiti_file: None,
+            graffiti_file_failing: AtomicBool::new(false),
         }
     }
 
-    /// These settings with `gas_limit` as the gas limit of every validator
-    /// with no override of its own, in place of [`DEFAULT_GAS_LIMIT`].
-    pub fn with_default_gas_limit(mut self, gas_limit: u64) -> Self {
+    /// These settings with `file` read before every proposal, ahead of every
+    /// other graffiti source (see [`Self::next_graffiti`]). `None` leaves them
+    /// without one.
+    pub fn with_graffiti_file(mut self, file: Option<GraffitiFile>) -> Self {
+        self.graffiti_file = file;
+        self
+    }
+
+    /// These settings with `gas_limit` (`--gas-limit`) as the gas limit of
+    /// every validator with no override of its own, at every epoch, in place
+    /// of the schedule's and [`DEFAULT_GAS_LIMIT`]. `None` leaves those two.
+    pub fn with_default_gas_limit(mut self, gas_limit: Option<u64>) -> Self {
         self.inner
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .default_gas_limit = gas_limit;
         self
+    }
+
+    /// Take the gas limit of a validator with neither an override nor
+    /// `--gas-limit` from `schedule` (the network's `GAS_LIMIT_SCHEDULE`), at
+    /// the epoch each reader names.
+    ///
+    /// Set when the beacon node's `/eth/v1/config/spec` is in, which is after
+    /// these settings are built and before anything that signs reads them,
+    /// and again whenever the chain check takes another schedule from the
+    /// nodes, as it swaps that one in (`chain_check::check_once`). It leaves
+    /// [`Self::generation`] alone: that counts override writes, and the full
+    /// registration send each epoch compares every gas limit it signs anyway.
+    pub fn set_gas_limit_schedule(&self, schedule: GasLimitSchedule) {
+        self.inner
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .gas_limit_schedule = schedule;
     }
 
     /// A counter that moves whenever a write or delete changes a fee
@@ -244,43 +319,126 @@ impl ProposerSettings {
         })
     }
 
-    /// `pubkey`'s fee recipient and gas limit read together, under one lock, or
-    /// `None` when it has no fee recipient.
+    /// `pubkey`'s fee recipient and its gas limit at `epoch` read together,
+    /// under one lock, or `None` when it has no fee recipient.
     ///
     /// For a signed message that carries both (a builder registration, proposer
     /// preferences): two separate reads could straddle a keymanager write and
     /// pair an old address with a new gas limit, a combination the operator
     /// never configured, which the builder then keeps.
+    ///
+    /// `epoch` picks the schedule's entry when neither an override nor
+    /// `--gas-limit` names a gas limit: a preference's proposal epoch, a
+    /// registration's current one.
     pub fn fee_recipient_and_gas_limit(
         &self,
         pubkey: &BlsPubkey,
+        epoch: Epoch,
     ) -> Option<(ExecutionAddress, u64)> {
         self.read(|inner| {
-            let overrides = inner.overrides.get(pubkey);
-            let fee_recipient = overrides
+            let fee_recipient = inner
+                .overrides
+                .get(pubkey)
                 .and_then(|o| o.fee_recipient)
                 .or(inner.default_fee_recipient)?;
-            let gas_limit = overrides
-                .and_then(|o| o.gas_limit)
-                .unwrap_or(inner.default_gas_limit);
-            Some((fee_recipient, gas_limit))
+            Some((fee_recipient, inner.gas_limit(pubkey, epoch)))
         })
     }
 
-    /// The graffiti `pubkey` proposes with.
-    pub fn graffiti(&self, pubkey: &BlsPubkey) -> Bytes32 {
+    /// The graffiti `pubkey` proposes with when the graffiti file gives it
+    /// none: its own, from the keymanager API or the definitions file, else
+    /// `--graffiti`, else `None`. What a proposal sends is
+    /// [`Self::next_graffiti`], which reads the file first.
+    pub fn graffiti(&self, pubkey: &BlsPubkey) -> Option<Bytes32> {
         self.read(|inner| {
             let overridden = inner.overrides.get(pubkey).and_then(|o| o.graffiti);
-            overridden.unwrap_or(inner.default_graffiti)
+            overridden.or(inner.default_graffiti)
         })
     }
 
-    /// The gas limit `pubkey` reports.
-    pub fn gas_limit(&self, pubkey: &BlsPubkey) -> u64 {
-        self.read(|inner| {
-            let overridden = inner.overrides.get(pubkey).and_then(|o| o.gas_limit);
-            overridden.unwrap_or(inner.default_gas_limit)
+    /// The graffiti `pubkey`'s next block request carries, and what the
+    /// keymanager API's `GET graffiti` answers, so the two cannot disagree.
+    /// The first of:
+    ///
+    /// - the graffiti file's line for `pubkey`;
+    /// - the graffiti file's `default` line;
+    /// - the validator's own graffiti, from the keymanager API or the
+    ///   definitions file;
+    /// - `--graffiti`.
+    ///
+    /// Lighthouse's order, so a `default` line in the file shadows a
+    /// validator's own graffiti too. `None` when none is set: the request then
+    /// carries no graffiti, and the beacon node applies its own default. The
+    /// binary never sets both a file and `--graffiti` (its CLI refuses the
+    /// pair, as Lighthouse's does), so with a file the last source reached is
+    /// the validator's own graffiti.
+    ///
+    /// The file is read afresh on every call, off the runtime (see
+    /// [`GraffitiFile::read`]). One that cannot be read or no longer parses
+    /// is skipped with a warning, every time, since this is what a proposal
+    /// calls; the next source applies.
+    pub async fn next_graffiti(&self, pubkey: &BlsPubkey) -> Option<Bytes32> {
+        self.graffiti_through_file(pubkey, false).await
+    }
+
+    /// [`Self::next_graffiti`]'s answer, for the keymanager API's
+    /// `GET graffiti`. Only the logging differs: a failed read of the file is
+    /// warned about at the first of a run of them and logged at debug after
+    /// that, so a client polling the route does not repeat the warning every
+    /// poll.
+    pub async fn reported_graffiti(&self, pubkey: &BlsPubkey) -> Option<Bytes32> {
+        self.graffiti_through_file(pubkey, true).await
+    }
+
+    /// The order [`Self::next_graffiti`] gives. `quiet_repeats` logs a failed
+    /// read of the file at debug when the one before it failed too.
+    async fn graffiti_through_file(
+        &self,
+        pubkey: &BlsPubkey,
+        quiet_repeats: bool,
+    ) -> Option<Bytes32> {
+        let from_file = match &self.graffiti_file {
+            Some(file) => self
+                .graffiti_file_table(file.read().await, quiet_repeats)
+                .and_then(|table| table.graffiti(pubkey)),
+            None => None,
+        };
+        from_file.or_else(|| self.graffiti(pubkey))
+    }
+
+    /// One read of the graffiti file, or `None` when it failed, which is
+    /// logged at warn, or at debug for a repeat under `quiet_repeats`. The
+    /// read that ends a run of failures is logged too.
+    fn graffiti_file_table(
+        &self,
+        read: Result<GraffitiTable, GraffitiFileError>,
+        quiet_repeats: bool,
+    ) -> Option<GraffitiTable> {
+        read.inspect(|_| {
+            if self.graffiti_file_failing.swap(false, Ordering::Relaxed) {
+                info!("Graffiti file read again; its graffiti applies from now on");
+            }
         })
+        .inspect_err(|err| {
+            let repeat = self.graffiti_file_failing.swap(true, Ordering::Relaxed);
+            if repeat && quiet_repeats {
+                debug!(%err, "Graffiti file still skipped");
+            } else {
+                warn!(
+                    %err,
+                    "Graffiti file skipped; the validator's own graffiti applies, if it \
+                     has one"
+                );
+            }
+        })
+        .ok()
+    }
+
+    /// The gas limit `pubkey` targets at `epoch`: its override, else
+    /// `--gas-limit`, else the schedule's for `epoch`, else
+    /// [`DEFAULT_GAS_LIMIT`].
+    pub fn gas_limit(&self, pubkey: &BlsPubkey, epoch: Epoch) -> u64 {
+        self.read(|inner| inner.gas_limit(pubkey, epoch))
     }
 
     /// Every override `pubkey` holds, defaults left as `None`.
@@ -349,6 +507,7 @@ impl ProposerSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_types::beacon::config::GasLimitScheduleEntry;
     use ethlambda_types::beacon::primitives::H160;
 
     fn key(byte: u8) -> BlsPubkey {
@@ -363,8 +522,8 @@ mod tests {
     fn a_key_without_overrides_gets_the_defaults() {
         let settings = settings();
         assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xaa; 20])));
-        assert_eq!(settings.graffiti(&key(1)), Bytes32::repeat_byte(0x11));
-        assert_eq!(settings.gas_limit(&key(1)), DEFAULT_GAS_LIMIT);
+        assert_eq!(settings.graffiti(&key(1)), Some(Bytes32::repeat_byte(0x11)));
+        assert_eq!(settings.gas_limit(&key(1), 0), DEFAULT_GAS_LIMIT);
     }
 
     #[test]
@@ -375,12 +534,12 @@ mod tests {
         settings.set_gas_limit(&key(1), 30_000_000);
 
         assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xbb; 20])));
-        assert_eq!(settings.graffiti(&key(1)), Bytes32::repeat_byte(0x22));
-        assert_eq!(settings.gas_limit(&key(1)), 30_000_000);
+        assert_eq!(settings.graffiti(&key(1)), Some(Bytes32::repeat_byte(0x22)));
+        assert_eq!(settings.gas_limit(&key(1), 0), 30_000_000);
 
         assert_eq!(settings.fee_recipient(&key(2)), Some(H160([0xaa; 20])));
-        assert_eq!(settings.graffiti(&key(2)), Bytes32::repeat_byte(0x11));
-        assert_eq!(settings.gas_limit(&key(2)), DEFAULT_GAS_LIMIT);
+        assert_eq!(settings.graffiti(&key(2)), Some(Bytes32::repeat_byte(0x11)));
+        assert_eq!(settings.gas_limit(&key(2), 0), DEFAULT_GAS_LIMIT);
     }
 
     /// `--gas-limit` replaces the default every key without an override gets,
@@ -388,18 +547,87 @@ mod tests {
     /// clearing it falls back to the configured default, not the built-in one.
     #[test]
     fn a_configured_default_gas_limit_replaces_the_built_in_one() {
-        let settings = settings().with_default_gas_limit(200_000_000);
-        assert_eq!(settings.gas_limit(&key(1)), 200_000_000);
+        let settings = settings().with_default_gas_limit(Some(200_000_000));
+        assert_eq!(settings.gas_limit(&key(1), 0), 200_000_000);
         assert_eq!(
-            settings.fee_recipient_and_gas_limit(&key(1)),
+            settings.fee_recipient_and_gas_limit(&key(1), 0),
             Some((H160([0xaa; 20]), 200_000_000))
         );
 
         settings.set_gas_limit(&key(1), 30_000_000);
-        assert_eq!(settings.gas_limit(&key(1)), 30_000_000);
-        assert_eq!(settings.gas_limit(&key(2)), 200_000_000);
+        assert_eq!(settings.gas_limit(&key(1), 0), 30_000_000);
+        assert_eq!(settings.gas_limit(&key(2), 0), 200_000_000);
         settings.clear_gas_limit(&key(1));
-        assert_eq!(settings.gas_limit(&key(1)), 200_000_000);
+        assert_eq!(settings.gas_limit(&key(1), 0), 200_000_000);
+    }
+
+    /// Two entries, at epochs 100 and 200.
+    fn schedule() -> GasLimitSchedule {
+        vec![
+            GasLimitScheduleEntry {
+                epoch: 100,
+                gas_limit: 200_000_000,
+            },
+            GasLimitScheduleEntry {
+                epoch: 200,
+                gas_limit: 300_000_000,
+            },
+        ]
+        .into()
+    }
+
+    /// Without `--gas-limit`, the schedule names the default per epoch, and
+    /// [`DEFAULT_GAS_LIMIT`] covers the epochs before its first entry.
+    #[test]
+    fn the_schedule_names_the_default_at_each_epoch() {
+        let settings = settings();
+        settings.set_gas_limit_schedule(schedule());
+
+        assert_eq!(settings.gas_limit(&key(1), 0), DEFAULT_GAS_LIMIT);
+        assert_eq!(settings.gas_limit(&key(1), 99), DEFAULT_GAS_LIMIT);
+        assert_eq!(settings.gas_limit(&key(1), 100), 200_000_000);
+        assert_eq!(settings.gas_limit(&key(1), 199), 200_000_000);
+        assert_eq!(settings.gas_limit(&key(1), 200), 300_000_000);
+        assert_eq!(
+            settings.fee_recipient_and_gas_limit(&key(1), 150),
+            Some((H160([0xaa; 20]), 200_000_000))
+        );
+    }
+
+    /// A node that does not serve `GAS_LIMIT_SCHEDULE` leaves the schedule
+    /// empty, and every epoch gets [`DEFAULT_GAS_LIMIT`].
+    #[test]
+    fn without_a_schedule_every_epoch_gets_the_built_in_default() {
+        let settings = settings();
+        settings.set_gas_limit_schedule(GasLimitSchedule::default());
+        for epoch in [0, 100, Epoch::MAX] {
+            assert_eq!(settings.gas_limit(&key(1), epoch), DEFAULT_GAS_LIMIT);
+        }
+    }
+
+    /// The order: a key's own override, then `--gas-limit`, then the
+    /// schedule, then [`DEFAULT_GAS_LIMIT`].
+    #[test]
+    fn an_override_and_the_flag_both_win_over_the_schedule() {
+        let flagged = settings().with_default_gas_limit(Some(45_000_000));
+        flagged.set_gas_limit_schedule(schedule());
+        assert_eq!(flagged.gas_limit(&key(1), 0), 45_000_000);
+        assert_eq!(flagged.gas_limit(&key(1), 150), 45_000_000);
+        flagged.set_gas_limit(&key(1), 30_000_000);
+        assert_eq!(flagged.gas_limit(&key(1), 150), 30_000_000);
+        assert_eq!(
+            flagged.fee_recipient_and_gas_limit(&key(1), 150),
+            Some((H160([0xaa; 20]), 30_000_000))
+        );
+
+        let scheduled = settings().with_default_gas_limit(None);
+        scheduled.set_gas_limit_schedule(schedule());
+        scheduled.set_gas_limit(&key(1), 30_000_000);
+        assert_eq!(scheduled.gas_limit(&key(1), 150), 30_000_000);
+        assert_eq!(scheduled.gas_limit(&key(2), 150), 200_000_000);
+        // Clearing the override puts the key back on the schedule.
+        scheduled.clear_gas_limit(&key(1));
+        assert_eq!(scheduled.gas_limit(&key(1), 150), 200_000_000);
     }
 
     /// The pair a signed registration or preference carries agrees with the
@@ -407,19 +635,19 @@ mod tests {
     #[test]
     fn the_fee_recipient_and_gas_limit_read_together_match_the_single_reads() {
         let settings = ProposerSettings::new(Bytes32::ZERO, None);
-        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1)), None);
+        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1), 0), None);
 
         settings.set_gas_limit(&key(1), 30_000_000);
-        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1)), None);
+        assert_eq!(settings.fee_recipient_and_gas_limit(&key(1), 0), None);
         settings.set_fee_recipient(&key(1), H160([0xbb; 20]));
         assert_eq!(
-            settings.fee_recipient_and_gas_limit(&key(1)),
+            settings.fee_recipient_and_gas_limit(&key(1), 0),
             Some((H160([0xbb; 20]), 30_000_000))
         );
 
         let defaults = self::settings();
         assert_eq!(
-            defaults.fee_recipient_and_gas_limit(&key(2)),
+            defaults.fee_recipient_and_gas_limit(&key(2), 0),
             Some((H160([0xaa; 20]), DEFAULT_GAS_LIMIT))
         );
     }
@@ -433,7 +661,7 @@ mod tests {
 
         settings.clear_fee_recipient(&key(1));
         assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xaa; 20])));
-        assert_eq!(settings.graffiti(&key(1)), Bytes32::repeat_byte(0x22));
+        assert_eq!(settings.graffiti(&key(1)), Some(Bytes32::repeat_byte(0x22)));
     }
 
     /// A per-key address counts even with no process-wide default: it is how
@@ -455,8 +683,8 @@ mod tests {
 
         settings.forget(&key(1));
         assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xaa; 20])));
-        assert_eq!(settings.graffiti(&key(1)), Bytes32::repeat_byte(0x11));
-        assert_eq!(settings.gas_limit(&key(1)), DEFAULT_GAS_LIMIT);
+        assert_eq!(settings.graffiti(&key(1)), Some(Bytes32::repeat_byte(0x11)));
+        assert_eq!(settings.gas_limit(&key(1), 0), DEFAULT_GAS_LIMIT);
     }
 
     #[test]
@@ -491,7 +719,7 @@ mod tests {
         );
         assert_eq!(settings.fee_recipient(&key(1)), Some(H160([0xbb; 20])));
         assert_eq!(
-            settings.gas_limit(&key(1)),
+            settings.gas_limit(&key(1), 0),
             DEFAULT_GAS_LIMIT,
             "an override the seed does not carry is gone"
         );
@@ -552,5 +780,102 @@ mod tests {
         settings.set_graffiti(&key(2), Bytes32::repeat_byte(0x22));
         assert!(!moved(&settings, &|s| s.forget(&key(2))));
         assert!(!moved(&settings, &|s| s.forget(&key(3))));
+    }
+
+    fn text(graffiti: &str) -> Option<Bytes32> {
+        Some(graffiti_from_text(graffiti).expect("fits"))
+    }
+
+    /// A graffiti file at a fresh path holding `contents`, with the directory
+    /// that keeps it alive. Read with a timeout a loaded runner cannot reach,
+    /// so a slow read is not skipped for the next source.
+    fn graffiti_file(contents: &str) -> (tempfile::TempDir, std::path::PathBuf, GraffitiFile) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("graffiti.txt");
+        std::fs::write(&path, contents).expect("writes");
+        let file = GraffitiFile::open(&path)
+            .expect("opens")
+            .with_read_timeout(crate::graffiti_file::PATIENT_READ_TIMEOUT);
+        (dir, path, file)
+    }
+
+    fn line(byte: u8, graffiti: &str) -> String {
+        format!("0x{}: {graffiti}\n", hex::encode(key(byte).0))
+    }
+
+    /// The file's line for the key, then its `default` line, then the
+    /// validator's own graffiti, then `--graffiti`: Lighthouse's order, a
+    /// `default` line shadowing a validator's own graffiti included.
+    #[tokio::test]
+    async fn the_file_comes_first_then_the_validators_own_then_the_flag() {
+        let contents = format!("default: wall\n{}", line(1, "from the file"));
+        let (_dir, path, file) = graffiti_file(&contents);
+        let settings = ProposerSettings::new(text("flag"), None).with_graffiti_file(Some(file));
+        settings.set_graffiti(&key(1), Bytes32::repeat_byte(0x22));
+        settings.set_graffiti(&key(2), Bytes32::repeat_byte(0x33));
+
+        assert_eq!(settings.next_graffiti(&key(1)).await, text("from the file"));
+        assert_eq!(settings.next_graffiti(&key(2)).await, text("wall"));
+        assert_eq!(settings.next_graffiti(&key(3)).await, text("wall"));
+
+        // Without a `default` line, a key the file does not name falls
+        // through to its own graffiti, then to the flag.
+        std::fs::write(&path, line(1, "from the file")).expect("rewrites");
+        assert_eq!(settings.next_graffiti(&key(1)).await, text("from the file"));
+        assert_eq!(
+            settings.next_graffiti(&key(2)).await,
+            Some(Bytes32::repeat_byte(0x33))
+        );
+        assert_eq!(settings.next_graffiti(&key(3)).await, text("flag"));
+
+        // A line deleted from the file stops applying at the next read.
+        std::fs::write(&path, "").expect("empties");
+        assert_eq!(
+            settings.next_graffiti(&key(1)).await,
+            Some(Bytes32::repeat_byte(0x22))
+        );
+    }
+
+    /// A file that stopped parsing, or is gone, is skipped: the next source
+    /// applies as if there were no file.
+    #[tokio::test]
+    async fn an_unreadable_file_falls_back_to_the_validators_own_then_the_flag() {
+        let (_dir, path, file) = graffiti_file(&format!("default: wall\n{}", line(1, "mine")));
+        let settings = ProposerSettings::new(text("flag"), None).with_graffiti_file(Some(file));
+        settings.set_graffiti(&key(1), Bytes32::repeat_byte(0x22));
+
+        std::fs::write(&path, "default: wall\nnot a line\n").expect("breaks");
+        assert_eq!(
+            settings.next_graffiti(&key(1)).await,
+            Some(Bytes32::repeat_byte(0x22))
+        );
+        assert_eq!(settings.next_graffiti(&key(2)).await, text("flag"));
+
+        std::fs::remove_file(&path).expect("removes");
+        assert_eq!(
+            settings.next_graffiti(&key(1)).await,
+            Some(Bytes32::repeat_byte(0x22))
+        );
+        assert_eq!(settings.next_graffiti(&key(2)).await, text("flag"));
+    }
+
+    /// With no graffiti anywhere there is none to send, rather than 32 zero
+    /// bytes the beacon node cannot tell from a chosen empty graffiti.
+    #[tokio::test]
+    async fn with_nothing_set_there_is_no_graffiti() {
+        let settings = ProposerSettings::new(None, None);
+        assert_eq!(settings.graffiti(&key(1)), None);
+        assert_eq!(settings.next_graffiti(&key(1)).await, None);
+
+        let (_dir, _path, file) = graffiti_file(&line(2, "only two"));
+        let settings = ProposerSettings::new(None, None).with_graffiti_file(Some(file));
+        assert_eq!(settings.next_graffiti(&key(1)).await, None);
+        assert_eq!(settings.next_graffiti(&key(2)).await, text("only two"));
+
+        let chosen_empty = ProposerSettings::new(text(""), None);
+        assert_eq!(
+            chosen_empty.next_graffiti(&key(1)).await,
+            Some(Bytes32::ZERO)
+        );
     }
 }
