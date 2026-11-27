@@ -191,7 +191,9 @@ proofs through one of two backends, chosen once per process:
 - **What it costs on a running node.** The node's `/metrics` times every
   committee proof, block-proof merge and proof verification, and when in the
   slot attestations and aggregates arrive: see
-  [metrics.md](./metrics.md#pq-aggregation-timing).
+  [metrics.md](./metrics.md#pq-aggregation-timing). `--pq-timing-output`
+  records the same as events, in the format the PQ devnets' clients share:
+  see [pq_timing.md](./pq_timing.md).
 
 pq-devnet-0 ran the prover as a separate `leanvm-sidecar` (bindings v0.15.0),
 which the image built and its `ethlambda-pq` supervisor started and

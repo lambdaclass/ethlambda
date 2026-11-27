@@ -724,7 +724,7 @@ pub(crate) fn next_payload(
 
 /// How far into a slot the next slot's attributes are first published: a
 /// third of a slot before it ends, Lighthouse's default lookahead.
-pub(crate) fn lookahead_start(slot_duration_ms: u64) -> Duration {
+pub fn lookahead_start(slot_duration_ms: u64) -> Duration {
     Duration::from_millis(slot_duration_ms - slot_duration_ms / 3)
 }
 

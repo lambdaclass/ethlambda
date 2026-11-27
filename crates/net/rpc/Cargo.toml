@@ -20,6 +20,7 @@ ethlambda-blockchain.workspace = true
 ethlambda-engine.workspace = true
 ethlambda-fork-choice.workspace = true
 ethlambda-metrics.workspace = true
+ethlambda-telemetry.workspace = true
 ethlambda-network-api.workspace = true
 ethlambda-state-transition.workspace = true
 ethlambda-storage.workspace = true
@@ -44,6 +45,9 @@ rayon.workspace = true
 ethlambda-validator = { workspace = true, features = ["test-utils"] }
 spawned-concurrency.workspace = true
 ethlambda-state-transition = { workspace = true, features = ["test-utils"] }
+# `test-utils` for `pq_timing::testing`: the PQ timing events the seat prover
+# emits, captured in memory.
+ethlambda-telemetry = { workspace = true, features = ["test-utils"] }
 ethlambda-types.workspace = true
 libssz-types.workspace = true
 tower = { version = "0.5", features = ["util"] }

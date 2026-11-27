@@ -7,6 +7,7 @@
 
 mod event;
 mod metrics;
+pub mod pq_timing;
 mod writer;
 
 use std::sync::{Arc, Mutex, OnceLock};

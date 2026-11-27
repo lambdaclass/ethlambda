@@ -34,6 +34,7 @@ use ethlambda_storage::{
     Store,
     pools::{CommitteeSignatures, PooledPqAggregate},
 };
+use ethlambda_telemetry::pq_timing;
 use ethlambda_types::beacon::{
     config::Config,
     constants::AGGREGATORS_PER_COMMITTEE,
@@ -132,9 +133,26 @@ async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
         let state_ms = started.elapsed().as_millis() as u64;
         let mut groups = store.pq_signature_pool().collected(slot, &committees);
         let committees = groups.len();
+        // The timing export's job for one committee of this seat: wanted
+        // since the seat's cutoff, when this pass was spawned.
+        let seat_job = || pq_timing::job(pq_timing::Work::Committee, slot, slot, spawned);
+        let seat_fields = |committee: u64, signatures: usize| {
+            pq_timing::json!({
+                "committee": committee,
+                "aggregator_position": position,
+                "signatures": signatures,
+            })
+        };
         // What an earlier seat of this node already proved in full is not
         // proved again: see `PqSignaturePool::is_proven`.
-        groups.retain(|group| !store.pq_signature_pool().is_proven(group));
+        groups.retain(|group| {
+            let proven = store.pq_signature_pool().is_proven(group);
+            if proven {
+                let fields = || seat_fields(group.committee_index, group.signatures.len());
+                seat_job().outcome("already_proven", fields);
+            }
+            !proven
+        });
         let already_proven = committees - groups.len();
         let signatures: usize = groups.iter().map(|group| group.signatures.len()).sum();
         // The larger groups first, in case not every one fits before the
@@ -142,15 +160,18 @@ async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
         groups.sort_by_key(|group| std::cmp::Reverse(group.signatures.len()));
         let (mut proved, mut failed, mut late) = (0usize, 0usize, 0usize);
         let mut prove_ms_total = 0u64;
-        for group in groups {
-            if Instant::now() >= deadline {
-                warn!(%slot, position, "The PQ aggregate deadline passed with committees left to prove");
-                break;
-            }
+        let mut groups = groups.into_iter().peekable();
+        while let Some(group) = groups.next_if(|_| Instant::now() < deadline) {
             let committee = group.committee_index;
             let collected = group.signatures.len();
             let committee_started = Instant::now();
-            let result = prove_committee(&store, &state, group);
+            let job = seat_job();
+            let timing = SeatTiming {
+                job: &job,
+                position,
+                deadline,
+            };
+            let result = prove_committee(&store, &state, group, &timing);
             let took_ms = committee_started.elapsed().as_millis() as u64;
             let on_time = Instant::now() < deadline;
             // Every proof made, late ones too: a late one is what the seat's
@@ -179,6 +200,13 @@ async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
                         took_ms,
                         "Proved a PQ aggregate"
                     );
+                    job.ready(|| {
+                        let mut fields = seat_fields(committee, collected);
+                        fields["claims"] = pq_timing::json!(aggregate.attesting_indices.len());
+                        fields["proof_id"] =
+                            pq_timing::json!(pq_timing::proof_id(&aggregate.proof));
+                        fields
+                    });
                     store.pq_aggregate_pool().insert((*aggregate).clone());
                     store.pq_signature_pool().insert_proven(aggregate);
                 }
@@ -210,6 +238,14 @@ async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
                     );
                 }
             }
+        }
+        // Whatever the deadline, or a proof that ran past it, left unproved.
+        if groups.peek().is_some() {
+            warn!(%slot, position, "The PQ aggregate deadline passed with committees left to prove");
+        }
+        for group in groups {
+            let fields = || seat_fields(group.committee_index, group.signatures.len());
+            seat_job().outcome("unproved", fields);
         }
         let unproved = committees - already_proven - proved - failed - late;
         let outcomes = [
@@ -251,11 +287,13 @@ async fn prove_seat(store: &Store, config: &Config, slot: Slot, position: u64) {
 /// `get_attestation_statements` lists their keys in.
 ///
 /// Also returns how long the proof itself took: the rest of the call is
-/// reading the committee and assembling the statements.
+/// reading the committee and assembling the statements. `timing` is told
+/// when the prover is called and when it returns.
 fn prove_committee(
     store: &Store,
     state: &BeaconState,
     group: CommitteeSignatures,
+    timing: &SeatTiming<'_>,
 ) -> Result<(Arc<PooledPqAggregate>, Duration), String> {
     let committees = store.committee_cache();
     let epoch_committees = committees.committees(state, group.data.target.epoch);
@@ -288,13 +326,30 @@ fn prove_committee(
     };
     let statements = get_attestation_statements(state, &attestation, &committees)
         .map_err(|err| err.to_string())?;
+    let timing_fields = {
+        let (committee_size, signatures) = (committee.len(), signatures.len());
+        move || {
+            pq_timing::json!({
+                "committee": group.committee_index,
+                "aggregator_position": timing.position,
+                "signatures": signatures,
+                "committee_size": committee_size,
+            })
+        }
+    };
+    timing.job.started(timing_fields);
     let proving = Instant::now();
     let proof = ethlambda_state_transition::beacon::helpers::pq::prove_aggregates(
         &statements,
         &[signatures],
     )
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| err.to_string());
     let proving = proving.elapsed();
+    let late = Instant::now() >= timing.deadline;
+    timing
+        .job
+        .finished(proving, late, proof.as_deref().ok(), timing_fields);
+    let proof = proof?;
     attesting_indices.sort_unstable();
     let aggregate = Arc::new(PooledPqAggregate {
         attestation,
@@ -305,6 +360,15 @@ fn prove_committee(
             .map_err(|_| "the proof exceeds MAX_STARK_PROOF_SIZE".to_string())?,
     });
     Ok((aggregate, proving))
+}
+
+/// What [`prove_committee`] reports its proof to the timing export with.
+struct SeatTiming<'a> {
+    job: &'a pq_timing::Job,
+    /// The aggregator's seat.
+    position: u64,
+    /// The seat's broadcast time: a proof finished after it is late.
+    deadline: Instant,
 }
 
 fn now_ms() -> u64 {
@@ -352,6 +416,10 @@ mod tests {
     /// position, and each committee it was due to prove under its outcome.
     /// The next seat, with nothing new to prove, counts the committee as
     /// already proven and times nothing.
+    ///
+    /// The timing export gets the same story as events: the proof started,
+    /// finished and ready for seat 0's job, and the committee already proven
+    /// for seat 1's.
     #[tokio::test]
     async fn a_seats_proving_pass_is_timed_and_counted() {
         let mut state = with_validators_at(ForkName::Pq, 256);
@@ -417,6 +485,9 @@ mod tests {
         };
         let signatures_before =
             series_value("lean_beacon_pq_committee_proof_signatures_sum").unwrap_or(0.0);
+        // Nothing else in this crate's tests proves a seat, so every work
+        // event captured is this test's.
+        let capture = pq_timing::testing::capture();
 
         prove_seat(&store, &config, slot, 0).await;
         assert_eq!(store.pq_aggregate_pool().candidates(slot).len(), 1);
@@ -442,6 +513,47 @@ mod tests {
         assert_eq!(count("already_proven", 1), 1.0);
         assert_eq!(count("proved", 1), 0.0);
         assert_eq!(timed(1), 0.0);
+
+        let events = capture.events();
+        let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "proof_started",
+                "proof_finished",
+                "candidate_ready",
+                "job_outcome"
+            ]
+        );
+        for event in &events {
+            assert_eq!(event["work"], "committee");
+            assert_eq!(event["origin"], "production");
+            assert_eq!(event["slot"], slot);
+            assert_eq!(event["reference_slot"], slot);
+            assert_eq!(event["sequence_id"], format!("production:{slot}"));
+            assert_eq!(event["committee"], committee);
+            assert_eq!(event["signatures"], members.len());
+        }
+        let (started, finished, ready, already) = (&events[0], &events[1], &events[2], &events[3]);
+        for event in [started, finished, ready] {
+            assert_eq!(event["job_id"], started["job_id"]);
+            assert_eq!(event["aggregator_position"], 0);
+        }
+        assert_eq!(started["committee_size"], members.len());
+        assert!(started["queue_wait_ns"].is_u64());
+        assert_eq!(finished["outcome"], "success");
+        assert_eq!(finished["late"], false);
+        let proof = store.pq_aggregate_pool().candidates(slot)[0].proof.clone();
+        assert_eq!(finished["proof_bytes"], proof.len());
+        assert_eq!(finished["proof_id"], pq_timing::proof_id(&proof));
+        assert!(finished["backend_duration_ns"].is_u64());
+        assert_eq!(ready["outcome"], "ready");
+        assert_eq!(ready["proof_id"], finished["proof_id"]);
+        assert_eq!(ready["claims"], members.len());
+        // Seat 1 made no proof: its own job says why.
+        assert_eq!(already["outcome"], "already_proven");
+        assert_eq!(already["aggregator_position"], 1);
+        assert_ne!(already["job_id"], started["job_id"]);
     }
 
     #[test]

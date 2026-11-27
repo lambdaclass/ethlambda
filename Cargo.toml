@@ -88,6 +88,9 @@ thiserror = "2.0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.117"
 serde_yaml_ng = "0.10"
+# The PQ timing export's chunks (`ethlambda-telemetry`). `zstd-sys` is already
+# built for RocksDB; this adds the two safe wrappers over it.
+zstd = "0.13"
 hex = "0.4"
 hmac = "0.12"
 base64 = "0.22"

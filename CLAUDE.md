@@ -671,6 +671,16 @@ recomputation), and p2p's column rows: `column_checks::column_rows` (after the c
 `passed_rows` called directly by the gossip-accept path and by this node's own fulu columns. See
 [`docs/telemetry.md`](docs/telemetry.md).
 
+The same crate holds the **PQ timing export** (`ethlambda_telemetry::pq_timing`,
+`--pq-timing-output`): PQ vote receipts and verdicts and every attestation proof, as JSON-lines
+events in a run directory, in the schema the PQ devnets' clients share (Lighthouse's
+`scripts/pq-measurement`, 1). Another global sink, installed in `run_node` after leanVM and closed
+in `wait_for_shutdown`; its emitters (`message_received`, `validated`, `Job`, `proposal_snapshot`)
+build nothing when it is off. The emit sites are p2p's `beacon::pq::triage` and `verdict::report`,
+rpc's seat prover and `pq_proposal`, and `pq_attestation_packing`. Tests of an emit site capture
+the events in memory (`pq_timing::testing::capture`, behind the crate's `test-utils` feature); the
+session is the process's, so one capture runs at a time. See [`docs/pq_timing.md`](docs/pq_timing.md).
+
 ## Beacon Chain types (`crates/common/types/src/beacon/`)
 
 `ethlambda-types` carries the **Ethereum Beacon Chain** containers (phase0

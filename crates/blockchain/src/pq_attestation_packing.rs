@@ -54,6 +54,7 @@ use ethlambda_state_transition::beacon::fork_choice::get_attestation_due_ms;
 use ethlambda_state_transition::beacon::pq_block_production::{PqPacked, select_pq_attestations};
 use ethlambda_storage::Store;
 use ethlambda_storage::pools::PooledPqAggregate;
+use ethlambda_telemetry::pq_timing;
 use ethlambda_types::ShortRoot;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::{BeaconState, pq};
@@ -146,6 +147,16 @@ impl PermitWait<'_> {
             Self::Wait { .. } => "ahead",
         }
     }
+
+    /// What the timing export calls this packing's merge: the first round
+    /// ahead of the slot, the second at production, which runs only when the
+    /// first cannot be used.
+    fn work(self) -> pq_timing::Work {
+        match self {
+            Self::TryOnce => pq_timing::Work::Improvement,
+            Self::Wait { .. } => pq_timing::Work::Initial,
+        }
+    }
 }
 
 /// The pool's candidates for a block at `slot`: aggregates from
@@ -191,16 +202,29 @@ pub async fn pack_attestations(
     if packed.attestations.is_empty() {
         return PackedAttestations::new(Vec::new(), Vec::new(), true, candidates);
     }
+    // The timing export's job for this packing: its votes are of the newest
+    // slot a block at `slot` may include.
+    let reference_slot = slot.saturating_sub(MIN_ATTESTATION_INCLUSION_DELAY_PQ);
+    let job = pq_timing::job(permit_wait.work(), slot, reference_slot, Instant::now());
     // One child's proof is the block's as it is; more must be merged.
     let fallback = packed.first_unmerged();
     if packed.children.len() == 1 {
-        return unmerged(slot, packed, true, candidates);
+        let packed = unmerged(slot, packed, true, candidates);
+        if packed.complete {
+            job.ready(|| ready_fields(&packed, false));
+        }
+        return packed;
     }
     let children = packed.children.len();
     let phase = permit_wait.phase();
     // `outcome` is the merge's, as `metrics::inc_pq_merges` counts it.
     let fall_back = |outcome: &str, reason: &str| {
         metrics::inc_pq_merges(phase, outcome);
+        // A failed or late merge has its own `proof_finished` event.
+        if outcome == "skipped" {
+            let fields = || pq_timing::json!({"reason": reason, "input_proof_count": children});
+            job.outcome("skipped", fields);
+        }
         warn!(%slot, children, reason, "Packing one PQ attestation instead of merging every proof");
         match fallback.clone() {
             Some(single) => unmerged(slot, single, false, candidates.clone()),
@@ -224,20 +248,32 @@ pub async fn pack_attestations(
         return fall_back("skipped", "no time left to merge");
     };
     let budget_ms = remaining.as_millis() as u64;
-    let job = tokio::task::spawn_blocking(move || {
+    let merging = job.clone();
+    let merge = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let started = Instant::now();
-        let proof = packed.merge().map_err(|err| err.to_string());
-        let took = started.elapsed();
-        // Recorded and logged when it ends, deadline or not: what a merge
-        // costs here, how big it was and how much of the budget it used.
-        metrics::observe_pq_merge(phase, took, children, proof.as_ref().ok().map(Vec::len));
         let signatures: usize = packed
             .children
             .iter()
             .flat_map(|(statements, _)| statements)
             .map(|statement| statement.pubkeys.len())
             .sum();
+        let records = packed.attestations.len();
+        let timing_fields = move || {
+            pq_timing::json!({
+                "input_proof_count": children,
+                "records": records,
+                "claims": signatures,
+            })
+        };
+        merging.started(timing_fields);
+        let started = Instant::now();
+        let proof = packed.merge().map_err(|err| err.to_string());
+        let took = started.elapsed();
+        // Recorded and logged when it ends, deadline or not: what a merge
+        // costs here, how big it was and how much of the budget it used.
+        metrics::observe_pq_merge(phase, took, children, proof.as_ref().ok().map(Vec::len));
+        let late = took >= remaining;
+        merging.finished(took, late, proof.as_deref().ok(), timing_fields);
         info!(
             %slot,
             attestations = packed.attestations.len(),
@@ -251,7 +287,7 @@ pub async fn pack_attestations(
         );
         proof.map(|proof| (packed, proof))
     });
-    match tokio::time::timeout(remaining, job).await {
+    match tokio::time::timeout(remaining, merge).await {
         Ok(Ok(Ok((packed, proof)))) => {
             metrics::inc_pq_merges(phase, "merged");
             info!(
@@ -261,7 +297,9 @@ pub async fn pack_attestations(
                 proof_bytes = proof.len(),
                 "Packed PQ attestations"
             );
-            PackedAttestations::new(packed.attestations, proof, true, candidates)
+            let packed = PackedAttestations::new(packed.attestations, proof, true, candidates);
+            job.ready(|| ready_fields(&packed, true));
+            packed
         }
         Ok(Ok(Err(err))) => fall_back("failed", &format!("the merge failed: {err}")),
         Ok(Err(err)) => fall_back("failed", &format!("the merge task failed: {err}")),
@@ -270,6 +308,18 @@ pub async fn pack_attestations(
             &format!("the merge missed its {} ms budget", remaining.as_millis()),
         ),
     }
+}
+
+/// What a `candidate_ready` event says of a complete packing: the proof the
+/// block would carry, how many attestations it covers, and whether leanVM
+/// was called for it (`merged`) or one child's proof is the block's as it is.
+fn ready_fields(packed: &PackedAttestations, merged: bool) -> pq_timing::Value {
+    pq_timing::json!({
+        "proof_id": pq_timing::proof_id(&packed.proof),
+        "records": packed.attestations.len(),
+        "recursive_depth": u64::from(merged),
+        "backend_call": merged,
+    })
 }
 
 /// Why [`merge_permit`] gave no permit.
@@ -768,7 +818,8 @@ mod tests {
 
     /// A packing with two proofs to merge and no time left for it packs
     /// without them, and `/metrics` counts the merge as skipped under the
-    /// packing's phase: ahead of the slot, or at production.
+    /// packing's phase: ahead of the slot, or at production. The timing
+    /// export gets a job outcome for each, as the round it would have been.
     #[tokio::test]
     async fn a_merge_with_no_time_left_is_counted_as_skipped_by_phase() {
         use ethlambda_metrics::series_value;
@@ -820,12 +871,30 @@ mod tests {
                 },
             ),
         ];
+        // Nothing else in this crate's tests packs, so every event captured
+        // is this test's.
+        let capture = pq_timing::testing::capture();
         for (phase, wait) in waits {
             let before = skipped(phase);
             let packed = pack_attestations(&store, &state, &config, wait).await;
             assert!(!packed.complete, "{phase}");
             assert!(packed.proof.is_empty(), "{phase}");
             assert_eq!(skipped(phase) - before, 1.0, "{phase}");
+        }
+
+        let events = capture.events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        let slot = state.slot();
+        for (event, (work, round)) in events.iter().zip([("improvement", 2), ("initial", 1)]) {
+            assert_eq!(event["kind"], "job_outcome");
+            assert_eq!(event["outcome"], "skipped");
+            assert_eq!(event["work"], work);
+            assert_eq!(event["round"], round);
+            assert_eq!(event["slot"], slot);
+            assert_eq!(event["reference_slot"], data_slot);
+            assert_eq!(event["sequence_id"], format!("production:{slot}"));
+            assert_eq!(event["input_proof_count"], 2);
+            assert_eq!(event["reason"], "no time left to merge");
         }
     }
 

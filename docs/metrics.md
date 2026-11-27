@@ -921,6 +921,7 @@ once the node has done the work they measure, and lean nodes never emit them.
 | `lean_beacon_pq_merges_total` | Counter | Packings with several proofs to merge, by what became of the merge | Once per such packing | phase=ahead,production, outcome=merged,failed,late,skipped | |
 | `lean_beacon_pq_proof_verification_seconds` | Histogram | Time to verify one attestation proof | On each aggregate that reached the proof check, and each block with attestations whose transition ran | kind=aggregate,block | 0.001, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2 |
 | `lean_beacon_pq_gossip_arrival_offset_seconds` | Histogram | How far into its vote's slot an attestation or aggregate arrived on gossip | On each one decoded, before any rule judges it | kind=beacon_attestation,beacon_aggregate_and_proof | 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 4.8, 6, 7.2, 7.5, 7.8, 8.1, 8.4, 8.7, 9, 9.5, 10, 12, 24 |
+| `lean_beacon_pq_timing_dropped_events_total` | Counter | Events the PQ timing export dropped because its queue was full | On each such event, only with `--pq-timing-output` | class=receipt,validation,work,status | |
 
 **Committee proofs.** `position` is the aggregator's seat in its committee's
 aggregation committee. Seat `p` stops collecting at 40% + `p` × 5% of the slot
@@ -963,6 +964,11 @@ reads over 12 s. It covers every attestation and aggregate that decodes,
 whatever validation then makes of it, and none of this node's own: gossip
 never hands a node its messages back. The time from arrival to verdict is
 `lean_beacon_gossip_validation_seconds`, under the same `kind` values.
+
+**The export.** `--pq-timing-output` writes each of these as an event rather
+than a sample (see [pq_timing.md](./pq_timing.md)).
+`lean_beacon_pq_timing_dropped_events_total` rising means its writer is not
+keeping up and the run has gaps, which its `run.json` counts too.
 
 ---
 

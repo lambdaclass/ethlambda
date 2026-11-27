@@ -25,6 +25,7 @@
 - [HTTP API](./rpc.md)
 - [Metrics](./metrics.md)
 - [Block telemetry (ClickHouse)](./telemetry.md)
+- [PQ timing export](./pq_timing.md)
 - [Checkpoint Sync](./checkpoint_sync.md)
 - [Fork Choice Visualization](./fork_choice_visualization.md)
 - [Data Storage](./data_storage.md)

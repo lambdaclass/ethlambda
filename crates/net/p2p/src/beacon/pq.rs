@@ -11,7 +11,7 @@
 //! (queued ones too, as for gloas). Blocks and data column sidecars take the
 //! shared path.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use std::time::Instant as StdInstant;
 
@@ -20,15 +20,16 @@ use ethlambda_state_transition::beacon::builder_market::SharedPqBuilderMarket;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::pq::get_committee_indices;
 use ethlambda_storage::{Store, pools::PooledPqAggregate};
+use ethlambda_telemetry::pq_timing;
 use ethlambda_types::beacon::containers::{SignedExecutionPayloadEnvelope, pq};
-use ethlambda_types::beacon::primitives::{Slot, ValidatorIndex};
+use ethlambda_types::beacon::primitives::{HashTreeRoot as _, Slot, ValidatorIndex};
 use ethlambda_types::chain_config::ChainConfig;
 use ethlambda_types::time::unix_now_ms;
 use tracing::{debug, trace, warn};
 
 use crate::beacon::decode::{self as beacon_decode, PqGossip};
 use crate::beacon::topics as beacon_topics;
-use crate::beacon::verdict::{Dispatch, Validated};
+use crate::beacon::verdict::{Dispatch, GossipId, Validated};
 use crate::{P2PServer, metrics};
 
 /// A PQ message whose stateful checks run on a blocking thread. The one
@@ -254,12 +255,16 @@ fn pool_aggregate(
 /// every topic of a fork this node does not follow: its containers are
 /// modelled from a moving specification branch, and a peer must not be
 /// scored down for this build's gap.
+///
+/// A vote that decodes is noted in `id` when the timing export recorded its
+/// receipt, for the verdict's own event.
 pub(crate) fn triage(
     server: &P2PServer,
     kind: &str,
     payload: &[u8],
-    received_at: Instant,
+    id: &mut GossipId,
 ) -> Option<Dispatch> {
+    let received_at = id.received_at;
     if !beacon_decode::is_pq_reshaped(kind) {
         return None;
     }
@@ -294,6 +299,7 @@ pub(crate) fn triage(
         let arrived_ms = now_ms.saturating_sub(received_at.elapsed().as_millis() as u64);
         let offset = arrival_offset(&store.config().time_grid(), slot, arrived_ms);
         metrics::observe_pq_gossip_arrival_offset(metric_kind, offset);
+        id.pq_vote = record_receipt(&decoded, kind, payload.len(), id);
     }
     let cheap = match &decoded {
         PqGossip::Aggregate(signed) => {
@@ -360,6 +366,47 @@ pub(crate) fn triage(
         PqGossip::Envelope(envelope) => PqValidated::Envelope(envelope),
     };
     Some(Dispatch::Validate(Validated::Pq(Box::new(object))))
+}
+
+/// Record a decoded vote's receipt in the timing export, if one is being
+/// written. `None` otherwise, or for a message that is not a vote.
+fn record_receipt(
+    decoded: &PqGossip,
+    kind: &str,
+    message_bytes: usize,
+    id: &GossipId,
+) -> Option<pq_timing::Vote> {
+    let message_id = id.message_id.0.as_slice();
+    match decoded {
+        PqGossip::Attestation(attestation) => {
+            pq_timing::message_received(id.received_at, || pq_timing::Receipt {
+                kind: pq_timing::MessageKind::Individual,
+                message_id,
+                slot: attestation.data.slot,
+                committee: Some(attestation.committee_index),
+                subnet: beacon_topics::attestation_subnet(kind),
+                message_bytes,
+                signer_count: 1,
+                vote_data_root: attestation.data.hash_tree_root().0,
+            })
+        }
+        PqGossip::Aggregate(signed) => pq_timing::message_received(id.received_at, || {
+            let aggregate = &signed.message.aggregate;
+            let bits = gossip::pq::aggregation_bits(signed);
+            pq_timing::Receipt {
+                kind: pq_timing::MessageKind::Aggregate,
+                message_id,
+                slot: aggregate.data.slot,
+                // The one committee it names, when it names one.
+                committee: gossip::pq::aggregate_key(signed).map(|key| key.committee_index),
+                subnet: None,
+                message_bytes,
+                signer_count: bits.iter().filter(|&&bit| bit).count(),
+                vote_data_root: aggregate.data.hash_tree_root().0,
+            }
+        }),
+        _ => None,
+    }
 }
 
 /// How far into `slot` the wall clock read `arrived_ms`. Zero for a message
@@ -488,6 +535,8 @@ mod tests {
     use ethlambda_types::beacon::fork::ForkName;
     use libssz::SszEncode as _;
 
+    use std::time::Instant;
+
     use super::*;
     use crate::test_support::unconnected_beacon_server;
 
@@ -498,8 +547,30 @@ mod tests {
             .with_fork_epoch(ForkName::Pq, 0)
     }
 
+    fn gossip_id(byte: u8, kind: &'static str) -> GossipId {
+        GossipId {
+            message_id: libp2p::gossipsub::MessageId::new(&[byte; 20]),
+            propagation_source: libp2p::PeerId::random(),
+            received_at: Instant::now(),
+            kind,
+            pq_vote: None,
+        }
+    }
+
+    /// The tests that triage votes run one at a time: each reads what this
+    /// module recorded for votes, in the metrics or the timing export, and
+    /// counts on the others not adding to it meanwhile. Taken after the
+    /// server is built, so it is never held across an `await`.
+    fn one_vote_test_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        static VOTE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        VOTE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn triage_now(server: &P2PServer, kind: &str, payload: &[u8]) -> Option<Dispatch> {
-        triage(server, kind, payload, Instant::now())
+        let metric_kind = beacon_topics::metric_kind(kind).expect("a beacon topic");
+        triage(server, kind, payload, &mut gossip_id(0, metric_kind))
     }
 
     /// A vote's arrival is measured from the start of its own slot, not the
@@ -540,6 +611,7 @@ mod tests {
     #[tokio::test]
     async fn a_decoded_votes_arrival_is_recorded_under_its_topic_kind() {
         let server = unconnected_beacon_server(config(), 0).await;
+        let _votes = one_vote_test_at_a_time();
         let arrivals = |kind: &str| {
             let series =
                 format!(r#"lean_beacon_pq_gossip_arrival_offset_seconds_count{{kind="{kind}"}}"#);
@@ -589,6 +661,124 @@ mod tests {
             arrivals(beacon_topics::BEACON_AGGREGATE_AND_PROOF) - aggregates,
             1.0
         );
+    }
+
+    /// With the timing export on, a vote that decodes leaves its receipt
+    /// (when it arrived, what it is, how big, who signed) and, once judged,
+    /// its verdict under the same message id. A vote the node had already
+    /// seen is a duplicate there, not an ignored message.
+    #[tokio::test]
+    async fn a_votes_receipt_and_verdict_are_exported() {
+        use crate::beacon::verdict;
+
+        let server = unconnected_beacon_server(config(), 0).await;
+        let _votes = one_vote_test_at_a_time();
+        let capture = pq_timing::testing::capture();
+        let mine = |events: Vec<pq_timing::Value>, message_id: &str| -> Vec<pq_timing::Value> {
+            let of = |event: &pq_timing::Value| event["message_id"] == message_id;
+            events.into_iter().filter(of).collect()
+        };
+
+        let mut attestation = pq::SingleAttestation {
+            committee_index: 2,
+            attester_index: 9,
+            data: Default::default(),
+            signature: Default::default(),
+        };
+        attestation.data.slot = 5;
+        let payload = attestation.to_ssz();
+        let topic = format!("{}3", beacon_topics::BEACON_ATTESTATION_PREFIX);
+        let mut id = gossip_id(0xa1, beacon_topics::BEACON_ATTESTATION_KIND);
+        assert!(triage(&server, &topic, &payload, &mut id).is_some());
+        assert!(id.pq_vote.is_some());
+        verdict::report(&server, id, Outcome::Ignore(IgnoreReason::AlreadySeen));
+
+        let message_id = format!("0x{}", "a1".repeat(20));
+        let events = mine(capture.events(), &message_id);
+        assert_eq!(events.len(), 2, "{events:?}");
+        let received = &events[0];
+        assert_eq!(received["kind"], "message_received");
+        assert_eq!(received["message_kind"], "individual");
+        assert_eq!(received["source"], "network");
+        assert_eq!(received["slot"], 5);
+        assert_eq!(received["reference_slot"], 5);
+        assert_eq!(received["committee"], 2);
+        assert_eq!(received["subnet"], 3);
+        assert_eq!(received["message_bytes"], payload.len());
+        assert_eq!(received["signer_count"], 1);
+        let root = attestation.data.hash_tree_root();
+        assert_eq!(
+            received["vote_data_root"],
+            format!("0x{}", hex::encode(root.0))
+        );
+        let validated = &events[1];
+        assert_eq!(validated["kind"], "validated");
+        assert_eq!(validated["message_kind"], "individual");
+        assert_eq!(validated["outcome"], "duplicate");
+        assert_eq!(validated["slot"], 5);
+
+        // An aggregate of three attesters in committee 1.
+        let mut bits = pq::AggregationBits::with_length(8);
+        for position in [0, 3, 4] {
+            bits.set(position, true).unwrap();
+        }
+        let mut committee_bits = pq::CommitteeBits::default();
+        committee_bits.set(1, true).unwrap();
+        let aggregate = pq::SignedAggregateAndProof {
+            message: pq::AggregateAndProof {
+                aggregator_index: 0,
+                aggregate: pq::Attestation {
+                    aggregation_bits: bits,
+                    data: attestation.data,
+                    committee_bits,
+                },
+                proof: Default::default(),
+            },
+            signature: Default::default(),
+        };
+        let topic = beacon_topics::BEACON_AGGREGATE_AND_PROOF;
+        let mut id = gossip_id(0xa2, topic);
+        assert!(triage(&server, topic, &aggregate.to_ssz(), &mut id).is_some());
+        verdict::report(&server, id, Outcome::Accept);
+
+        let events = mine(capture.events(), &format!("0x{}", "a2".repeat(20)));
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["message_kind"], "aggregate");
+        assert_eq!(events[0]["committee"], 1);
+        assert_eq!(events[0]["subnet"], pq_timing::Value::Null);
+        assert_eq!(events[0]["signer_count"], 3);
+        assert_eq!(events[1]["outcome"], "accepted");
+
+        // Not a vote: nothing recorded, and its verdict leaves nothing.
+        let slashing = pq::ProposerSlashing::default();
+        let mut id = gossip_id(0xa3, beacon_topics::PROPOSER_SLASHING);
+        triage(
+            &server,
+            beacon_topics::PROPOSER_SLASHING,
+            &slashing.to_ssz(),
+            &mut id,
+        );
+        assert!(id.pq_vote.is_none());
+        verdict::report(&server, id, Outcome::Ignore(IgnoreReason::AlreadySeen));
+        assert!(mine(capture.events(), &format!("0x{}", "a3".repeat(20))).is_empty());
+    }
+
+    /// Without the export, a decoded vote is not noted for one.
+    #[tokio::test]
+    async fn a_vote_is_not_noted_when_no_run_is_recorded() {
+        let server = unconnected_beacon_server(config(), 0).await;
+        // The one test of this crate that captures holds the same lock.
+        let _votes = one_vote_test_at_a_time();
+        let attestation = pq::SingleAttestation {
+            committee_index: 0,
+            attester_index: 0,
+            data: Default::default(),
+            signature: Default::default(),
+        };
+        let topic = format!("{}0", beacon_topics::BEACON_ATTESTATION_PREFIX);
+        let mut id = gossip_id(0xa4, beacon_topics::BEACON_ATTESTATION_KIND);
+        assert!(triage(&server, &topic, &attestation.to_ssz(), &mut id).is_some());
+        assert!(id.pq_vote.is_none());
     }
 
     /// A block or a column takes the shared path under a PQ digest too.

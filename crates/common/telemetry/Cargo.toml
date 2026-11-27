@@ -5,12 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Exposes `pq_timing::testing`, which records the PQ timing events into
+# memory, for the crates whose tests check their own emit sites.
+test-utils = []
+
 [dependencies]
 ethlambda-metrics.workspace = true
 hex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The PQ timing export: proof ids, and its chunks' compression.
+sha2.workspace = true
+zstd.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
 
@@ -18,4 +26,5 @@ tracing.workspace = true
 # A stand-in ClickHouse HTTP endpoint for the writer tests. Already in the
 # lockfile through ethlambda-rpc, so this adds no new crate.
 axum = "0.8.1"
+tempfile = "3"
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }

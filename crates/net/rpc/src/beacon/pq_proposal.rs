@@ -319,9 +319,34 @@ async fn attestations_for_block(
                 proof_bytes = packed.proof.len(),
                 "Collected the PQ attestations packed ahead of the slot"
             );
+            proposal_snapshot(slot, &packed.attestations, &packed.proof, true);
             return (packed.attestations, packed.proof);
         }
     }
     let packed = pack_attestations(store, state, config, PermitWait::TryOnce).await;
+    proposal_snapshot(slot, &packed.attestations, &packed.proof, false);
     (packed.attestations, packed.proof)
+}
+
+/// Tell the timing export what a block at `slot` was built with: the
+/// attestations and proof production took, and whether they are the ones
+/// packed ahead of the slot.
+fn proposal_snapshot(slot: Slot, attestations: &[pq::Attestation], proof: &[u8], ahead: bool) {
+    use ethlambda_telemetry::pq_timing;
+    use ethlambda_types::beacon::preset::MIN_ATTESTATION_INCLUSION_DELAY_PQ;
+
+    let outcome = if attestations.is_empty() {
+        "no_candidate"
+    } else {
+        "candidate"
+    };
+    let reference_slot = slot.saturating_sub(MIN_ATTESTATION_INCLUSION_DELAY_PQ);
+    pq_timing::proposal_snapshot(slot, reference_slot, outcome, || {
+        pq_timing::json!({
+            "proof_id": pq_timing::proof_id(proof),
+            "proof_bytes": proof.len(),
+            "records": attestations.len(),
+            "packed_ahead": ahead,
+        })
+    });
 }
