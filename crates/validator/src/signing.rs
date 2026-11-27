@@ -237,6 +237,11 @@ impl SigningContext {
         self
     }
 
+    /// Whether distributed mode is on ([`Self::with_distributed`]).
+    pub fn is_distributed(&self) -> bool {
+        self.distributed
+    }
+
     /// Put the slashable signatures behind doppelganger protection.
     pub fn with_doppelganger(mut self, doppelganger: Arc<Doppelganger>) -> Self {
         self.doppelganger = Some(doppelganger);

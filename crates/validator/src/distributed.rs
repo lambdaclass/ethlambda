@@ -134,10 +134,21 @@ enum Seat {
 }
 
 impl<B: BeaconNodeApi + 'static> Distributed<B> {
-    /// `context` must have distributed mode on
-    /// ([`SigningContext::with_distributed`]), or the combined proofs this
-    /// fetches are dropped and every selection is this client's own.
+    /// # Panics
+    ///
+    /// If `context` does not have distributed mode on
+    /// ([`SigningContext::with_distributed`]). With the mode off the context
+    /// drops the combined proofs this fetches and every selection is the
+    /// share's own: the client would run every exchange and still decide and
+    /// publish with partial proofs, with nothing saying so. The two are
+    /// switched on in separate places, so the mistake is refused here rather
+    /// than left to whoever wires them.
     pub fn new(beacon_node: Arc<B>, context: Arc<SigningContext>) -> Self {
+        assert!(
+            context.is_distributed(),
+            "`Distributed` needs a `SigningContext` built `with_distributed()`: with the mode \
+             off it drops every combined proof and decides on the share's own"
+        );
         info!(
             "Distributed mode on: aggregation is decided by the combined selection proofs the \
              middleware returns"
@@ -868,6 +879,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A context with the mode off would drop every combined proof and
+    /// decide on the share's own, so the exchanges are not built on one.
+    #[test]
+    #[should_panic(expected = "with_distributed")]
+    fn a_context_with_the_mode_off_is_refused() {
+        let _ = Distributed::new(Arc::new(MockBeaconNode::new()), local_context());
     }
 
     /// The combined proof decides, against the share's own verdict either
