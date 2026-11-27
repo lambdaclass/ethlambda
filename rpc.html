@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-2eb573ae.js";
+            window.path_to_searchindex_js = "searchindex-c85cf60d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-26bf4b2e.js"></script>
@@ -480,7 +480,7 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/pool/voluntary_exits</code></td><td>JSON</td><td>The pool’s <code>SignedVoluntaryExit</code>s; validate, pool and gossip one</td></tr>
 <tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/pool/bls_to_execution_changes</code></td><td>JSON</td><td>The pool’s <code>SignedBLSToExecutionChange</code>s; POST takes an array</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/pool/payload_attestations</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip <code>PayloadAttestationMessage</code>s (gloas; JSON or SSZ body)</td></tr>
-<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/pool/payload_attestations</code></td><td>JSON</td><td>The pool’s votes as aggregated <code>PayloadAttestation</code>s (gloas)</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/pool/payload_attestations</code></td><td>JSON / SSZ</td><td>The pool’s votes as aggregated <code>PayloadAttestation</code>s (gloas)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/beacon_committee_subscriptions</code></td><td><em>(status only)</em></td><td>Aggregators’ entries join their committee’s subnet; every entry’s validator counts as attached, for validator custody</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v2/validator/aggregate_attestation</code></td><td>JSON</td><td>The pooled votes for a data root and committee, aggregated</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v2/validator/aggregate_and_proofs</code></td><td><em>(status only)</em></td><td>Validate and gossip <code>SignedAggregateAndProof</code>s (JSON or SSZ body)</td></tr>
@@ -496,7 +496,11 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/execution_payload_envelopes</code></td><td><em>(status only)</em></td><td>Gossip a signed envelope and its data columns (gloas; JSON or SSZ body)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/execution_payload_bids</code></td><td><em>(status only)</em></td><td>Validate, pool and gossip a builder’s <code>SignedExecutionPayloadBid</code> (gloas; JSON or SSZ body)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/proposer_preferences</code></td><td><em>(status only)</em></td><td>Validate, cache and gossip <code>SignedProposerPreferences</code> (gloas; JSON or SSZ body)</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/proposer_preferences</code></td><td>JSON / SSZ</td><td>The signed preferences the node holds for proposal slots not yet past (from gossip and the POST above), narrowed by <code>?slot</code> and <code>?dependent_root</code>, versioned <code>gloas</code></td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/beacon/states/{state_id}/builders</code></td><td>JSON</td><td>The gloas builder registry, filtered by id and status</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/states/{state_id}/ptc</code></td><td>JSON / SSZ</td><td>The payload timeliness committee of <code>?slot</code> (default: the state’s slot), from the state’s <code>ptc_window</code>; a slot before gloas or outside the window is a <code>400</code></td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/states/{state_id}/builder_pending_payments</code></td><td>JSON / SSZ</td><td>The gloas state’s <code>builder_pending_payments</code>, versioned</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/states/{state_id}/builder_pending_withdrawals</code></td><td>JSON / SSZ</td><td>The gloas state’s <code>builder_pending_withdrawals</code>, versioned</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/prepare_beacon_proposer</code></td><td><em>(status only)</em></td><td>Record each validator’s fee recipient for block production (see below), and that it is attached, for validator custody</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/register_validator</code></td><td><em>(status only)</em></td><td>Forwards builder registrations of active or pending validators to <code>--builder</code>, and sets their fee recipients</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/events</code></td><td>SSE</td><td>Live stream of chain events (see below)</td></tr>
@@ -856,7 +860,10 @@ and <code>pool/bls_to_execution_changes</code></strong>: <code>GET</code> lists 
 specification’s <code>validate_*_gossip</code> rule for the topic against the head’s
 post-state as it is (consensus-specs v1.7.0-beta.5; no <code>process_*</code> and no
 state advance, and an attester slashing’s range and slashability checks run
-before its BLS checks), pools the operation and gossips it on the topic. A
+before its BLS checks), pools the operation and gossips it on the topic. The
+rules apply under an electra, fulu or gloas head. An attester slashing’s JSON
+and SSZ bytes are the same from electra on (gloas’s progressive
+<code>IndexedAttestation</code> changes only its root). A
 rejected operation is a <code>400</code>. <code>bls_to_execution_changes</code> takes an array: on
 partial failure the response is a <code>400</code> listing the failures by index, and
 the valid entries are still pooled and published.</p>
@@ -896,9 +903,16 @@ fee recipient and gas target of that build come from the proposer’s signed
 <code>ProposerPreferences</code> for the slot when the market holds them under the slot’s
 dependent root, else from <code>prepare_beacon_proposer</code> (fee recipient, or the zero
 address with a warning) and the parent bid’s gas limit. The body packs the
-attestation pool’s best aggregates and the payload attestation pool’s votes for
-the parent block (an aggregate that does not verify against the advanced state
-is dropped, since one bad operation fails the block), and the state root comes
+attestation pool’s best aggregates, the payload attestation pool’s votes for
+the parent block, the operation pool’s slashings, exits and credential changes
+(through <code>pack_operations</code>, run with gloas’s own slashing rules) and the sync
+committee’s aggregate over the parent (an operation that does not verify
+against the advanced state is dropped, since one bad operation fails the
+block). The slashings, exits and credential changes are checked against that
+state with the parent payload’s execution requests applied, which a gloas
+block runs before its operations: a parent’s withdrawal or consolidation
+request can already have exited a validator whose exit is pooled. A block
+built on a builder’s bid packs the same body. The state root comes
 from running the block through <code>process_block</code>. The bid is a zero-value
 self-build bid read off the built payload. What was built is cached by <code>(slot, block root)</code>, for the current and previous slot only.</p>
 <p><strong>Choosing between the local payload and a bid.</strong> The bids considered are the
@@ -946,11 +960,19 @@ post-state, and every data column built from the blobs must carry one cell and
 one proof per commitment; when the blobs came in the body, its cell proofs must
 also verify against the commitments. Any failure is a <code>400</code>. The cached blobs’
 proofs are not verified here: they came from this node’s own execution client
-(<code>engine_getPayload</code>’s blobs bundle), which checked them when it admitted their
+(<code>engine_getPayload</code>‘s blobs bundle), which checked them when it admitted their
 blob transactions, and Lighthouse and Prysm publish their own columns unverified
 too. They are verified once, after gossip: this node’s own copy of each column
 goes through p2p’s chain checks, KZG proofs included, before it is stored
-(<code>column_checks.rs</code>). A success is <code>200</code> once the
+(<code>column_checks.rs</code>). That is the <code>gossip</code> level of <code>broadcast_validation</code>, the
+default. <code>?broadcast_validation=consensus</code> adds
+<code>verify_execution_payload_envelope</code> against the block’s post-state (every
+payload field against the bid and the state, and the execution requests’ root;
+the execution client’s verdict is left to the import), and
+<code>consensus_and_equivocation</code> then refuses an envelope whose block’s proposer
+has another block for the slot in this node’s store. A failure at the requested
+level is a <code>400</code> and nothing is broadcast; an unknown level is a <code>400</code> too. A
+success is <code>200</code> once the
 envelope and all <code>NUMBER_OF_COLUMNS</code> gloas data column sidecars are handed to
 P2P, which gossips them together. A node that does not subscribe to a column’s
 subnet publishes through gossipsub fanout.</p>
@@ -1306,11 +1328,10 @@ these are ever sent:</p>
 </tbody>
 </table>
 </div>
-<p>Never emitted: the operation topics (<code>voluntary_exit</code>,
-<code>proposer_slashing</code>, <code>attester_slashing</code>, <code>bls_to_execution_change</code>,
-<code>contribution_and_proof</code>: no operation pools), the light client topics and
+<p>| <code>voluntary_exit</code>, <code>proposer_slashing</code>, <code>attester_slashing</code>, <code>bls_to_execution_change</code> | The <code>SignedVoluntaryExit</code>, <code>ProposerSlashing</code>, <code>AttesterSlashing</code> or <code>SignedBLSToExecutionChange</code> as is, with no version wrapper | The operation passed its topic’s gossip rules, or was accepted by its <code>pool/*</code> POST route. An attester slashing’s JSON is the same at electra and gloas |</p>
+<p>Never emitted: <code>contribution_and_proof</code>, the light client topics and
 <code>blob_sidecar</code>.</p>
-<p>The gloas topics and <code>single_attestation</code> are emitted by whichever part of the
+<p>The gloas topics, <code>single_attestation</code> and the operation topics are emitted by whichever part of the
 node accepted the object, since several never reach the chain actor: the actor
 publishes <code>execution_payload</code> and <code>execution_payload_available</code>; p2p publishes
 the gossip-accepted <code>execution_payload_gossip</code>, <code>execution_payload_bid</code>,

@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-2eb573ae.js";
+            window.path_to_searchindex_js = "searchindex-c85cf60d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-26bf4b2e.js"></script>
@@ -931,6 +931,30 @@ that would repeat the ladder for every copy that arrives.</li>
 verified ancestor: a gloas block’s EL parent is the ancestor whose payload hash
 is its <code>bid.parent_block_hash</code>, skipping blocks it built past on their EMPTY
 node, and a pre-gloas block’s is its parent. Both walks stop at finality.</p>
+<h2 id="a-deferred-gloas-column-is-relayed-only-within-gossipsubs-cache-window-and-its-senders-are-not-charged"><a class="header" href="#a-deferred-gloas-column-is-relayed-only-within-gossipsubs-cache-window-and-its-senders-are-not-charged">A deferred gloas column is relayed only within gossipsub’s cache window, and its senders are not charged</a></h2>
+<ul>
+<li><strong>The specification:</strong> a gloas <code>data_column_sidecar</code> queued for its block
+that then fails validation MUST get its forwarding peers downscored, and one
+that passes MUST be re-broadcast (<code>gloas/p2p-interface.md</code>).</li>
+<li><strong>ethlambda:</strong> the gossip verdict of a queued gloas sidecar is held until the
+chain checks decide, then reported to gossipsub
+(<code>p2p/src/beacon/deferred_columns.rs</code>). A late <code>Accept</code> relays the message.
+A late <code>Reject</code> marks it invalid, but gossipsub’s invalid-message penalty
+counts only on topics with score parameters, and <code>data_column_sidecar_*</code> has
+none, so no peer is charged. Gossipsub is sure to keep a message for five
+700 ms heartbeats, so a verdict still held at 3.5 s is reported with its
+<code>Queue</code> instead: a block that arrives later still gets the column stored, but
+the column is not relayed.</li>
+<li><strong>Why:</strong> gossipsub refuses to publish bytes already in its duplicate cache, so
+a sidecar received by gossip cannot be re-broadcast any other way, and it has
+nothing to forward once the message has left its cache. Column topics are
+unscored as in every client but Prysm (see <code>beacon_wire.md</code>, “Peer scoring”),
+and this node has no application-level peer score to charge instead.</li>
+<li><strong>Consequence:</strong> the re-broadcast holds for the usual case, a column that
+arrives a moment before its block, and lapses for a block that arrives
+seconds late. The downscore waits on column topic score parameters, or an
+application-level peer score.</li>
+</ul>
 <h2 id="columns-built-from-the-execution-clients-blobs-are-verified"><a class="header" href="#columns-built-from-the-execution-clients-blobs-are-verified">Columns built from the execution client’s blobs are verified</a></h2>
 <ul>
 <li><strong>The specification:</strong> fulu <code>p2p-interface.md</code>, “Distributed blob publishing
@@ -939,8 +963,9 @@ builds data column sidecars from <code>engine_getBlobsV2</code>’s answer SHOUL
 verifying them, and MUST then treat them as received on gossip.</li>
 <li><strong>ethlambda:</strong> the built sidecars go through every chain check a fetched
 column gets, KZG proofs included, before they are published, recorded seen
-or stored (<code>crates/blockchain/src/beacon_blobs.rs</code>, <code>check_built</code>). Columns
-that fail are dropped and counted in <code>lean_engine_blob_columns_refused_total</code>.</li>
+or stored (<code>crates/blockchain/src/beacon_blobs.rs</code>, <code>check_built</code>), fulu
+and gloas alike. Columns that fail are dropped and counted in
+<code>lean_engine_blob_columns_refused_total</code>.</li>
 <li><strong>Why:</strong> a stored column keeps every later copy of it out (<code>AlreadyStored</code>),
 and block import trusts the stored columns, so a wrong blob or proof taken
 on trust from a faulty execution client would either stop its block for

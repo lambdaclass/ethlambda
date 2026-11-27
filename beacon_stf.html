@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-2eb573ae.js";
+            window.path_to_searchindex_js = "searchindex-c85cf60d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-26bf4b2e.js"></script>
@@ -597,8 +597,10 @@ passing the fork epoch no longer forces the sync status to syncing. Fork choice
 records the head node’s payload status next to the head root
 (<code>Store::head_payload_status</code>, in memory, recomputed by the first head
 computation after a restart), which the envelope by-range server reads to
-withhold the head’s envelope while the head is the EMPTY node. The node is
-still only a follower: the validator-client endpoints refuse a gloas epoch.</p>
+withhold the head’s envelope while the head is the EMPTY node. The node also
+serves gloas validator duties: block and envelope production, attestation and
+aggregation, payload timeliness committee duties and proposer preferences (see
+<a href="./rpc.html">rpc.md</a>).</p>
 <h3 id="the-envelope-pipeline-in-the-chain-actor"><a class="header" href="#the-envelope-pipeline-in-the-chain-actor">The envelope pipeline in the chain actor</a></h3>
 <p>Order of arrival is not order of validity: an envelope can beat its block, a
 block can name a parent payload that has not arrived, and the columns an
@@ -989,8 +991,8 @@ that is not ignored passes on both presets:</p>
 <tr><th>Preset</th><th>Fixture cases passed</th><th>Ignored</th></tr>
 </thead>
 <tbody>
-<tr><td>mainnet</td><td>7556</td><td>986</td></tr>
-<tr><td>minimal</td><td>49650</td><td>6410</td></tr>
+<tr><td>mainnet</td><td>7640</td><td>902</td></tr>
+<tr><td>minimal</td><td>49734</td><td>6326</td></tr>
 </tbody>
 </table>
 </div>
@@ -1015,9 +1017,11 @@ ignored runs. The ignored cases are deliberate exclusions:</p>
 through gloas. The light-client sync protocol is a different layer from the
 state transition and fork choice, and is not in this module’s scope.</li>
 <li><code>networking/gossip_*</code> cases outside what the node validates: every fork’s
-cases for topics it has no validator for (<code>IGNORED_HANDLERS</code>), non-fulu cases
-of the aggregate and attestation topics (block and data column validate fulu
-and gloas), and the vectors in <code>SKIPPED</code>, which assume a bad-block cache.</li>
+cases for topics it has no validator for (<code>IGNORED_HANDLERS</code>), cases from
+forks a validated topic’s rules do not cover (<code>validated_forks</code>: fulu and
+gloas for every validated topic except the four gloas-only ones, and
+electra too for the four operation topics, whose rules take an electra
+head), and the vectors in <code>SKIPPED</code>, which assume a bad-block cache.</li>
 <li>The <code>heze</code> fixture tree, one ignored entry. See “Accounting for every fork
 directory” below.</li>
 <li>Cases generated with BLS ignored (<code>bls_setting: 2</code>), whose stub signatures
