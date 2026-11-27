@@ -646,7 +646,10 @@ the chain actor writes, so no request waits on the actor.
   specification's `validate_*_gossip` rule for the topic against the head's
   post-state as it is (consensus-specs v1.7.0-beta.1; no `process_*` and no
   state advance, and an attester slashing's range and slashability checks run
-  before its BLS checks), pools the operation and gossips it on the topic. A
+  before its BLS checks), pools the operation and gossips it on the topic. The
+  rules apply under an electra, fulu or gloas head. An attester slashing's JSON
+  and SSZ bytes are the same from electra on (gloas's progressive
+  `IndexedAttestation` changes only its root). A
   rejected operation is a `400`. `bls_to_execution_changes` takes an array: on
   partial failure the response is a `400` listing the failures by index, and
   the valid entries are still pooled and published.
@@ -682,9 +685,12 @@ fee recipient and gas target of that build come from the proposer's signed
 `ProposerPreferences` for the slot when the market holds them under the slot's
 dependent root, else from `prepare_beacon_proposer` (fee recipient, or the zero
 address with a warning) and the parent bid's gas limit. The body packs the
-attestation pool's best aggregates and the payload attestation pool's votes for
-the parent block (an aggregate that does not verify against the advanced state
-is dropped, since one bad operation fails the block), and the state root comes
+attestation pool's best aggregates, the payload attestation pool's votes for
+the parent block, the operation pool's slashings, exits and credential changes
+(through `pack_operations`, run with gloas's own slashing rules) and the sync
+committee's aggregate over the parent (an operation that does not verify
+against the advanced state is dropped, since one bad operation fails the
+block). A block built on a builder's bid packs the same body. The state root comes
 from running the block through `process_block`. The bid is a zero-value
 self-build bid read off the built payload. What was built is cached by `(slot,
 block root)`, for the current and previous slot only.

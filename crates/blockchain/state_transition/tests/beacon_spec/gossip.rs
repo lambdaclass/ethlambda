@@ -78,13 +78,12 @@ fn validated_forks(handler: &str) -> &'static [ForkName] {
         | "gossip_payload_attestation_message"
         | "gossip_execution_payload_bid"
         | "gossip_proposer_preferences" => &[ForkName::Gloas],
-        // `gossip::operations` validates electra-shaped operations against an
-        // electra or fulu head state and ignores every other one, so gloas's
-        // vectors (builder exits included) are a known gap rather than a run.
+        // Phase0's and capella's rules, which neither fulu nor gloas changes
+        // beyond gloas's `AttesterSlashing` container.
         "gossip_voluntary_exit"
         | "gossip_proposer_slashing"
         | "gossip_attester_slashing"
-        | "gossip_bls_to_execution_change" => &[ForkName::Fulu],
+        | "gossip_bls_to_execution_change" => &[ForkName::Fulu, ForkName::Gloas],
         // Altair's rules, which neither fulu nor gloas changes.
         "gossip_sync_committee_message" | "gossip_sync_committee_contribution_and_proof" => {
             &[ForkName::Fulu, ForkName::Gloas]
@@ -368,21 +367,33 @@ fn rebase_stale_header(state: &mut BeaconState, anchor: &mut SignedBeaconBlock) 
     use ethlambda_state_transition::beacon::containers::BeaconBlockHeader;
     use ethlambda_state_transition::beacon::primitives::HashTreeRoot as _;
 
-    let SignedBeaconBlock::Fulu(block) = anchor else {
-        return;
+    // The header that names `message`, with the state root left for the store.
+    macro_rules! header_of {
+        ($message:expr) => {
+            BeaconBlockHeader {
+                slot: $message.slot,
+                proposer_index: $message.proposer_index,
+                parent_root: $message.parent_root,
+                state_root: Root::ZERO,
+                body_root: $message.body.hash_tree_root(),
+            }
+        };
+    }
+    let header = match anchor {
+        SignedBeaconBlock::Fulu(block) => header_of!(block.message),
+        SignedBeaconBlock::Gloas(block) => header_of!(block.message),
+        _ => return,
     };
-    if state.slot() != block.message.slot {
+    if state.slot() != header.slot {
         return;
     }
-    let message = &mut block.message;
-    *state.latest_block_header_mut() = BeaconBlockHeader {
-        slot: message.slot,
-        proposer_index: message.proposer_index,
-        parent_root: message.parent_root,
-        state_root: Root::ZERO,
-        body_root: message.body.hash_tree_root(),
-    };
-    message.state_root = state.hash_tree_root();
+    *state.latest_block_header_mut() = header;
+    let state_root = state.hash_tree_root();
+    match anchor {
+        SignedBeaconBlock::Fulu(block) => block.message.state_root = state_root,
+        SignedBeaconBlock::Gloas(block) => block.message.state_root = state_root,
+        _ => unreachable!("returned above for every other fork"),
+    }
 }
 
 /// The store the case describes: its anchor, then each listed block.
@@ -742,8 +753,17 @@ fn run_case(case: &Case) -> Result<(), String> {
             }
             "attester_slashing" => {
                 let bytes = case.ssz_bytes(&message.message);
-                let slashing = electra::AttesterSlashing::from_ssz_bytes(&bytes)
-                    .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+                let decoding = |err| format!("decoding {}: {err:?}", message.message);
+                // Gloas's container, carried in electra's shape as gossip
+                // hands it over (see `BeaconOperation`).
+                let slashing = if case.fork == ForkName::Gloas {
+                    let slashing =
+                        gloas::AttesterSlashing::from_ssz_bytes(&bytes).map_err(decoding)?;
+                    electra::AttesterSlashing::try_from(&slashing)
+                        .map_err(|err| format!("converting {}: {err:?}", message.message))?
+                } else {
+                    electra::AttesterSlashing::from_ssz_bytes(&bytes).map_err(decoding)?
+                };
                 validate_operation(
                     &mut seen_operations,
                     &store,

@@ -57,7 +57,9 @@ use ethlambda_engine::{
 };
 use ethlambda_network_api::{GossipEvent, RpcToP2PRef};
 use ethlambda_state_transition::beacon::{
-    block_production::{empty_sync_aggregate, verified_sync_aggregate},
+    block_production::{
+        Operations, empty_sync_aggregate, pack_operations, verified_sync_aggregate,
+    },
     bls,
     builder_market::SharedBuilderMarket,
     fork_choice::{gloas_verify_data_column_sidecar, gloas_verify_data_column_sidecar_kzg_proofs},
@@ -524,6 +526,15 @@ async fn produce(
     );
 
     let candidates = store.attestation_pool().block_candidates();
+    let operation_candidates = {
+        let pool = store.operation_pool();
+        Operations {
+            proposer_slashings: pool.proposer_slashings(),
+            attester_slashings: pool.attester_slashings(),
+            voluntary_exits: pool.voluntary_exits(),
+            bls_to_execution_changes: pool.bls_to_execution_changes(),
+        }
+    };
     let messages = ptc_pool
         .lock()
         .expect("payload attestation pool lock poisoned")
@@ -543,13 +554,19 @@ async fn produce(
         let assembled = {
             let (config, prepared, bid) = (config.clone(), prepared.clone(), bid.clone());
             let (candidates, messages) = (candidates.clone(), messages.clone());
+            let (operation_candidates, sync_candidate) =
+                (operation_candidates.clone(), sync_candidate.clone());
             tokio::task::spawn_blocking(move || {
                 assemble_on_bid(
                     &config,
                     &prepared,
                     bid,
-                    candidates,
-                    messages,
+                    Candidates {
+                        attestations: candidates,
+                        operations: operation_candidates,
+                        payload_attestations: messages,
+                        sync_aggregate: sync_candidate,
+                    },
                     randao_reveal,
                     graffiti,
                 )
@@ -595,9 +612,12 @@ async fn produce(
                 &prepared,
                 built,
                 execution_requests,
-                candidates,
-                messages,
-                sync_candidate,
+                Candidates {
+                    attestations: candidates,
+                    operations: operation_candidates,
+                    payload_attestations: messages,
+                    sync_aggregate: sync_candidate,
+                },
                 randao_reveal,
                 graffiti,
             )
@@ -845,113 +865,167 @@ async fn build_payload(
     })
 }
 
+/// What the pools offer a block, before it is checked against the block's
+/// pre-state.
+struct Candidates {
+    attestations: Vec<containers::electra::Attestation>,
+    /// Slashings, exits and credential changes, in the pool's electra shapes.
+    operations: Operations,
+    payload_attestations: Vec<containers::gloas::PayloadAttestationMessage>,
+    /// What the committee signed at the previous slot over this block's parent.
+    sync_aggregate: Option<SyncAggregate>,
+}
+
+/// The body contents [`Candidates`] pack to against a block's pre-state.
+struct Packed {
+    attestations: Vec<containers::gloas::Attestation>,
+    operations: Operations,
+    payload_attestations: Vec<containers::gloas::PayloadAttestation>,
+    sync_aggregate: SyncAggregate,
+}
+
+impl Packed {
+    /// A body with nothing in it beyond what the chain requires, the fallback
+    /// when a packed one fails to build.
+    fn bare() -> Self {
+        Self {
+            attestations: Vec::new(),
+            operations: Operations::default(),
+            payload_attestations: Vec::new(),
+            sync_aggregate: empty_sync_aggregate(),
+        }
+    }
+
+    fn is_bare(&self) -> bool {
+        self.attestations.is_empty()
+            && self.operations.is_empty()
+            && self.payload_attestations.is_empty()
+            && self.sync_aggregate == empty_sync_aggregate()
+    }
+}
+
+/// Each candidate list packed against `prepared.state`, the block's pre-state:
+/// what `process_block` would accept, in the order it applies them. The sync
+/// aggregate is verified exactly as `process_sync_aggregate` will check it; a
+/// candidate that fails becomes the empty aggregate rather than a block the
+/// chain would refuse.
+fn pack(config: &Config, prepared: &Prepared, candidates: Candidates) -> Packed {
+    let Prepared {
+        state,
+        head_root,
+        head_slot,
+        ..
+    } = prepared;
+    Packed {
+        attestations: pack_gloas_attestations(state, candidates.attestations),
+        operations: pack_operations(state, candidates.operations, config),
+        payload_attestations: pack_payload_attestations(
+            state,
+            *head_root,
+            *head_slot,
+            candidates.payload_attestations,
+            config,
+        ),
+        sync_aggregate: candidates
+            .sync_aggregate
+            .map_or_else(empty_sync_aggregate, |candidate| {
+                verified_sync_aggregate(state, candidate)
+            }),
+    }
+}
+
 /// The pure half: the pooled operations and the built payload into a block and
 /// its envelope.
-#[allow(clippy::too_many_arguments)]
 fn assemble(
     config: &Config,
     prepared: &Prepared,
     built: BuiltGloasPayload,
     execution_requests: ExecutionRequests,
-    candidates: Vec<containers::electra::Attestation>,
-    messages: Vec<containers::gloas::PayloadAttestationMessage>,
-    sync_candidate: Option<SyncAggregate>,
+    candidates: Candidates,
     randao_reveal: BlsSignature,
     graffiti: Bytes32,
 ) -> Result<GloasProduced, ApiError> {
     let Prepared {
         state,
-        head_root,
-        head_slot,
         parent_requests,
         options,
         pubkey_indices,
         ..
     } = prepared;
-    let attestations = pack_gloas_attestations(state, candidates);
-    let payload_attestations =
-        pack_payload_attestations(state, *head_root, *head_slot, messages, config);
     let commitments = built.blobs_bundle.commitments;
-    // Verified exactly as `process_sync_aggregate` will check it, against the
-    // state the block is built on; a candidate that fails becomes the empty
-    // aggregate rather than a block the chain would refuse.
-    let sync_aggregate = sync_candidate.map_or_else(empty_sync_aggregate, |candidate| {
-        verified_sync_aggregate(state, candidate)
-    });
-    let has_sync_aggregate = sync_aggregate != empty_sync_aggregate();
-    let inputs = |attestations, payload_attestations, sync_aggregate| GloasBlockInputs {
-        sync_aggregate,
+    let inputs = |packed: Packed| GloasBlockInputs {
+        sync_aggregate: packed.sync_aggregate,
         randao_reveal,
         graffiti,
-        attestations,
-        payload_attestations,
+        attestations: packed.attestations,
+        operations: packed.operations,
+        payload_attestations: packed.payload_attestations,
         parent_execution_requests: parent_requests.clone(),
         execution_payload: built.execution_payload.clone(),
         blob_kzg_commitments: commitments.clone(),
         execution_requests: execution_requests.clone(),
     };
-    let operations = attestations.len() + payload_attestations.len();
-    let attempt = inputs(attestations, payload_attestations, sync_aggregate);
-    match assemble_gloas_block(state, attempt, config, pubkey_indices, *options) {
+    let packed = pack(config, prepared, candidates);
+    let bare = packed.is_bare();
+    match assemble_gloas_block(state, inputs(packed), config, pubkey_indices, *options) {
         Ok(produced) => Ok(produced),
         // The packers check every operation's signature against this state, and
-        // the sync aggregate was verified above, so this should not happen; but
-        // a block without them still earns the proposal, and one that fails to build earns nothing.
-        Err(err) if operations > 0 || has_sync_aggregate => {
+        // the sync aggregate was verified, so this should not happen; but a
+        // block without them still earns the proposal, and one that fails to
+        // build earns nothing.
+        Err(err) if !bare => {
             warn!(slot = state.slot(), %err, "Block with operations failed to build; retrying without");
-            let bare = inputs(Vec::new(), Vec::new(), empty_sync_aggregate());
-            assemble_gloas_block(state, bare, config, pubkey_indices, *options)
-                .map_err(|_| ApiError::Internal("the block failed to build"))
+            assemble_gloas_block(
+                state,
+                inputs(Packed::bare()),
+                config,
+                pubkey_indices,
+                *options,
+            )
+            .map_err(|_| ApiError::Internal("the block failed to build"))
         }
         Err(_) => Err(ApiError::Internal("the block failed to build")),
     }
 }
 
 /// [`assemble`] for a block that commits to a builder's bid: no payload, no
-/// envelope. `process_block` on the block enforces the bid's own rules.
+/// envelope. `process_block` on the block enforces the bid's own rules. The
+/// body carries the same packed contents a self-built block would, sync
+/// aggregate and operations included.
 fn assemble_on_bid(
     config: &Config,
     prepared: &Prepared,
     signed_bid: SignedExecutionPayloadBid,
-    candidates: Vec<containers::electra::Attestation>,
-    messages: Vec<containers::gloas::PayloadAttestationMessage>,
+    candidates: Candidates,
     randao_reveal: BlsSignature,
     graffiti: Bytes32,
 ) -> Result<BeaconBlock, ApiError> {
     let Prepared {
         state,
-        head_root,
-        head_slot,
         parent_requests,
         options,
         pubkey_indices,
         ..
     } = prepared;
-    let attestations = pack_gloas_attestations(state, candidates);
-    let payload_attestations =
-        pack_payload_attestations(state, *head_root, *head_slot, messages, config);
-    let inputs = |attestations, payload_attestations| GloasBidBlockInputs {
+    let inputs = |packed: Packed| GloasBidBlockInputs {
         randao_reveal,
         graffiti,
-        attestations,
-        payload_attestations,
+        attestations: packed.attestations,
+        operations: packed.operations,
+        payload_attestations: packed.payload_attestations,
         parent_execution_requests: parent_requests.clone(),
         signed_bid: signed_bid.clone(),
+        sync_aggregate: packed.sync_aggregate,
     };
-    let operations = attestations.len() + payload_attestations.len();
-    match assemble_gloas_block_on_bid(
-        state,
-        inputs(attestations, payload_attestations),
-        config,
-        pubkey_indices,
-        *options,
-    ) {
+    let packed = pack(config, prepared, candidates);
+    let bare = packed.is_bare();
+    match assemble_gloas_block_on_bid(state, inputs(packed), config, pubkey_indices, *options) {
         Ok(block) => Ok(block),
-        Err(err) if operations > 0 => {
+        Err(err) if !bare => {
             warn!(slot = state.slot(), %err, "Bid block with operations failed to build; retrying without");
             assemble_gloas_block_on_bid(
                 state,
-                inputs(Vec::new(), Vec::new()),
+                inputs(Packed::bare()),
                 config,
                 pubkey_indices,
                 *options,
@@ -1594,6 +1668,7 @@ mod tests {
         assemble_gloas_block(
             state,
             GloasBlockInputs {
+                operations: Default::default(),
                 sync_aggregate:
                     ethlambda_state_transition::beacon::block_production::empty_sync_aggregate(),
                 randao_reveal: randao_reveal(state),
@@ -1641,6 +1716,19 @@ mod tests {
 
     /// `assemble` over the fixture's build state with `candidate` pooled.
     fn assembled_with(state: &BeaconState, candidate: Option<SyncAggregate>) -> GloasProduced {
+        assembled_from(
+            state,
+            Candidates {
+                attestations: Vec::new(),
+                operations: Operations::default(),
+                payload_attestations: Vec::new(),
+                sync_aggregate: candidate,
+            },
+        )
+    }
+
+    /// `assemble` over the fixture's build state with `candidates` pooled.
+    fn assembled_from(state: &BeaconState, candidates: Candidates) -> GloasProduced {
         use ethlambda_state_transition::beacon::gloas_block_production::test_support::{
             payload_for, randao_reveal,
         };
@@ -1676,13 +1764,68 @@ mod tests {
             &prepared,
             built,
             requests,
-            Vec::new(),
-            Vec::new(),
-            candidate,
+            candidates,
             randao_reveal(state),
             Bytes32::ZERO,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_pooled_proposer_slashing_is_packed_into_the_gloas_body() {
+        use ethlambda_state_transition::beacon::{
+            gloas_block_production::test_support::state_to_build_on, helpers::test_state::sign_for,
+        };
+        use ethlambda_types::beacon::containers::shared::{
+            BeaconBlockHeader, ProposerSlashing, SignedBeaconBlockHeader,
+        };
+        let state = state_to_build_on();
+        // Not the block's own proposer, which the slashing would leave slashed.
+        let proposer = get_beacon_proposer_index(&state).unwrap();
+        let offender = (proposer + 1) % state.validator_count() as u64;
+        let slot = state.slot() - 1;
+        let domain = get_domain(
+            &state,
+            constants::DOMAIN_BEACON_PROPOSER,
+            Some(compute_epoch_at_slot(slot)),
+        );
+        let signed = |body_byte: u8| {
+            let message = BeaconBlockHeader {
+                slot,
+                proposer_index: offender,
+                body_root: H256::repeat_byte(body_byte),
+                ..Default::default()
+            };
+            let signing_root = compute_signing_root(message.hash_tree_root(), domain);
+            SignedBeaconBlockHeader {
+                message,
+                signature: sign_for(offender as usize, signing_root),
+            }
+        };
+        let slashing = ProposerSlashing {
+            signed_header_1: signed(1),
+            signed_header_2: signed(2),
+        };
+        // A second, forged copy for another validator: packing drops it.
+        let mut forged = slashing.clone();
+        forged.signed_header_1.message.proposer_index = (offender + 1) % 64;
+        forged.signed_header_2.message.proposer_index = (offender + 1) % 64;
+        let produced = assembled_from(
+            &state,
+            Candidates {
+                attestations: Vec::new(),
+                operations: Operations {
+                    proposer_slashings: vec![slashing.clone(), forged],
+                    ..Operations::default()
+                },
+                payload_attestations: Vec::new(),
+                sync_aggregate: None,
+            },
+        );
+        assert_eq!(
+            produced.block.body.proposer_slashings.to_vec(),
+            vec![slashing]
+        );
     }
 
     #[test]
@@ -1947,6 +2090,7 @@ mod tests {
         let produced = assemble_gloas_block(
             &state,
             GloasBlockInputs {
+                operations: Default::default(),
                 sync_aggregate:
                     ethlambda_state_transition::beacon::block_production::empty_sync_aggregate(),
                 randao_reveal: randao_reveal(&state),

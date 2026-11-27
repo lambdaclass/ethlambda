@@ -5,8 +5,14 @@ use libssz::SszEncode as _;
 
 use super::containers::{capella, electra, shared};
 
-/// One proposer slashing, attester slashing, voluntary exit or BLS change, in
-/// the shapes fulu's gossip topics carry.
+/// One proposer slashing, attester slashing, voluntary exit or BLS change.
+///
+/// An attester slashing is held in electra's shape at every fork from electra
+/// on. Gloas's container (EIP-7688 makes `IndexedAttestation` progressive)
+/// has the same fields and the same SSZ bytes; only its merkle root and the
+/// list's bound differ, and every valid gloas slashing fits electra's bound.
+/// So one shape serves the pool, the gossip rules and block production, and
+/// its encoding is also what a gloas topic carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeaconOperation {
     ProposerSlashing(shared::ProposerSlashing),
@@ -16,7 +22,8 @@ pub enum BeaconOperation {
 }
 
 impl BeaconOperation {
-    /// The SSZ encoding gossip publishes.
+    /// The SSZ encoding gossip publishes, the same under every fork's digest
+    /// from electra on.
     pub fn to_ssz(&self) -> Vec<u8> {
         match self {
             Self::ProposerSlashing(op) => op.to_ssz(),

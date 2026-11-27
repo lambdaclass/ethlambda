@@ -449,8 +449,10 @@ passing the fork epoch no longer forces the sync status to syncing. Fork choice
 records the head node's payload status next to the head root
 (`Store::head_payload_status`, in memory, recomputed by the first head
 computation after a restart), which the envelope by-range server reads to
-withhold the head's envelope while the head is the EMPTY node. The node is
-still only a follower: the validator-client endpoints refuse a gloas epoch.
+withhold the head's envelope while the head is the EMPTY node. The node also
+serves gloas validator duties: block and envelope production, attestation and
+aggregation, payload timeliness committee duties and proposer preferences (see
+[rpc.md](./rpc.md)).
 
 ### The envelope pipeline in the chain actor
 
@@ -839,6 +841,11 @@ that is not ignored passes on both presets:
 | mainnet | 7175 | 1285 | 433 passed, 1 ignored |
 | minimal | 49261 | 5403 | 434 passed, 1 ignored |
 
+These counts predate the gloas operation gossip vectors (`gossip_voluntary_exit`,
+`gossip_proposer_slashing`, `gossip_attester_slashing`,
+`gossip_bls_to_execution_change`), which now run rather than being ignored;
+the next full run moves them from the ignored column to the passed one.
+
 The lib counts are with `beacon-spec-tests` on, and include lean's own unit
 tests, since the two chains share one lib target. The one ignored lib test is
 a timing measurement, not a fixture.
@@ -849,8 +856,9 @@ The release ships no mainnet `genesis` fixtures, so that whole runner is added
 to minimal runs only (`tests/beacon_spec/genesis.rs`).
 
 The gossip validation vectors this crate's `gossip.rs` runner covers come from
-the same tree as every other suite. The node validates four topics under fulu's
-rules; every other case is ignored by name rather than left unmatched.
+the same tree as every other suite. Each validated topic runs the forks its
+rules cover (`validated_forks`); every other case is ignored by name rather
+than left unmatched.
 
 Nothing is ignored for being unimplemented in the state transition or fork
 choice: `HIGHEST_IMPLEMENTED_FORK` is gloas, and every gloas case that is not
@@ -860,9 +868,10 @@ ignored runs. The ignored cases are deliberate exclusions:
   through gloas. The light-client sync protocol is a different layer from the
   state transition and fork choice, and is not in this module's scope.
 - `networking/gossip_*` cases outside what the node validates: every fork's
-  cases for topics it has no validator for (`IGNORED_HANDLERS`), non-fulu cases
-  of the aggregate and attestation topics (block and data column validate fulu
-  and gloas), and the vectors in `SKIPPED`, which assume a bad-block cache.
+  cases for topics it has no validator for (`IGNORED_HANDLERS`), cases from
+  forks a validated topic's rules do not cover (`validated_forks`: fulu and
+  gloas for every validated topic except the four gloas-only ones), and the
+  vectors in `SKIPPED`, which assume a bad-block cache.
 - The `heze` fixture tree, one ignored entry. See "Accounting for every fork
   directory" below.
 

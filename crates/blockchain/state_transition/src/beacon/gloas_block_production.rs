@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use super::block_production::{empty_sync_aggregate, pack_attestations};
+use super::block_production::{Operations, pack_attestations};
 use super::bls;
 use super::config::Config;
 use super::error::{Error, Result, verify};
@@ -349,6 +349,10 @@ pub struct GloasBlockInputs {
     pub randao_reveal: BlsSignature,
     pub graffiti: Bytes32,
     pub attestations: Vec<gloas::Attestation>,
+    /// Slashings, exits and credential changes, as
+    /// [`super::block_production::pack_operations`] returns them for a gloas
+    /// state (electra's shapes, converted into the body here).
+    pub operations: Operations,
     pub payload_attestations: Vec<PayloadAttestation>,
     /// The parent envelope's requests when building on its full payload and
     /// the parent is gloas; empty otherwise.
@@ -372,16 +376,46 @@ pub struct GloasBidBlockInputs {
     pub randao_reveal: BlsSignature,
     pub graffiti: Bytes32,
     pub attestations: Vec<gloas::Attestation>,
+    /// As [`GloasBlockInputs::operations`].
+    pub operations: Operations,
     pub payload_attestations: Vec<PayloadAttestation>,
     pub parent_execution_requests: ExecutionRequests,
     pub signed_bid: SignedExecutionPayloadBid,
+    /// As [`GloasBlockInputs::sync_aggregate`].
+    pub sync_aggregate: SyncAggregate,
+}
+
+impl Operations {
+    /// The four lists in a gloas body's progressive containers, attester
+    /// slashings converted to gloas's `AttesterSlashing`.
+    fn into_gloas_lists(
+        self,
+    ) -> (
+        gloas::ProposerSlashings,
+        gloas::AttesterSlashings,
+        gloas::VoluntaryExits,
+        gloas::BlsToExecutionChanges,
+    ) {
+        let attester_slashings: Vec<gloas::AttesterSlashing> = self
+            .attester_slashings
+            .iter()
+            .map(gloas::AttesterSlashing::from)
+            .collect();
+        (
+            self.proposer_slashings.into(),
+            attester_slashings.into(),
+            self.voluntary_exits.into(),
+            self.bls_to_execution_changes.into(),
+        )
+    }
 }
 
 /// The unsigned block for `state.slot()` committing to `inputs.signed_bid`, a
 /// builder's bid rather than a payload this node built.
 ///
-/// The body is [`assemble_gloas_block`]'s (empty sync aggregate, the state's own
-/// `eth1_data`), with the bid in place of the self-build one. `process_block` on
+/// The body is [`assemble_gloas_block`]'s (the state's own `eth1_data`, the
+/// packed operations and the given sync aggregate), with the bid in place of
+/// the self-build one. `process_block` on
 /// a copy fills `state_root` and enforces `process_execution_payload_bid`:
 /// the builder is active, covers the bid and signed it, and the bid's slot,
 /// parent hash and root and randao are the state's. There is no envelope: the
@@ -398,12 +432,18 @@ pub fn assemble_gloas_block_on_bid(
         matches!(state, BeaconState::Gloas(_)),
         "gloas block production runs on a gloas state",
     )?;
+    let (proposer_slashings, attester_slashings, voluntary_exits, bls_to_execution_changes) =
+        inputs.operations.into_gloas_lists();
     let body = BeaconBlockBody {
         randao_reveal: inputs.randao_reveal,
         eth1_data: state.eth1_data().clone(),
         graffiti: inputs.graffiti,
+        proposer_slashings,
+        attester_slashings,
         attestations: inputs.attestations.into(),
-        sync_aggregate: empty_sync_aggregate(),
+        voluntary_exits,
+        sync_aggregate: inputs.sync_aggregate,
+        bls_to_execution_changes,
         signed_execution_payload_bid: inputs.signed_bid,
         payload_attestations: inputs.payload_attestations.into(),
         parent_execution_requests: inputs.parent_execution_requests,
@@ -479,8 +519,9 @@ pub struct GloasProduced {
 /// The unsigned self-built block for the slot `state` has been advanced to, with
 /// its state root computed, and the unsigned envelope for its payload.
 ///
-/// The body votes the state's own `eth1_data`, carries no slashings, exits or
-/// credential changes (this node pools none) and an empty sync aggregate. The
+/// The body votes the state's own `eth1_data` and carries the slashings, exits
+/// and credential changes in `inputs.operations` (converted to gloas's
+/// containers) and the sync aggregate it is given. The
 /// block is run through gloas's `process_block` on a copy of `state`, which
 /// is also what rejects a body the network would, before anything is signed.
 /// The envelope is then checked against that post-state with every condition
@@ -520,12 +561,18 @@ pub fn assemble_gloas_block(
         blob_kzg_commitments: inputs.blob_kzg_commitments.into(),
         execution_requests_root: inputs.execution_requests.hash_tree_root(),
     };
+    let (proposer_slashings, attester_slashings, voluntary_exits, bls_to_execution_changes) =
+        inputs.operations.into_gloas_lists();
     let body = BeaconBlockBody {
         randao_reveal: inputs.randao_reveal,
         eth1_data: state.eth1_data().clone(),
         graffiti: inputs.graffiti,
+        proposer_slashings,
+        attester_slashings,
         attestations: inputs.attestations.into(),
+        voluntary_exits,
         sync_aggregate: inputs.sync_aggregate,
+        bls_to_execution_changes,
         signed_execution_payload_bid: SignedExecutionPayloadBid {
             message: bid,
             signature: BlsSignature(bls::G2_POINT_AT_INFINITY),
@@ -754,6 +801,7 @@ pub mod test_support {
                 randao_reveal: randao_reveal(state),
                 graffiti: Bytes32::repeat_byte(7),
                 attestations: Vec::new(),
+                operations: Default::default(),
                 payload_attestations,
                 parent_execution_requests: requests,
                 execution_payload: payload_for(&inputs),
@@ -898,6 +946,7 @@ mod gloas_block_production_tests {
         let produced = assemble_gloas_block(
             &state,
             GloasBlockInputs {
+                operations: Default::default(),
                 sync_aggregate: good.clone(),
                 randao_reveal: randao_reveal(&state),
                 graffiti: Bytes32::repeat_byte(7),
@@ -1070,6 +1119,7 @@ mod gloas_block_production_tests {
             assemble_gloas_block(
                 &state,
                 GloasBlockInputs {
+                    operations: Default::default(),
                     sync_aggregate: empty_sync_aggregate(),
                     randao_reveal: BlsSignature(bls::G2_POINT_AT_INFINITY),
                     graffiti: Bytes32::ZERO,
@@ -1123,6 +1173,7 @@ mod gloas_block_production_tests {
         let result = assemble_gloas_block(
             &state,
             GloasBlockInputs {
+                operations: Default::default(),
                 sync_aggregate: empty_sync_aggregate(),
                 randao_reveal: randao_reveal(&state),
                 graffiti: Bytes32::ZERO,
@@ -1163,6 +1214,7 @@ mod gloas_block_production_tests {
         let produced = assemble_gloas_block(
             &state,
             GloasBlockInputs {
+                operations: Default::default(),
                 sync_aggregate: empty_sync_aggregate(),
                 randao_reveal: randao_reveal(&state),
                 graffiti: Bytes32::ZERO,
@@ -1326,6 +1378,7 @@ mod gloas_block_production_tests {
         assemble_gloas_block(
             &state,
             GloasBlockInputs {
+                operations: Default::default(),
                 sync_aggregate: empty_sync_aggregate(),
                 randao_reveal: randao_reveal(&state),
                 graffiti: Bytes32::ZERO,
@@ -1450,9 +1503,11 @@ mod bid_assembly_tests {
             randao_reveal: randao_reveal(state),
             graffiti: Bytes32::repeat_byte(7),
             attestations: Vec::new(),
+            operations: Default::default(),
             payload_attestations: Vec::new(),
             parent_execution_requests: ExecutionRequests::default(),
             signed_bid,
+            sync_aggregate: crate::beacon::block_production::empty_sync_aggregate(),
         }
     }
 

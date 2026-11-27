@@ -707,6 +707,61 @@ pub struct AttesterSlashing {
     pub attestation_2: IndexedAttestation,
 }
 
+impl From<&super::electra::IndexedAttestation> for IndexedAttestation {
+    /// The same attestation in gloas's container: every field carries over,
+    /// only `attesting_indices` moves from electra's bounded list to the
+    /// progressive one.
+    fn from(attestation: &super::electra::IndexedAttestation) -> Self {
+        Self {
+            attesting_indices: attestation.attesting_indices.to_vec().into(),
+            data: attestation.data,
+            signature: attestation.signature,
+        }
+    }
+}
+
+impl TryFrom<&IndexedAttestation> for super::electra::IndexedAttestation {
+    type Error = libssz_types::TypeError;
+
+    /// The inverse of the conversion above. Fails only when the indices exceed
+    /// electra's `MAX_VALIDATORS_PER_SLOT` bound, which gloas's
+    /// `is_valid_indexed_attestation` enforces explicitly, so no valid gloas
+    /// attestation fails it.
+    fn try_from(attestation: &IndexedAttestation) -> Result<Self, Self::Error> {
+        Ok(Self {
+            attesting_indices: attestation.attesting_indices.to_vec().try_into()?,
+            data: attestation.data,
+            signature: attestation.signature,
+        })
+    }
+}
+
+impl From<&super::electra::AttesterSlashing> for AttesterSlashing {
+    /// The same evidence in gloas's container. The operation pool holds
+    /// electra's shape (gossip and the Beacon API agree on it until the fork);
+    /// a gloas block body is filled through this.
+    fn from(slashing: &super::electra::AttesterSlashing) -> Self {
+        Self {
+            attestation_1: (&slashing.attestation_1).into(),
+            attestation_2: (&slashing.attestation_2).into(),
+        }
+    }
+}
+
+impl TryFrom<&AttesterSlashing> for super::electra::AttesterSlashing {
+    type Error = libssz_types::TypeError;
+
+    /// The inverse of the conversion above, for a gloas slashing entering the
+    /// pool. Fails only where one of its attestations is invalid at gloas too
+    /// (see the [`IndexedAttestation`] conversion).
+    fn try_from(slashing: &AttesterSlashing) -> Result<Self, Self::Error> {
+        Ok(Self {
+            attestation_1: (&slashing.attestation_1).try_into()?,
+            attestation_2: (&slashing.attestation_2).try_into()?,
+        })
+    }
+}
+
 /// An aggregate together with proof that its aggregator was selected to
 /// produce it. Unchanged in shape from electra: `aggregate` simply carries
 /// gloas's own, wider [`Attestation`] now.
@@ -1383,5 +1438,38 @@ mod tests {
         assert!(<PayloadAttestationData as libssz::SszEncode>::is_fixed_size());
         assert!(<PayloadAttestationMessage as libssz::SszEncode>::is_fixed_size());
         assert!(<ProposerPreferences as libssz::SszEncode>::is_fixed_size());
+    }
+
+    #[test]
+    fn an_attester_slashing_round_trips_through_electras_shape() {
+        let indexed = |indices: Vec<u64>, slot| super::super::electra::IndexedAttestation {
+            attesting_indices: indices.try_into().expect("far below the bound"),
+            data: AttestationData {
+                slot,
+                ..Default::default()
+            },
+            signature: BlsSignature([7; 96]),
+        };
+        let electra_slashing = super::super::electra::AttesterSlashing {
+            attestation_1: indexed(vec![1, 5, 9], 3),
+            attestation_2: indexed(vec![5, 9, 12], 4),
+        };
+        let gloas_slashing = AttesterSlashing::from(&electra_slashing);
+        assert_eq!(
+            gloas_slashing.attestation_1.attesting_indices.to_vec(),
+            vec![1, 5, 9]
+        );
+        assert_eq!(gloas_slashing.attestation_2.data.slot, 4);
+        // A progressive container and list change the merkle root only: the
+        // bytes are the same, which is what lets gossip publish the electra
+        // encoding on a gloas topic.
+        assert_eq!(gloas_slashing.to_ssz(), electra_slashing.to_ssz());
+        assert_ne!(
+            gloas_slashing.hash_tree_root(),
+            electra_slashing.hash_tree_root()
+        );
+        let decoded = AttesterSlashing::from_ssz_bytes(&gloas_slashing.to_ssz()).unwrap();
+        let back = super::super::electra::AttesterSlashing::try_from(&decoded).unwrap();
+        assert_eq!(back, electra_slashing);
     }
 }

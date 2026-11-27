@@ -270,7 +270,7 @@ fn handle_beacon_gossip(
             | beacon_topics::ATTESTER_SLASHING
             | beacon_topics::BLS_TO_EXECUTION_CHANGE
     ) {
-        triage_operation(server, wire, kind, payload)
+        triage_operation(server, wire, topic_fork, kind, payload)
     } else if let Some(subnet_id) = beacon_topics::sync_committee_subnet(kind) {
         triage_sync_committee_message(server, payload, subnet_id)
     } else if kind == beacon_topics::SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF {
@@ -568,8 +568,24 @@ fn triage_payload_attestation(server: &P2PServer, payload: &[u8]) -> Dispatch {
 /// `proposer_slashing`, `attester_slashing`, `bls_to_execution_change`) and run
 /// its cheap gossip checks: a verdict already, or the operation for
 /// [`verdict::spawn_stateful_checks`] to take further.
-fn triage_operation(server: &P2PServer, wire: &BeaconWire, kind: &str, payload: &[u8]) -> Dispatch {
-    let operation = match beacon_decode::decode_gossip(&wire.config, kind, payload) {
+///
+/// An attester slashing is decoded in the container of `topic_fork`, the fork
+/// of the topic's digest, since that, not the slot of the votes it carries,
+/// sets the payload's type.
+fn triage_operation(
+    server: &P2PServer,
+    wire: &BeaconWire,
+    topic_fork: ForkName,
+    kind: &str,
+    payload: &[u8],
+) -> Dispatch {
+    let decoded = if kind == beacon_topics::ATTESTER_SLASHING {
+        beacon_decode::decode_attester_slashing(topic_fork, payload)
+            .map(|slashing| BeaconGossip::AttesterSlashing(Box::new(slashing)))
+    } else {
+        beacon_decode::decode_gossip(&wire.config, kind, payload)
+    };
+    let operation = match decoded {
         Ok(BeaconGossip::VoluntaryExit(exit)) => BeaconOperation::VoluntaryExit(exit),
         Ok(BeaconGossip::ProposerSlashing(slashing)) => {
             BeaconOperation::ProposerSlashing(*slashing)
@@ -578,11 +594,22 @@ fn triage_operation(server: &P2PServer, wire: &BeaconWire, kind: &str, payload: 
             beacon_decode::AttesterSlashing::Electra(slashing) => {
                 BeaconOperation::AttesterSlashing(slashing)
             }
-            // The pool and the block builder only hold electra's shape:
-            // electra is the earliest fork this node produces blocks for, and
-            // it produces none for gloas.
-            beacon_decode::AttesterSlashing::Phase0(_)
-            | beacon_decode::AttesterSlashing::Gloas(_) => {
+            // The pool, the rules and block production hold electra's shape,
+            // which every gloas slashing converts to unless one of its
+            // attestations names more than `MAX_VALIDATORS_PER_SLOT`
+            // attesters, which gloas's `is_valid_indexed_attestation` rejects.
+            beacon_decode::AttesterSlashing::Gloas(slashing) => {
+                match ethlambda_types::beacon::containers::electra::AttesterSlashing::try_from(
+                    &slashing,
+                ) {
+                    Ok(slashing) => BeaconOperation::AttesterSlashing(slashing),
+                    Err(_) => {
+                        return Dispatch::Report(Outcome::Reject(RejectReason::InvalidOperation));
+                    }
+                }
+            }
+            // Electra is the earliest fork this node validates operations for.
+            beacon_decode::AttesterSlashing::Phase0(_) => {
                 return Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer));
             }
         },
@@ -1707,9 +1734,56 @@ mod tests {
             .expect("a beacon server has a beacon wire");
 
         assert!(matches!(
-            triage_operation(&server, wire, beacon_topics::VOLUNTARY_EXIT, &[0xff; 3]),
+            triage_operation(
+                &server,
+                wire,
+                wire.fork,
+                beacon_topics::VOLUNTARY_EXIT,
+                &[0xff; 3]
+            ),
             Dispatch::Report(Outcome::Reject(RejectReason::Decode))
         ));
+    }
+
+    /// A gloas topic carries gloas's container whatever the slot of the votes
+    /// in it, and the slashing reaches the rules in electra's shape.
+    #[tokio::test]
+    async fn a_gloas_attester_slashing_is_decoded_by_the_topics_fork() {
+        use ethlambda_types::beacon::containers::{electra, gloas};
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        // Two votes for one target epoch over different blocks: a double vote,
+        // which the cheap checks pass on. Slot 0 is a phase0 slot by mainnet's
+        // schedule, so decoding by the votes' slot would have read phase0's
+        // container, which nothing consumes.
+        let indexed = |indices: Vec<u64>, block: u8| electra::IndexedAttestation {
+            attesting_indices: indices.try_into().unwrap(),
+            data: ethlambda_types::beacon::containers::shared::AttestationData {
+                beacon_block_root: ethlambda_types::beacon::primitives::Root::repeat_byte(block),
+                ..Default::default()
+            },
+            signature: Default::default(),
+        };
+        let slashing = electra::AttesterSlashing {
+            attestation_1: indexed(vec![1, 2], 1),
+            attestation_2: indexed(vec![2, 3], 2),
+        };
+        let payload = gloas::AttesterSlashing::from(&slashing).to_ssz();
+
+        let dispatch = triage_operation(
+            &server,
+            wire,
+            ForkName::Gloas,
+            beacon_topics::ATTESTER_SLASHING,
+            &payload,
+        );
+        let Dispatch::Validate(Validated::Operation(operation)) = dispatch else {
+            panic!("a decodable slashing goes on to the stateful checks");
+        };
+        assert_eq!(*operation, BeaconOperation::AttesterSlashing(slashing));
     }
 
     #[tokio::test]
@@ -1729,7 +1803,13 @@ mod tests {
         let payload = exit.to_ssz();
 
         assert!(matches!(
-            triage_operation(&server, wire, beacon_topics::VOLUNTARY_EXIT, &payload),
+            triage_operation(
+                &server,
+                wire,
+                wire.fork,
+                beacon_topics::VOLUNTARY_EXIT,
+                &payload
+            ),
             Dispatch::Validate(Validated::Operation(_))
         ));
     }
