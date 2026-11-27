@@ -3593,7 +3593,8 @@ pub(crate) mod tests {
     use crate::ConnectionDirection;
     use ethlambda_network_api::sync::SyncThresholds;
     use ethlambda_state_transition::beacon::gossip::{
-        Outcome as GossipOutcome, RejectReason as GossipRejectReason,
+        IgnoreReason as GossipIgnoreReason, Outcome as GossipOutcome,
+        RejectReason as GossipRejectReason,
     };
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
     use ethlambda_types::beacon::containers::gloas;
@@ -4609,10 +4610,10 @@ pub(crate) mod tests {
         );
 
         let report = checked.recv().await.expect("the checks report back");
-        assert_eq!(
-            report.reply,
-            ColumnReply::Answered(vec![(1, ColumnVerdict::Delivered)])
-        );
+        // Already stored, which the lookup counts as here.
+        let stored =
+            ColumnVerdict::Dropped(GossipOutcome::Ignore(GossipIgnoreReason::AlreadyStored));
+        assert_eq!(report.reply, ColumnReply::Answered(vec![(1, stored)]));
         assert_eq!(
             report_column_request(&mut server, &report),
             Some(ColumnAttemptOutcome::Complete)
