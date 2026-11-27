@@ -41,18 +41,25 @@
 //! block, in the same budget. A bid naming anyone else is a builder's to
 //! reveal, and is left alone.
 //!
-//! # A builder's bid without `--builder-proposals`
+//! # A builder's bid at gloas, with or without `--builder-proposals`
 //!
-//! Without the flag a gloas block request carries a boost factor of `0`,
-//! which beacon-APIs defines as the local payload unless it cannot be built.
-//! A node whose execution client fails at the slot may therefore build on a
-//! pooled p2p bid, and this client signs that block rather than refusing it.
-//! A refusal would cost the slot as well as its payload, where the bid pays
-//! the fee recipient this validator's preference named. Lighthouse, Prysm and
-//! Teku sign it too, and their nodes fall back the same way; Lodestar refuses
-//! it only in its opt-in `executiononly` mode. Before gloas a blinded block is
-//! refused instead, but for another reason: without the flag this client has
-//! no way to publish one.
+//! A gloas block request carries a boost factor whether or not builder
+//! proposals are on: [`DEFAULT_BUILDER_BOOST_FACTOR`] and a `min_bid` of `0`
+//! unless the operator set others, as Lighthouse, Teku and Nimbus send by
+//! default. A pooled p2p bid therefore competes with the local payload on
+//! value, and a node whose execution client fails at the slot may build on
+//! one. This client signs a block built on such a bid: the bid pays the fee
+//! recipient this validator's preference named, and a refusal would cost the
+//! slot as well as its payload. `--builder-proposals` keeps its pre-gloas
+//! meaning only: before gloas a request without it carries a factor of `0`,
+//! and a blinded block is refused, since without the flag this client has no
+//! way to publish one.
+//!
+//! `--self-build-only` is the opt-out, Lodestar's `executiononly`: a gloas
+//! request carries a factor of `0` and [`SELF_BUILD_ONLY_MIN_BID`], a floor no
+//! bid clears, and a block whose bid names a builder anyway is refused before
+//! slashing protection records the slot. The slot is then missed rather than
+//! signed on a builder's payload, as it is when the local build fails.
 //!
 //! The envelope is not slashable, so slashing protection is untouched by it.
 //!
@@ -110,6 +117,7 @@ use ethlambda_types::beacon::primitives::{
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 use crate::beacon_node::block_contents::{GloasPayload, Producer, signed_envelope_ssz};
@@ -123,6 +131,16 @@ use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
 use crate::slashing_protection::{Refusal, SharedProtection};
 use crate::slot_clock::SlotClock;
+
+/// The `builder_boost_factor` a gloas block request carries unless the
+/// operator sets another: beacon-APIs' own default, which compares a pooled
+/// p2p bid and the local payload as they are.
+pub const DEFAULT_BUILDER_BOOST_FACTOR: u64 = 100;
+
+/// The `min_bid` a gloas block request carries with `--self-build-only`, in
+/// gwei: `2^64 - 1`, a floor no real bid's value plus execution payment
+/// clears, as Lodestar's `executiononly` sends it.
+pub const SELF_BUILD_ONLY_MIN_BID: u64 = u64::MAX;
 
 /// What became of a proposal, as the duty loop needs it.
 ///
@@ -200,12 +218,19 @@ pub struct ProposalService<B> {
     /// What every validator has signed, shared with the attestation service
     /// and the keymanager. See [`crate::slashing_protection`].
     protection: SharedProtection,
-    /// The `builder_boost_factor` sent with each block request, or `None` when
-    /// builder proposals are off, in which case a blinded answer is refused.
+    /// The `builder_boost_factor` sent with each block request before gloas,
+    /// or `None` when builder proposals are off, in which case a blinded
+    /// answer is refused.
     builder_boost_factor: Option<u64>,
+    /// The `builder_boost_factor` sent with each gloas block request, with or
+    /// without builder proposals. [`DEFAULT_BUILDER_BOOST_FACTOR`] unless set.
+    gloas_boost_factor: u64,
     /// The `min_bid` sent with each gloas block request, in gwei: the floor
     /// below which the node takes no p2p bid. `0` unless set.
     builder_min_bid: u64,
+    /// `--self-build-only`: from gloas, ask for no bid at all and refuse a
+    /// block built on one. Overrides the two fields above at gloas.
+    self_build_only: bool,
     /// Where a slot starts, so each block's publication delay is taken as the
     /// node accepts it. `None` observes nothing.
     clock: Option<SlotClock>,
@@ -213,6 +238,10 @@ pub struct ProposalService<B> {
     /// block may rightly pay instead of the current one. `None` compares
     /// against the current one alone.
     preferences: Option<Arc<PreferencesService<B>>>,
+    /// Where a signed blinded block's publish runs, so a shutdown can wait
+    /// for it. The service's own tracker unless [`Self::with_tasks`] gives it
+    /// the client's.
+    tasks: TaskTracker,
     /// Where each proposal's outcome is counted, and its block's later check.
     /// `None` counts and checks nothing.
     performance: Option<Arc<Performance>>,
@@ -232,9 +261,12 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             settings,
             protection,
             builder_boost_factor,
+            gloas_boost_factor: DEFAULT_BUILDER_BOOST_FACTOR,
             builder_min_bid: 0,
+            self_build_only: false,
             clock: None,
             preferences: None,
+            tasks: TaskTracker::new(),
             performance: None,
         }
     }
@@ -295,6 +327,41 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         self
     }
 
+    /// Send `factor` as every gloas block request's `builder_boost_factor`,
+    /// in place of [`DEFAULT_BUILDER_BOOST_FACTOR`]. Builder proposals or
+    /// not: they only decide the factor before gloas.
+    pub fn with_gloas_boost_factor(mut self, factor: u64) -> Self {
+        self.gloas_boost_factor = factor;
+        self
+    }
+
+    /// `--self-build-only` when `on`: every gloas block request asks for no
+    /// bid (a factor of `0` and [`SELF_BUILD_ONLY_MIN_BID`]), and a block
+    /// whose bid names a builder anyway is refused before slashing protection
+    /// records the slot. One switch for the three, so they cannot be set
+    /// apart.
+    pub fn with_self_build_only(mut self, on: bool) -> Self {
+        self.self_build_only = on;
+        self
+    }
+
+    /// The `builder_boost_factor` and `min_bid` a block request at `fork`
+    /// carries.
+    ///
+    /// Before gloas, builder proposals' factor, or `None` without them, which
+    /// sends `0` and refuses a blinded answer; `min_bid` goes nowhere there.
+    /// From gloas the factor is always sent, in `produceBlockV4`'s body, and
+    /// the answer is never blinded, so `Some` opens no blinded path.
+    fn bid_terms(&self, fork: ForkName) -> (Option<u64>, u64) {
+        if fork < ForkName::Gloas {
+            return (self.builder_boost_factor, self.builder_min_bid);
+        }
+        if self.self_build_only {
+            return (Some(0), SELF_BUILD_ONLY_MIN_BID);
+        }
+        (Some(self.gloas_boost_factor), self.builder_min_bid)
+    }
+
     /// Give the service the proposer preferences this client published, so
     /// the fee recipient check accepts the address a gloas block's node was
     /// given in them.
@@ -309,6 +376,14 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     /// not. Without it no delay is taken.
     pub fn with_clock(mut self, clock: SlotClock) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// Run each signed blinded block's publish on `tasks`, which the client
+    /// closes and waits for when a shutdown signal stops it, so the publish
+    /// is not dropped with the process (see [`Self::publish_blinded`]).
+    pub fn with_tasks(mut self, tasks: TaskTracker) -> Self {
+        self.tasks = tasks;
         self
     }
 
@@ -522,14 +597,16 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         // compares against the address in force when the request went out.
         let graffiti = self.settings.graffiti(&pubkey);
         let fee_recipient = self.settings.fee_recipient(&pubkey);
+        let request_fork = self.context.config().fork_at_epoch(epoch);
+        let (builder_boost_factor, builder_min_bid) = self.bid_terms(request_fork);
         let request = BlockRequest {
             slot,
-            fork: self.context.config().fork_at_epoch(epoch),
+            fork: request_fork,
             proposer_index: duty.validator_index,
             randao_reveal,
             graffiti,
-            builder_boost_factor: self.builder_boost_factor,
-            builder_min_bid: self.builder_min_bid,
+            builder_boost_factor,
+            builder_min_bid,
         };
         let mut produced = self.beacon_node.produce_block(&request).await?;
 
@@ -552,11 +629,27 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         // blinded block, so signing one would record the slot in slashing
         // protection for a block that can never be sent. A gloas block built
         // on a builder's bid is not refused here: it is a full block, and the
-        // module doc says why it is signed.
+        // module doc says why it is signed (unless `--self-build-only`, below).
         if produced.is_blinded() && self.builder_boost_factor.is_none() {
             return Err(Error::InconsistentResponse(format!(
                 "node produced a blinded block for slot {slot}; builder proposals are off, so \
                  this client cannot publish one"
+            )));
+        }
+
+        // `--self-build-only`. The request's `min_bid` is a floor no bid
+        // clears, but a node may ignore it (one that does not read `min_bid`
+        // would), so the bid is checked here as well. Like the blinded check
+        // above, before slashing protection records the slot, so a refusal
+        // leaves the slot unrecorded and unsigned; the duty is then a missed
+        // proposal, which is what this mode chooses over a builder's payload.
+        if self.self_build_only
+            && let Some(builder_index) = produced.builder_index()
+            && builder_index != BUILDER_INDEX_SELF_BUILD
+        {
+            return Err(Error::InconsistentResponse(format!(
+                "node built the gloas block for slot {slot} on builder {builder_index}'s bid; \
+                 --self-build-only signs only a self-built payload"
             )));
         }
 
@@ -684,6 +777,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             pubkey,
             fork,
             block_root,
+            producer,
             payload,
             builder_index,
             body,
@@ -709,8 +803,9 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             // Logged and counted rather than propagated. The block is out and
             // the proposal did happen; what failed is the reveal, which has its
             // own series because it is the failure that costs the payload.
-            let reveal =
-                self.publish_envelope(slot, validator, &pubkey, block_root, payload, store);
+            let reveal = self.publish_envelope(
+                slot, validator, &pubkey, block_root, producer, payload, store,
+            );
             let _ = before(deadline, slot, reveal)
                 .await
                 .inspect(|()| crate::metrics::inc_envelopes_published())
@@ -742,12 +837,17 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     /// be for this block and this self-build before it is signed: the signature
     /// covers the envelope as it stands, so one for another block would be a
     /// valid signature on the wrong payload.
+    ///
+    /// `producer` is the node that built the block, which the fallback sends
+    /// the envelope to first under `--broadcast blocks`.
+    #[allow(clippy::too_many_arguments)]
     async fn publish_envelope(
         &self,
         slot: Slot,
         validator: u64,
         pubkey: &BlsPubkey,
         block_root: Root,
+        producer: Producer,
         payload: Option<GloasPayload>,
         store: &RwLock<ValidatorStore>,
     ) -> Result<()> {
@@ -783,8 +883,10 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
             Some(payload) => payload.into_signed_contents_ssz(signature),
             None => signed_envelope_ssz(envelope, signature),
         };
+        // Signed once, above; under `--broadcast blocks` the same body goes to
+        // every node, the block's producer first.
         self.beacon_node
-            .publish_execution_payload_envelope(&body, included)
+            .publish_execution_payload_envelope_produced_by(producer, &body, included)
             .await?;
         info!(%slot, validator, bytes = body.len(), blob_data_included = included, "Envelope published");
         Ok(())
@@ -796,7 +898,9 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
     ///
     /// The request runs on a spawned task, so neither the deadline nor a
     /// dropped proposal cancels it: the beacon node may wait up to 5 s on the
-    /// relay, and the block may already be out. The task logs and counts the
+    /// relay, and the block may already be out. The task is spawned on the
+    /// service's [`TaskTracker`], so a shutdown signal waits for it as well
+    /// (see [`Self::with_tasks`]). The task logs and counts the
     /// node's answer ([`blinded_outcome`]) and hands the outcome back over a
     /// channel. Whoever holds it then does the rest: the duty loop when this
     /// returns it in time, and the task itself when this has stopped waiting
@@ -839,7 +943,7 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
         // check of its own.
         let check = self.later_check(slot, validator, block_root);
         let (handoff, mut outcome) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             let bytes = body.len();
             let answer = beacon_node
                 .publish_blinded_block(producer, fork, &body)
@@ -1594,6 +1698,49 @@ mod tests {
         assert_eq!(node.block_requests().len(), 1);
     }
 
+    /// A blinded publish that outlives its proposal runs on the tracker the
+    /// client gave the service, so a shutdown that closes the tracker and
+    /// waits for it holds on until the node has answered.
+    #[tokio::test]
+    async fn a_blinded_publish_still_going_is_on_the_clients_tracker() {
+        let (store, pubkey) = store();
+        let relay_answers = Arc::new(tokio::sync::Semaphore::new(0));
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_block(slot(), 7)
+                .with_blinded_block()
+                .with_blinded_publish_gate(relay_answers.clone()),
+        );
+        let tasks = TaskTracker::new();
+        let service = builder_service(node.clone(), None).with_tasks(tasks.clone());
+
+        // Past the deadline the same way as the test above.
+        let at_the_node = node.blinded_publish_entered.clone();
+        let this_duty = duty(&pubkey, 7, slot());
+        let hour = std::time::Duration::from_secs(3600);
+        let proposal = service.propose_by(slot(), &this_duty, &store, Instant::now() + hour);
+        tokio::pin!(proposal);
+        tokio::select! {
+            outcome = &mut proposal => {
+                panic!("the node is still waiting on the relay, yet the proposal ended: {outcome:?}")
+            }
+            () = at_the_node.notified() => {}
+        }
+        tokio::time::pause();
+        tokio::time::advance(hour * 2).await;
+        let outcome = proposal.await.expect("signed, so not an error");
+        tokio::time::resume();
+        assert_eq!(outcome, Proposed::Blinded(BlindedOutcome::StillPublishing));
+
+        tasks.close();
+        assert_eq!(tasks.len(), 1, "the publish is the client's to wait for");
+        relay_answers.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), tasks.wait())
+            .await
+            .expect("the wait ends once the node answers");
+        assert_eq!(node.published_blinded.lock().expect("lock").len(), 1);
+    }
+
     /// The duty loop's entry point, with the deadline far off: a full block
     /// and a blinded one both come back confirmed, as from `propose`.
     #[tokio::test]
@@ -1763,6 +1910,40 @@ mod tests {
         assert_eq!(published, Proposed::Full(Published::Imported));
         assert_eq!(node.block_requests()[0].builder_boost_factor, None);
         assert!(node.published_blinded.lock().expect("lock").is_empty());
+    }
+
+    /// The gloas factor and `--self-build-only` leave a request before gloas
+    /// as it was: no factor without builder proposals, so `0` on the wire and
+    /// a blinded answer refused, and the factor builder proposals give with
+    /// them.
+    #[tokio::test]
+    async fn the_gloas_bid_settings_leave_a_pre_gloas_request_as_it_was() {
+        for (pre_gloas_factor, self_build_only) in [(None, false), (None, true), (Some(100), false)]
+        {
+            let (store, pubkey) = store();
+            let node = Arc::new(MockBeaconNode::new().with_block(slot(), 7));
+            let settings = ProposerSettings::new(Bytes32::repeat_byte(0xab), None);
+            ProposalService::new(
+                node.clone(),
+                context(),
+                Arc::new(settings),
+                SlashingProtection::in_memory(),
+                pre_gloas_factor,
+            )
+            .with_gloas_boost_factor(250)
+            .with_self_build_only(self_build_only)
+            .propose(slot(), &duty(&pubkey, 7, slot()), &store)
+            .await
+            .expect("proposes");
+
+            let request = node.block_requests().remove(0);
+            assert_eq!(request.fork, ForkName::Electra);
+            assert_eq!(
+                request.builder_boost_factor, pre_gloas_factor,
+                "{self_build_only}"
+            );
+            assert_eq!(request.builder_min_bid, 0, "{self_build_only}");
+        }
     }
 
     /// A node breaking its contract with a blinded answer to a request with no
@@ -2222,8 +2403,9 @@ mod gloas_tests {
     /// nothing for it.
     ///
     /// The block itself is signed and published, with builder proposals off
-    /// too (this module's service has none): that is the block a node whose
-    /// local build failed builds on a pooled bid. See the module doc.
+    /// too (this module's service has none): that is the block a node builds
+    /// on a pooled bid that beat the local payload, or stood in for a local
+    /// build that failed. See the module doc.
     #[tokio::test]
     async fn a_builders_bid_gets_no_envelope_from_this_client() {
         let (store, pubkey) = store();
@@ -2298,6 +2480,132 @@ mod gloas_tests {
             .await
             .expect("the block was published");
         assert_eq!(published, Proposed::Full(Published::Imported));
+        assert!(node.published_envelopes().is_empty());
+    }
+
+    /// Without builder proposals (this module's service has none) a gloas
+    /// request lets pooled p2p bids compete: a factor of 100 and no floor, as
+    /// Lighthouse, Teku and Nimbus send by default.
+    #[tokio::test]
+    async fn by_default_a_gloas_request_lets_bids_compete_at_par() {
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_gloas_block(
+            slot(),
+            7,
+            BUILDER_INDEX_SELF_BUILD,
+            true,
+        ));
+        service(node.clone())
+            .propose(slot(), &duty(&pubkey), &store)
+            .await
+            .expect("proposes");
+
+        let request = node.block_requests().remove(0);
+        assert_eq!(request.fork, ForkName::Gloas);
+        assert_eq!(
+            request.builder_boost_factor,
+            Some(DEFAULT_BUILDER_BOOST_FACTOR)
+        );
+        assert_eq!(request.builder_boost_factor, Some(100));
+        assert_eq!(request.builder_min_bid, 0);
+    }
+
+    /// An explicit factor and floor replace the defaults, builder proposals or
+    /// not, and the pre-gloas factor does not leak into a gloas request.
+    #[tokio::test]
+    async fn an_explicit_gloas_factor_and_min_bid_win() {
+        for pre_gloas_factor in [None, Some(7)] {
+            let (store, pubkey) = store();
+            let node = Arc::new(MockBeaconNode::new().with_gloas_block(
+                slot(),
+                7,
+                BUILDER_INDEX_SELF_BUILD,
+                true,
+            ));
+            let settings = ProposerSettings::new(
+                ethlambda_types::beacon::primitives::Bytes32::repeat_byte(0xab),
+                None,
+            );
+            ProposalService::new(
+                node.clone(),
+                context(),
+                Arc::new(settings),
+                SlashingProtection::in_memory(),
+                pre_gloas_factor,
+            )
+            .with_gloas_boost_factor(250)
+            .with_builder_min_bid(1_000_000)
+            .propose(slot(), &duty(&pubkey), &store)
+            .await
+            .expect("proposes");
+
+            let request = node.block_requests().remove(0);
+            assert_eq!(
+                request.builder_boost_factor,
+                Some(250),
+                "{pre_gloas_factor:?}"
+            );
+            assert_eq!(request.builder_min_bid, 1_000_000, "{pre_gloas_factor:?}");
+        }
+    }
+
+    fn self_build_only(node: Arc<MockBeaconNode>) -> ProposalService<MockBeaconNode> {
+        // A factor and a floor set too, to show the opt-out overrides both.
+        service(node)
+            .with_gloas_boost_factor(250)
+            .with_builder_min_bid(5)
+            .with_self_build_only(true)
+    }
+
+    /// `--self-build-only` asks for no bid: a factor of `0` and a floor no
+    /// bid clears. A self-built block is still signed, and its envelope
+    /// revealed.
+    #[tokio::test]
+    async fn self_build_only_asks_for_no_bid_and_signs_a_self_build() {
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_gloas_block(
+            slot(),
+            7,
+            BUILDER_INDEX_SELF_BUILD,
+            true,
+        ));
+        let published = self_build_only(node.clone())
+            .propose(slot(), &duty(&pubkey), &store)
+            .await
+            .expect("a self-built block is signed");
+        assert_eq!(published, Proposed::Full(Published::Imported));
+
+        let request = node.block_requests().remove(0);
+        assert_eq!(request.builder_boost_factor, Some(0));
+        assert_eq!(request.builder_min_bid, SELF_BUILD_ONLY_MIN_BID);
+        assert_eq!(request.builder_min_bid, u64::MAX);
+        assert_eq!(node.published_blocks().len(), 1);
+        assert_eq!(node.published_envelopes().len(), 1);
+    }
+
+    /// A node that builds on a builder's bid anyway (one that ignores
+    /// `min_bid`) gets no signature: the block is refused before slashing
+    /// protection records the slot. The second attempt reaches the node and
+    /// is refused for the same reason, not by slashing protection, which
+    /// shows nothing was recorded.
+    #[tokio::test]
+    async fn self_build_only_refuses_a_builders_block_before_recording_the_slot() {
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_gloas_block(slot(), 7, 3, true));
+        let service = self_build_only(node.clone());
+
+        for attempt in 0..2 {
+            let err = service
+                .propose(slot(), &duty(&pubkey), &store)
+                .await
+                .expect_err("a builder's block must not be signed");
+            assert!(
+                matches!(&err, Error::InconsistentResponse(reason) if reason.contains("builder 3")),
+                "attempt {attempt}: got {err:?}"
+            );
+        }
+        assert_eq!(node.block_requests().len(), 2);
+        assert!(node.published_blocks().is_empty());
         assert!(node.published_envelopes().is_empty());
     }
 }

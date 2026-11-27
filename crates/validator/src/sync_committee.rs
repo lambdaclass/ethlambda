@@ -3,7 +3,9 @@
 //! # What is owed
 //!
 //! A member of the current sync committee signs the head block root once per
-//! slot (`SyncCommitteeMessage`), at the sync-message deadline. The 512 seats
+//! slot (`SyncCommitteeMessage`), when the slot's block arrives or at the
+//! sync-message deadline, whichever comes first (see
+//! [`crate::head_monitor`]). The 512 seats
 //! are split into four subcommittees; within each, a few members are selected
 //! by a hash of their selection proof to fold the subcommittee's messages into
 //! a `SyncCommitteeContribution` and publish it, which is how the messages
@@ -11,8 +13,9 @@
 //!
 //! # Which slot, and which root
 //!
-//! The message carries the wall slot and the head root at the deadline, which
-//! may be an older block when slots were skipped. A member assigned to wall
+//! The message carries the wall slot and the head root when it is signed (on
+//! the slot's block, or at the deadline), which may be an older block when
+//! slots were skipped. A member assigned to wall
 //! slot `S` signs for `S - 1`; the caller picks the duties accordingly (see
 //! [`crate::duties::DutiesService::sync_at_slot`]).
 //!
@@ -127,17 +130,60 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         duties: &[SyncDutyDto],
         store: &RwLock<ValidatorStore>,
     ) -> Result<Option<Root>> {
-        let pending: Vec<&SyncDutyDto> = {
-            let done = self.lock();
-            duties
-                .iter()
-                .filter(|duty| !done.contains(&(duty.validator_index, slot)))
-                .collect()
-        };
-        if pending.is_empty() {
+        if self.pending(slot, duties).is_empty() {
             return Ok(None);
         }
 
+        let root = match self.head_block_root().await {
+            Ok(root) => root,
+            Err(Error::BeaconNodeSyncing) => {
+                // Not a failure: nothing may be signed over this head, so
+                // nothing is counted.
+                warn!(%slot, "Head is optimistic or the node is syncing; not signing sync committee messages");
+                return Ok(None);
+            }
+            Err(err) => {
+                // `publish_messages_over`'s count never starts, so the
+                // pending duties are counted failed here, as an early `?`
+                // there counts them.
+                drop(Batch::new(
+                    self.performance.as_ref(),
+                    Duty::SyncCommitteeMessage,
+                    slot,
+                    self.pending(slot, duties)
+                        .iter()
+                        .map(|duty| duty.validator_index),
+                ));
+                return Err(err);
+            }
+        };
+        self.publish_messages_over(slot, duties, store, root).await
+    }
+
+    /// The head root a message would sign, with nothing recorded and nothing
+    /// signed. `BeaconNodeSyncing` for a head the node reports optimistic.
+    ///
+    /// For a caller that must look at the root before committing to it: the
+    /// duty loop's early trigger signs only the block a head event announced,
+    /// and otherwise leaves the duty to its deadline (see
+    /// [`crate::head_monitor`]).
+    pub async fn head_block_root(&self) -> Result<Root> {
+        self.beacon_node.head_block_root().await
+    }
+
+    /// [`Self::publish_messages`] over `root`, a head root already fetched
+    /// with [`Self::head_block_root`], instead of fetching it here.
+    pub async fn publish_messages_over(
+        &self,
+        slot: Slot,
+        duties: &[SyncDutyDto],
+        store: &RwLock<ValidatorStore>,
+        root: Root,
+    ) -> Result<Option<Root>> {
+        let pending = self.pending(slot, duties);
+        if pending.is_empty() {
+            return Ok(None);
+        }
         // Each pending duty counts once, published or failed, however this
         // call ends: an early `?` or the duty loop's deadline counts it failed.
         let mut outcomes = Batch::new(
@@ -146,16 +192,6 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
             slot,
             pending.iter().map(|duty| duty.validator_index),
         );
-        let root = match self.beacon_node.head_block_root().await {
-            Ok(root) => root,
-            Err(Error::BeaconNodeSyncing) => {
-                // Not a failure: nothing may be signed over this head.
-                outcomes.skip_all();
-                warn!(%slot, "Head is optimistic or the node is syncing; not signing sync committee messages");
-                return Ok(None);
-            }
-            Err(err) => return Err(err),
-        };
 
         // Recorded one by one, then signed all at once, each within the
         // signing budget: a hung remote signer costs only its own keys'
@@ -346,6 +382,15 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         info!(%slot, count = signed.len(), "Published sync committee contributions");
         crate::metrics::inc_sync_contributions_published(signed.len() as u64);
         Ok(signed.len())
+    }
+
+    /// The duties not yet served for `slot`.
+    fn pending<'d>(&self, slot: Slot, duties: &'d [SyncDutyDto]) -> Vec<&'d SyncDutyDto> {
+        let done = self.lock();
+        duties
+            .iter()
+            .filter(|duty| !done.contains(&(duty.validator_index, slot)))
+            .collect()
     }
 
     fn record(&self, validator: ValidatorIndex, slot: Slot) -> bool {

@@ -11,9 +11,14 @@
 //!
 //! # Timing
 //!
-//! Due at `PAYLOAD_ATTESTATION_DUE_BPS` of the slot, three quarters of the way
-//! in, which is when the node's view of the payload is as complete as it will
-//! be. See [`crate::slot_clock::SlotClock::until_payload_attestation`].
+//! As soon as the node has the slot's payload and its blob data, and no later
+//! than `PAYLOAD_ATTESTATION_DUE_BPS` of the slot, three quarters of the way
+//! in. The early trigger is the node's `execution_payload_available` event for
+//! the slot's block, and it signs only data that says both are there: the
+//! block alone never starts the vote (see [`crate::head_monitor`]). Otherwise
+//! the vote waits for the deadline, when the node's view of the payload is as
+//! complete as it will be. See
+//! [`crate::slot_clock::SlotClock::until_payload_attestation`].
 //!
 //! # No block, no vote
 //!
@@ -44,7 +49,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage;
+use ethlambda_types::beacon::containers::gloas::{
+    PayloadAttestationData, PayloadAttestationMessage,
+};
 use ethlambda_types::beacon::primitives::{Slot, ValidatorIndex};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -105,22 +112,72 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
         duties: &[PtcDutyDto],
         store: &RwLock<ValidatorStore>,
     ) -> Result<usize> {
-        if duties.is_empty() {
+        // Cheap pre-check, so a slot already served costs the node no request.
+        if self.pending(slot, duties).is_empty() {
             return Ok(0);
         }
 
-        // Cheap pre-check, so a slot already served costs the node no request.
-        let pending: Vec<&PtcDutyDto> = {
-            let done = self.lock();
-            duties
-                .iter()
-                .filter(|duty| !done.contains(&(duty.validator_index, slot)))
-                .collect()
+        let data = match self.data(slot).await {
+            Ok(Some(data)) => data,
+            Ok(None) => {
+                // Not a failure: there is nothing to vote on, so nothing is
+                // counted.
+                info!(%slot, "No block known for this slot; not voting on its payload");
+                return Ok(0);
+            }
+            // Every node's last sync probe said syncing or optimistic, so none
+            // was asked: see "Optimistic heads" above. Not a failure either:
+            // nothing may be signed over such a head.
+            Err(Error::BeaconNodeSyncing) => {
+                warn!(%slot, "Every beacon node is syncing or on an optimistic head; not voting on this slot's payload");
+                return Ok(0);
+            }
+            Err(err) => {
+                // `attest_with`'s count never starts, so the pending votes
+                // are counted failed here, as an early `?` there counts them.
+                drop(Batch::new(
+                    self.performance.as_ref(),
+                    Duty::PayloadAttestation,
+                    slot,
+                    self.pending(slot, duties)
+                        .iter()
+                        .map(|duty| duty.validator_index),
+                ));
+                return Err(err);
+            }
         };
+        self.attest_with(slot, duties, store, data).await
+    }
+
+    /// What the node says the committee should vote at `slot`, checked to be
+    /// about `slot`, with nothing recorded and nothing signed. `None` when the
+    /// node knows no block for the slot (204).
+    ///
+    /// For a caller that must look at the data before committing to it: the
+    /// duty loop's early trigger votes only on data that says the payload and
+    /// its blob data are there, and otherwise leaves the duty to its deadline
+    /// (see [`crate::head_monitor`]).
+    pub async fn data(&self, slot: Slot) -> Result<Option<PayloadAttestationData>> {
+        let data = self.beacon_node.payload_attestation_data(slot).await?;
+        if let Some(data) = &data {
+            check_slot(slot, data)?;
+        }
+        Ok(data)
+    }
+
+    /// [`Self::attest`], over `data` already fetched for `slot` with
+    /// [`Self::data`] instead of fetching it here.
+    pub async fn attest_with(
+        &self,
+        slot: Slot,
+        duties: &[PtcDutyDto],
+        store: &RwLock<ValidatorStore>,
+        data: PayloadAttestationData,
+    ) -> Result<usize> {
+        let pending = self.pending(slot, duties);
         if pending.is_empty() {
             return Ok(0);
         }
-
         // Each pending vote counts once, published or failed, however this
         // call ends: an early `?` or the duty loop's deadline counts it failed.
         let mut outcomes = Batch::new(
@@ -129,35 +186,12 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
             slot,
             pending.iter().map(|duty| duty.validator_index),
         );
-        let data = match self.beacon_node.payload_attestation_data(slot).await {
-            Ok(Some(data)) => data,
-            Ok(None) => {
-                // Not a failure: there is nothing to vote on.
-                outcomes.skip_all();
-                info!(%slot, "No block known for this slot; not voting on its payload");
-                return Ok(0);
-            }
-            // Every node's last sync probe said syncing or optimistic, so none
-            // was asked: see "Optimistic heads" above. Not a failure either:
-            // nothing may be signed over such a head.
-            Err(Error::BeaconNodeSyncing) => {
-                outcomes.skip_all();
-                warn!(%slot, "Every beacon node is syncing or on an optimistic head; not voting on this slot's payload");
-                return Ok(0);
-            }
-            Err(err) => return Err(err),
-        };
 
         // Checked again here, having already been checked by the
         // implementation (see `BeaconNodeApi::payload_attestation_data`), for
         // the reason the attestation duty does: the trait is public, and this
         // is the last point before the data becomes a signature.
-        if data.slot != slot {
-            return Err(crate::error::Error::InconsistentResponse(format!(
-                "requested payload attestation data for slot {slot}, node answered for slot {}",
-                data.slot
-            )));
-        }
+        check_slot(slot, &data)?;
 
         // Recorded one by one before anything is signed, so a signature that
         // exists is one the record already knows about; then signed all at
@@ -230,6 +264,15 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
         Ok(published)
     }
 
+    /// The duties not yet served for `slot`.
+    fn pending<'d>(&self, slot: Slot, duties: &'d [PtcDutyDto]) -> Vec<&'d PtcDutyDto> {
+        let done = self.lock();
+        duties
+            .iter()
+            .filter(|duty| !done.contains(&(duty.validator_index, slot)))
+            .collect()
+    }
+
     /// Record that `validator` is being served for `slot`. `false` when it
     /// already was, or when the record is unusable, which is treated as a
     /// refusal for the reason the other guards' poisoned locks are.
@@ -250,6 +293,17 @@ impl<B: BeaconNodeApi> PayloadAttestationService<B> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// `data` is about `slot`, or the node answered a question it was not asked.
+fn check_slot(slot: Slot, data: &PayloadAttestationData) -> Result<()> {
+    if data.slot != slot {
+        return Err(crate::error::Error::InconsistentResponse(format!(
+            "requested payload attestation data for slot {slot}, node answered for slot {}",
+            data.slot
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

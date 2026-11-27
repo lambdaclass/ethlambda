@@ -538,11 +538,6 @@ impl Batch {
         self.pending.remove(&validator);
     }
 
-    /// [`Self::skip`] every validator not yet resolved.
-    pub(crate) fn skip_all(&mut self) {
-        self.pending.clear();
-    }
-
     /// What the node made of the messages `sent` carried: every one accepted
     /// when `accepted` covers them all, and otherwise `accepted` of them
     /// without saying which, counted under `other` (see the module doc).
