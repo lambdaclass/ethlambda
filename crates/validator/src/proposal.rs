@@ -522,8 +522,9 @@ impl<B: BeaconNodeApi + 'static> ProposalService<B> {
 
         // The graffiti reads `--graffiti-file` afresh, so an edit to the file
         // reaches this proposal. Alongside the RANDAO signature, a round trip
-        // when a remote signer holds the key, so a slow file costs the block
-        // request no time of its own.
+        // when a remote signer holds the key, so a slow file delays the block
+        // request only by what it takes beyond the signature, and by at most
+        // `READ_TIMEOUT` (nothing once a stalled read has run that long).
         let (randao_reveal, graffiti) = tokio::join!(
             self.context.sign_randao(store, &pubkey, epoch),
             self.settings.next_graffiti(&pubkey)

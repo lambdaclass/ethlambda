@@ -1205,9 +1205,13 @@ the same way, so a stalled mount cannot cost a proposal its slot; the read
 runs alongside the RANDAO signature, so it adds nothing when that takes as
 long. Each read runs on a thread of its own, and only one runs at a time: a
 proposal or `GET graffiti` that comes while one runs takes that read's answer
-rather than starting another. So a stalled file holds one thread, and never
-one slashing protection runs on. A UTF-8 byte-order mark at the start of the
-file is ignored.
+rather than starting another. The 250 ms count from the read's start, so a
+caller that joins a running read waits only what is left of them, and one
+that finds the read running longer than that skips the file at once. So a
+stalled file holds one thread, never one slashing protection runs on, and
+costs a proposal at most 250 ms; and a caller that joins a read takes the
+file as it was at most 250 ms before it asked. A UTF-8 byte-order mark at the
+start of the file is ignored.
 
 One thing differs from Lighthouse besides the reload: the keymanager API's
 graffiti routes stay open while the file is set: a `POST graffiti` is written to `validator_definitions.yml` and
