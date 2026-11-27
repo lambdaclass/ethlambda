@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c139ba93.js";
+            window.path_to_searchindex_js = "searchindex-25c7298d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -2940,10 +2940,28 @@ whether validation competes with block import: see “Validation contention” i
 message; a message whose dependency is not ready yet is IGNOREd. See
 <a href="#aggregate-attestations">Aggregate attestations</a> for the two topics with
 their own section.</p>
-<p>Blocks and data column sidecars are, either way, handed to the chain actor,
-which parks what it cannot import yet and imports the rest immediately, such
-as a sidecar whose slot merely falls outside its parent state’s proposer
-lookahead. An aggregate reaches the chain actor only on <code>Accept</code>, carrying the
+<p>A block reaches the chain actor only once its proposer signature has
+verified: on <code>Accept</code>, or on <code>Queue</code> for one whose parent has no post-state
+yet but whose signature the cached head state checked. A block gossip could
+not judge that far (no cached head state, a proposer that state does not
+hold, or no free validation permit) is dropped, because the chain actor keeps
+a waiting block unjudged until its parent and then its custody columns
+arrive, and mainnet gossip carries altered copies of real blocks that no peer
+has columns for. A real block dropped here still arrives through a child’s
+by-root fetch or range sync, and the chain actor checks the signature of
+those too before it lets one wait (see
+<code>lean_beacon_blocks_refused_before_waiting_total</code> in
+<a href="#metrics-2">metrics.md</a>). The one exception is a block waiting for its
+parent whose proposer the head state does not hold: the actor parks it
+rather than refusing it, since a node catching up after downtime has a head
+older than the validators registered since, and range sync parks every block
+behind a parent still held for its columns. A refused copy takes nothing
+parked behind its root with it: the root does not cover the signature, so a
+validly signed copy can still follow. Data column sidecars are, either way,
+handed to the chain actor, which parks what it cannot import yet and imports
+the rest
+immediately, such as a sidecar whose slot merely falls outside its parent
+state’s proposer lookahead. An aggregate reaches the chain actor only on <code>Accept</code>, carrying the
 attesting indices gossip validation resolved. A subnet attestation never
 reaches it at all, on any outcome: verifying and relaying it is the whole of
 what this node owes the topic (see above), so there is nothing further for the
@@ -4151,20 +4169,22 @@ is also admitted against a budget, before the precheck runs:
 <code>MAX_ASKS_PER_SLOT</code> (4) per block slot, spent whether or not the precheck
 passes, and <code>MAX_ASKS_IN_FLIGHT</code> (4) at once, held from the engine call through
 the cell computation and the chain checks. That bounds the BLS verifications
-on the chain actor and the blocking-pool work a flood of forged roots can buy.
-The cost: forged roots that arrive first can spend a slot’s budget before the
-genuine block, which is then left to gossip and the peer asks, where a miss
-leaves it anyway. Skips are counted in
+this ask adds on the chain actor and the blocking-pool work a flood of roots
+can buy. A root whose signature fails never gets that far: the import runs the
+same precheck before it holds a block (<code>precheck_before_waiting</code>) and refuses
+it instead. What reaches the budget was signed by the validator it names,
+which past the parent state’s proposer lookahead need not be the slot’s
+proposer (see below). The cost: such roots that arrive first can spend a
+slot’s budget before the genuine block, which is then left to gossip and the
+peer asks, where a miss leaves it anyway. Skips are counted in
 <code>lean_engine_get_blobs_skipped_total{reason}</code>.</p>
 <p>The precheck is a filter, not the guard: the built columns go through every
-chain check before they are published (see the build below). It saves an engine
-call and a cell computation for a block whose signature already fails, which
-range sync and by-root answers can deliver, since they never pass gossip
-validation and the import checks the signature only after data availability.
-It cannot catch everything: past the parent state’s proposer lookahead,
+chain check before they are published (see the build below). Since the import
+ran it before the hold, it repeats a check the block has already passed, at one
+more BLS verification per first hold of a block that would be asked about. It
+cannot catch everything: past the parent state’s proposer lookahead,
 <code>precheck_block</code> checks the signature against whichever validator the block
-names, not that this validator is the slot’s proposer. It costs one BLS
-verification per first hold of a block that would be asked about.</p>
+names, not that this validator is the slot’s proposer.</p>
 <p><strong>The call.</strong> One attempt with a 1 s timeout (<code>ENGINE_GET_BLOBS_TIMEOUT</code>, the
 value <code>osaka.md</code> gives the method), outside the retry ladder. The call races
 gossip delivery of the same columns, and a retry after the ladder’s first
@@ -7212,7 +7232,7 @@ samples nothing and publishes no series here.</p>
 <p><code>parent_wait</code> and <code>columns_wait</code> are separate sections rather than one “pending”, so a block held for its parent and a block held for its custody columns never collapse into the same number. An absent <code>columns_wait</code> still has two readings, and only the log separates them: its <code>da_complete_on_arrival</code> field says whether the columns were never missing, or landed while the block was held for its parent.</p>
 <p>The bookkeeping an import triggers (chain-event emission, the finality eviction sweep, the gauge refresh including a RocksDB size estimate per table) has no section of its own. It is charged to the section it follows, which is <code>fc_head</code> on lean and <code>block_atts</code> on beacon. Those three were sections once: across 5248 imports on a mainnet follower none of them reached a millisecond, so they were three rows that never moved in every tree and three label values that never said anything. The work is still counted, just where it happens.</p>
 <p><code>decode</code> is a gossip-only section, so <code>queue</code> is the only one a fetched block crosses before the chain actor. The req/resp codec has already turned the bytes into a block before any handler sees one, leaving no decode boundary to take; the path reports nothing rather than a zero, since a zero reads as free work rather than as unmeasured work and would drag the decode histogram down with samples that measured nothing. Two consequences: <code>decode</code> is a gossip population even though the <code>source</code> label allows <code>sync</code>, and a fetched block’s <code>total</code> starts later in its life than a gossiped block’s, having never counted the request round trip at all.</p>
-<p>On the beacon wire, <code>decode</code> for <code>source="gossip"</code> spans more than its name says. <code>BlockArrival::decode_start</code> is still the wire arrival, but <code>handed_off</code> is stamped only once the block has a gossip verdict, so the section also covers the cheap, stateless checks, the stateful check’s own <code>spawn_blocking</code> task, and the verdict’s trip back through the p2p actor’s mailbox. There is no wait for a free validation slot to attribute here either: <code>try_acquire_owned</code> never blocks, and a message arriving with none free is reported <code>Ignore(Overloaded)</code> (and still forwarded to the chain actor) rather than queued. A rising <code>decode</code> on the beacon wire alone therefore does not mean decoding got slower; check <code>lean_beacon_gossip_validation_seconds</code> before assuming so.</p>
+<p>On the beacon wire, <code>decode</code> for <code>source="gossip"</code> spans more than its name says. <code>BlockArrival::decode_start</code> is still the wire arrival, but <code>handed_off</code> is stamped only once the block has a gossip verdict, so the section also covers the cheap, stateless checks, the stateful check’s own <code>spawn_blocking</code> task, and the verdict’s trip back through the p2p actor’s mailbox. There is no wait for a free validation slot to attribute here either: <code>try_acquire_owned</code> never blocks, and a message arriving with none free is reported <code>Ignore(Overloaded)</code> rather than queued. A block reported that way never reaches the chain actor, so it contributes no import timing at all. A rising <code>decode</code> on the beacon wire alone therefore does not mean decoding got slower; check <code>lean_beacon_gossip_validation_seconds</code> before assuming so.</p>
 <p><code>engine</code> and <code>fcu</code> are execution-client waits. They are I/O waits rather than work, so a node whose import time is dominated by them is waiting on its execution client, not spending CPU. <code>engine</code> is only the part of the <code>engine_newPayload</code> question the import could not hide behind its own state transition: building the request (a copy of the payload), plus whatever of the round trip was left once that transition finished. For a block whose answer arrived first it is the request’s construction alone; how often that is the case depends on the execution client being faster than the transition. The round trip itself is <code>lean_engine_new_payload_seconds</code>. The transition that ran meanwhile is charged to <code>stf</code> whether or not the import used it, and the log line’s <code>speculation</code> field says which (<code>used</code>, <code>discarded_invalidated</code>, <code>discarded_held</code> or <code>discarded_mismatch</code>), so a block whose <code>stf</code> holds two transitions says so.</p>
 <p>The <code>source</code> label has two values, <code>gossip</code> and <code>sync</code> (req/resp backfill). Two populations are deliberately absent. A block re-delivered to itself because its slot had not started reports under the source it first arrived on, since the hold is already visible as its <code>defer</code> section and a third label value would take the block out of the population it belongs to for every section it has left. A block this node built itself is not measured at all: it crossed no wire, so it has no <code>decode</code> and an empty <code>queue</code> taken when the import began. Both still appear in the log, which names them <code>deferred</code> and <code>local</code>.</p>
 <p>Series appear as blocks arrive rather than being seeded, since a third of the phases are beacon-only and a lean node can never write to them.</p>
@@ -7449,6 +7469,12 @@ other topics: <code>unsupported_fork</code> is an ignore reason for a message of
 build has no gossip rules for, so an honest peer past the fork epoch is not
 scored as a bad decoder. Gloas blocks, data columns, aggregates and attestations
 are validated, so they carry their own verdict reasons instead.</p>
+<p><code>beacon_block</code> has one ignore reason of its own, <code>signature_unverified</code>: a
+block whose parent has no post-state yet, and whose proposer signature no
+cached state could check (no head state cached, or a proposer newer than the
+head state). It is dropped rather than queued, so it never reaches the chain
+actor. A resumed node caches its head state at startup, so a restart alone
+does not produce it.</p>
 <p>Three permit pools bound the blocking-thread half of validation:
 <code>gossip_validation_permits</code> for blocks, columns and envelopes,
 <code>attestation_validation_permits</code> for aggregates, subnet attestations and
@@ -7760,6 +7786,7 @@ spec.</p>
 <tr><td><code>lean_data_column_kzg_verify_seconds</code></td><td>Histogram</td><td>Time spent in one KZG cell-proof batch verification: one sidecar’s cells in gossip validation, one sub-batch of at most 16 of one block’s sidecars in the chain checks, which for every sub-batch after a block’s first is how long it holds its <code>column_check_permits</code> permit (see <a href="#data-column-sidecars">Data column sidecars</a>), plus one observation per sidecar if that batch fails and each is re-verified alone</td><td>On each KZG batch verification, in gossip validation or the chain checks</td><td></td><td>0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0</td></tr>
 <tr><td><code>lean_data_column_fetch_failures_total</code></td><td>Counter</td><td><code>DataColumnsByRoot</code> lookups this node gave up on, by reason</td><td>On lookup abandonment</td><td>reason=no_peers,max_retries,peers_exhausted,no_custodian</td><td></td></tr>
 <tr><td><code>lean_blocks_held_for_columns</code></td><td>Gauge</td><td>Blocks held out of fork choice pending their custody columns</td><td>On every hold, release, and finality eviction of the held-block set</td><td></td><td></td></tr>
+<tr><td><code>lean_beacon_blocks_refused_before_waiting_total</code></td><td>Counter</td><td>Blocks the chain actor refused instead of parking them for their parent or holding them for their columns, by the precheck rule they broke</td><td>On each refusal in <code>precheck_before_waiting</code>, whatever path delivered the block. A block waiting for its parent is checked against the head’s state for its signature only, and one whose proposer that state does not hold is parked, not counted</td><td>reason=not_after_parent,wrong_proposer,unknown_proposer,bad_signature, wait=parent,columns (<code>wait=parent</code> only ever has <code>reason=bad_signature</code>)</td><td></td></tr>
 <tr><td><code>lean_sidecars_awaiting_parent</code></td><td>Gauge</td><td>Sidecars parked until their block’s parent has a post-state</td><td>On every park, replay, and finality eviction of the parked set</td><td></td><td></td></tr>
 <tr><td><code>lean_envelopes_awaiting_block</code></td><td>Gauge</td><td>Gloas execution payload envelopes held until their block is imported</td><td>On every hold, release, and finality eviction of the held envelopes</td><td></td><td></td></tr>
 <tr><td><code>lean_envelopes_awaiting_columns</code></td><td>Gauge</td><td>Gloas execution payload envelopes held until every sampled column is stored</td><td>On every hold, release, and finality eviction of the held envelopes</td><td></td><td></td></tr>
