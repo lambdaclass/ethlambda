@@ -1,0 +1,21 @@
+[package]
+name = "ephyra-validator"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+ethlambda-validator = { path = "../../crates/validator", features = ["test-utils"] }
+ethlambda-types = { path = "../../crates/common/types" }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "time"] }
+
+[dev-dependencies]
+ephyra = { version = "=0.0.1", features = ["coverage"] }
+
+[profile.release]
+debug-assertions = true
+overflow-checks = true
