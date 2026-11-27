@@ -21,7 +21,7 @@ use libp2p::swarm::dial_opts::DialOpts;
 use tokio::sync::mpsc;
 use tracing::trace;
 
-use super::admission::{DialTargets, DiscoveredPeer, LeanFilter, rank_candidates};
+use super::admission::{DiscoveredPeer, LeanFilter, rank_candidates};
 use super::node_id::node_id_from_peer_id;
 use super::subnets::SubnetHunt;
 use super::{
@@ -73,7 +73,7 @@ impl DiscoveryState {
     /// async context.
     pub(crate) fn new(spawned: SpawnedDiscovery, local_peer_id: PeerId) -> Self {
         Self {
-            contacts: spawn_contact_poll(spawned.handle.clone(), spawned.filter.dial_targets()),
+            contacts: spawn_contact_poll(spawned.handle.clone(), spawned.filter.clone()),
             hunt: SubnetHunt::spawn(
                 spawned.handle.clone(),
                 spawned.filter.clone(),
@@ -469,13 +469,17 @@ fn refill_candidates(server: &mut P2PServer) {
 /// already connected to, or whose ENR our
 /// [`LeanFilter`](super::admission::LeanFilter) turned down, and records each
 /// as *tried* before returning it. So successive calls never repeat, and
-/// everything that arrives here has already passed admission.
+/// everything that arrives here has already passed admission, though under
+/// the policy in force when its record arrived.
 ///
 /// What arrives is a `Node`, which knows an address and a key and nothing about
-/// `quic`, `tcp` or `attnets`, so the dial target is looked back up in
-/// [`DialTargets`] under the node's id. A miss is ordinary: bootnodes are
-/// dialable to ethrex before they have published an ENR, and one we never read
-/// a record for is one we cannot build a libp2p multiaddr for.
+/// `quic`, `tcp` or `attnets`, so the dial target is looked back up under the
+/// node's id in what the filter filed, and its record judged again under the
+/// policy in force now ([`LeanFilter::dial_target_for`]): after a fork
+/// boundary, discovery still offers the peers it admitted on the old digest. A
+/// miss is ordinary: bootnodes are dialable to ethrex before they have
+/// published an ENR, and one we never read a record for is one we cannot build
+/// a libp2p multiaddr for.
 ///
 /// That "marked tried on the way out" is why the channel is bounded and why the
 /// task reserves its slot before asking. A contact drawn with nowhere to put it
@@ -488,7 +492,7 @@ fn refill_candidates(server: &mut P2PServer) {
 /// [`DiscoveryState`] is dropped.
 fn spawn_contact_poll(
     handle: DiscoveryHandle,
-    dial_targets: DialTargets,
+    filter: LeanFilter,
 ) -> mpsc::Receiver<DiscoveredPeer> {
     let (contacts, receiver) = mpsc::channel(DISCOVERY_CANDIDATE_BATCH);
     tokio::spawn(async move {
@@ -499,11 +503,12 @@ fn spawn_contact_poll(
                 continue;
             };
             // A node with no dial target filed is one whose ENR we never read,
-            // so it carries no address or peer id to dial. Skipping it costs
-            // nothing: it was marked tried on the way out either way. The
-            // permit is released with it, so the slot goes to the next node
-            // rather than to this one's absence.
-            if let Some(peer) = dial_targets.get(&node.node_id()) {
+            // so it carries no address or peer id to dial; one whose filed
+            // record the policy no longer admits is on a digest this node has
+            // left. Skipping either costs nothing: it was marked tried on the
+            // way out either way. The permit is released with it, so the slot
+            // goes to the next node rather than to this one's absence.
+            if let Some(peer) = filter.dial_target_for(&node.node_id()) {
                 permit.send(peer);
             }
         }
