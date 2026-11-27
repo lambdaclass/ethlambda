@@ -142,19 +142,31 @@ impl BuilderMarket {
         lock(&self.bids).count(bid)
     }
 
-    /// Re-runs [`Self::check_bid_seen`] under the lock. If it passes, counts
-    /// the bid against its builder, raises the slot and parent's best value
-    /// and pools the bid. `false` = not recorded (race, or the per-slot key
-    /// cap). Prunes slots below `bid.slot - 1`.
-    ///
-    /// The bid limit is not re-checked here, since it needs a state: two of a
-    /// builder's bids validated at once can both pass the gossip rule's count,
-    /// and the later of the two is still recorded if it beats the earlier on
-    /// value. A builder gains at most one bid per race, and each must outbid
-    /// the last.
+    /// [`Self::record_bid_within`] with no bid limit, for a caller that
+    /// records each bid before validating the next, so the gossip rule's own
+    /// count check already held: tests and the spec vectors.
     pub fn record_bid(&self, signed: gloas::SignedExecutionPayloadBid) -> bool {
+        self.record_bid_within(signed, u64::MAX)
+    }
+
+    /// Re-runs [`Self::check_bid_seen`] and the bid-limit rule (count below
+    /// `bid_limit`, the limit the bid's stateful checks read) under the lock.
+    /// If both pass, counts the bid against its builder, raises the slot and
+    /// parent's best value and pools the bid. `false` = not recorded (race,
+    /// or the per-slot key cap). Prunes slots below `bid.slot - 1`.
+    ///
+    /// The limit is compared again here because bids are validated
+    /// concurrently: several of one builder's bids can pass the gossip rule's
+    /// count at once, each before the others are recorded, and without this
+    /// every one of them that outbid the last would be counted and forwarded,
+    /// as many as validate at the same time.
+    pub fn record_bid_within(
+        &self,
+        signed: gloas::SignedExecutionPayloadBid,
+        bid_limit: u64,
+    ) -> bool {
         let mut pool = lock(&self.bids);
-        if pool.check(&signed.message).is_err() {
+        if pool.check(&signed.message).is_err() || pool.count(&signed.message) >= bid_limit {
             return false;
         }
         let bid_slot = signed.message.slot;
@@ -481,6 +493,23 @@ mod tests {
         assert_eq!(market.bid_count(&other.message), 0);
         assert!(market.record_bid(other.clone()));
         assert_eq!(market.bid_count(&other.message), 1);
+    }
+
+    /// Two of a builder's bids that both passed the gossip rule's count, at
+    /// a limit of one, validated before either was recorded: the second is
+    /// refused when recorded, though it beats the first on value, so the
+    /// count never passes the limit.
+    #[test]
+    fn recording_holds_a_builder_to_its_bid_limit() {
+        let market = BuilderMarket::default();
+        assert!(market.record_bid_within(bid(10, 1, 5), 1));
+        assert!(!market.record_bid_within(bid(10, 1, 9), 1));
+        assert_eq!(market.bid_count(&bid(10, 1, 9).message), 1);
+        // Refused for the limit, so the best value did not move: another
+        // builder with its own limit still records above the first bid.
+        assert!(market.record_bid_within(bid(10, 2, 6), 1));
+        // A limit of zero records nothing.
+        assert!(!market.record_bid_within(bid(10, 3, 7), 0));
     }
 
     #[test]

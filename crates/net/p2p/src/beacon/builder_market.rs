@@ -68,6 +68,7 @@ pub(crate) fn triage_execution_payload_bid(server: &P2PServer, payload: &[u8]) -
     Dispatch::Validate(Validated::ExecutionPayloadBid {
         bid: Box::new(bid),
         market: server.builder_market.clone(),
+        bid_limit: 0,
     })
 }
 
@@ -307,6 +308,7 @@ mod tests {
             Dispatch::Validate(Validated::ExecutionPayloadBid {
                 bid: decoded,
                 market,
+                ..
             }) => {
                 assert_eq!(*decoded, bid);
                 assert!(std::sync::Arc::ptr_eq(&market, &server.builder_market));

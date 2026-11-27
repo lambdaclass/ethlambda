@@ -375,16 +375,33 @@ pub fn stateful_checks(
     signed: &gloas::SignedExecutionPayloadBid,
 ) -> Outcome {
     match stateful_rules(store, market, signed) {
-        Ok(()) => Outcome::Accept,
+        Ok(_bid_limit) => Outcome::Accept,
         Err(outcome) => outcome,
     }
 }
 
+/// [`stateful_checks`], answering `Ok` with the builder's bid limit
+/// ([`get_builder_bid_limit`]) where that answers [`Outcome::Accept`].
+///
+/// For a caller that validates bids concurrently: the count this compared
+/// with the limit can have grown by the time the bid is recorded, so the
+/// caller hands the limit to [`BuilderMarket::record_bid_within`], which
+/// compares the two again under the market's lock.
+pub fn stateful_checks_with_limit(
+    store: &Store,
+    market: &BuilderMarket,
+    signed: &gloas::SignedExecutionPayloadBid,
+) -> Result<u64, Outcome> {
+    stateful_rules(store, market, signed)
+}
+
+/// The rules that need states, then the signature. `Ok` carries the builder's
+/// bid limit the count was checked against.
 fn stateful_rules(
     store: &Store,
     market: &BuilderMarket,
     signed: &gloas::SignedExecutionPayloadBid,
-) -> Result<(), Outcome> {
+) -> Result<u64, Outcome> {
     let bid = &signed.message;
     let ignore = |reason| Outcome::Ignore(reason);
     let reject = |reason| Outcome::Reject(reason);
@@ -504,7 +521,7 @@ fn stateful_rules(
     ) {
         return Err(reject(RejectReason::BadSignature));
     }
-    Ok(())
+    Ok(bid_limit)
 }
 
 /// Both halves. The caller records the bid on `Accept`: the specification's

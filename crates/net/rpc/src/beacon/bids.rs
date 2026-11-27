@@ -22,7 +22,7 @@ use ethlambda_state_transition::beacon::{
     gossip::{
         IgnoreReason, Outcome,
         execution_payload_bid::{
-            MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE, cheap_checks, stateful_checks,
+            MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE, cheap_checks, stateful_checks_with_limit,
         },
     },
 };
@@ -110,37 +110,49 @@ async fn post_bid(
         );
         return StatusCode::OK.into_response();
     }
-    let verdict = match cheap_checks(&market, &store, &bid, unix_ms()) {
+    // On `Accept`, the builder's bid limit the stateful checks read.
+    let checked = match cheap_checks(&market, &store, &bid, unix_ms()) {
         Ok(()) => {
             let (store, market, bid) = (store.clone(), market.clone(), bid.clone());
-            match tokio::task::spawn_blocking(move || stateful_checks(&store, &market, &bid)).await
-            {
-                Ok(verdict) => verdict,
+            let task = tokio::task::spawn_blocking(move || {
+                stateful_checks_with_limit(&store, &market, &bid)
+            });
+            match task.await {
+                Ok(checked) => checked,
                 Err(_) => {
                     return ApiError::Internal("validating the bid failed").into_response();
                 }
             }
         }
-        Err(outcome) => outcome,
+        Err(outcome) => Err(outcome),
     };
-    if verdict != Outcome::Accept {
-        let (outcome, reason) = verdict.labels();
-        warn!(
-            slot = bid.message.slot,
-            builder_index = bid.message.builder_index,
-            outcome,
-            reason,
-            "Refused a submitted execution payload bid"
-        );
-        return bad_request(describe(&verdict));
-    }
+    let bid_limit = match checked {
+        Ok(bid_limit) => bid_limit,
+        Err(verdict) => {
+            let (outcome, reason) = verdict.labels();
+            warn!(
+                slot = bid.message.slot,
+                builder_index = bid.message.builder_index,
+                outcome,
+                reason,
+                "Refused a submitted execution payload bid"
+            );
+            return bad_request(describe(&verdict));
+        }
+    };
     // The state a stateful check read can have moved on, and a higher bid for
-    // the slot and parent can have been recorded meanwhile: recording re-runs
-    // the best-value rule under the market's lock.
+    // the slot and parent, or another of the builder's bids, can have been
+    // recorded meanwhile: recording re-runs the best-value rule and the bid
+    // limit under the market's lock.
     let slot = bid.message.slot;
     let builder_index = bid.message.builder_index;
-    if !market.record_bid(bid.clone()) {
-        return bad_request(describe(&Outcome::Ignore(IgnoreReason::NotHighestBid)));
+    if !market.record_bid_within(bid.clone(), bid_limit) {
+        let reason = if market.bid_count(&bid.message) >= bid_limit {
+            IgnoreReason::BidLimitReached
+        } else {
+            IgnoreReason::NotHighestBid
+        };
+        return bad_request(describe(&Outcome::Ignore(reason)));
     }
     let for_event = copy_if_listened(events.as_deref(), &bid);
     match p2p.publish_execution_payload_bid(bid) {

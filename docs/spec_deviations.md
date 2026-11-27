@@ -445,9 +445,10 @@ from the Beacon API, and no other way.
   previous slot's payload attestation deadline, a strictly higher value than
   the best seen, and a funded active registered builder with a valid
   signature. On top of those, a cap on keys per slot and on bids pooled per
-  parent, and a separate permit pool for validating them. Two bids from one
-  builder validated at the same moment can both pass the count, so the limit
-  can be overshot by one. A configurable minimum increment is a follow-up.
+  parent, and a separate permit pool for validating them. Bids are validated
+  concurrently, so recording compares the count with the limit again under
+  the market's lock, and the limit holds however many of one builder's bids
+  are in validation at once. A configurable minimum increment is a follow-up.
 
 ## `skip_randao_verification` is ignored
 
