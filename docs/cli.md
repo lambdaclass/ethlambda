@@ -1195,7 +1195,10 @@ reads it half-written.
 A file that cannot be read or does not parse, a graffiti over 32 bytes among
 them, refuses startup, as an over-long `--graffiti` does. So does a file over
 16 MiB, and one not read within 5 seconds, so a stalled mount or a FIFO in the
-file's place refuses startup rather than hang it. Once the client is running,
+file's place refuses startup rather than hang it. One read within 5 seconds
+but in more than 250 ms starts with a warning, since a proposal gives up on a
+read that slow (see below); a cold cache can make one read that slow and the
+next ones fast, so it is not refused. Once the client is running,
 the same failure costs only the file: the proposal takes its graffiti from the
 next source in the list and logs a warning, and the client logs an info line
 once the file reads again. `GET graffiti` skips the file the same way, but

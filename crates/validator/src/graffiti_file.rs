@@ -70,7 +70,7 @@ use std::time::Duration;
 use ethlambda_types::beacon::primitives::{BLS_PUBKEY_SIZE, BlsPubkey, Bytes32};
 use tokio::sync::watch;
 use tokio::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::proposer_settings::{GRAFFITI_BYTES, graffiti_from_text};
 
@@ -246,12 +246,19 @@ impl GraffitiFile {
     /// proposal would skip refuses startup instead. That read is given up on
     /// after [`OPEN_TIMEOUT`], so a stalled mount refuses startup too rather
     /// than hang it.
+    ///
+    /// A read that answers within [`OPEN_TIMEOUT`] but takes longer than
+    /// [`READ_TIMEOUT`] is accepted with a warning: a proposal gives up on a
+    /// read that slow, so a file that always reads so slowly is skipped by
+    /// every proposal. Not refused, since a cold cache or a mount's first
+    /// access can make one read that slow and the next ones fast.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, GraffitiFileError> {
         let file = Self {
             path: path.into(),
             read_timeout: READ_TIMEOUT,
             running: Arc::default(),
         };
+        let started = std::time::Instant::now();
         let (answer, answered) = std::sync::mpsc::channel();
         let reader = file.clone();
         file.spawn(move || {
@@ -262,6 +269,16 @@ impl GraffitiFile {
             Err(RecvTimeoutError::Timeout) => return Err(file.timed_out(OPEN_TIMEOUT)),
             Err(RecvTimeoutError::Disconnected) => return Err(file.unanswered()),
         };
+        let took = started.elapsed();
+        if took > file.read_timeout {
+            warn!(
+                path = %file.path.display(),
+                ?took,
+                read_timeout = ?file.read_timeout,
+                "Graffiti file was slow to read; a proposal gives up on a read this slow and \
+                 skips the file"
+            );
+        }
         info!(
             path = %file.path.display(),
             validators = table.by_key.len(),

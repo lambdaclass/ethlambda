@@ -381,7 +381,8 @@ async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
     // signature those requests were for fails with it.
     crate::fd_limit::raise_fd_limit().wrap_err("failed to raise RLIMIT_NOFILE")?;
     let graffiti = options.graffiti()?;
-    // Read once here, so a file every proposal would skip refuses startup.
+    // Read once here, so a file every proposal would skip refuses startup,
+    // and one read more slowly than a proposal waits for is warned about.
     let graffiti_file = options
         .graffiti_file
         .as_deref()
