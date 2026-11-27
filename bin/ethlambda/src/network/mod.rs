@@ -194,6 +194,8 @@ pub(crate) fn check_constants(config: &Config) -> Result<(), ConstantsMismatch> 
         max_payload_size == ethlambda_p2p::MAX_PAYLOAD_SIZE as u64,
         message_domain_invalid_snappy == ethlambda_p2p::MESSAGE_DOMAIN_INVALID_SNAPPY,
         message_domain_valid_snappy == ethlambda_p2p::MESSAGE_DOMAIN_VALID_SNAPPY,
+        min_transaction_gas
+            == ethlambda_state_transition::beacon::gossip::envelope::MIN_TRANSACTION_GAS,
     );
 
     if mismatches.is_empty() {

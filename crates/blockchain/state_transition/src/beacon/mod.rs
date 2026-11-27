@@ -78,6 +78,7 @@ pub use ethlambda_crypto::bls;
 mod bls_fixtures;
 pub mod das;
 pub mod data_columns;
+pub mod execution_block_hash;
 pub mod fast_confirmation;
 pub mod fork_choice;
 pub mod genesis;

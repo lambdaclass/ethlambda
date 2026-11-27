@@ -46,8 +46,8 @@
 //!
 //! The reference generator (`get_viable_for_head_checks` in
 //! `tests/core/pyspec/eth_consensus_specs/test/helpers/fork_choice.py`) walks
-//! from the justified root's PENDING node with a stack, through
-//! `get_node_children` over `get_filtered_block_tree`, and reports every leaf
+//! from the justified root's PENDING node with a stack, through the
+//! `get_node_children` that are in `get_filtered_node_tree`, and reports every leaf
 //! with its `get_weight` and payload status. [`check_viable_for_head`] does the
 //! same walk but compares `{root, weight, payload_status}` as an unordered set,
 //! since the order the fixture lists the leaves in is not reproducible here:
@@ -125,6 +125,9 @@ use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
     BeaconState, Checkpoint, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, fulu,
     gloas, phase0,
+};
+use ethlambda_state_transition::beacon::fast_confirmation::{
+    self, FastConfirmationStore, FastConfirmationVariables,
 };
 use ethlambda_state_transition::beacon::fork_choice::{
     self, DataAvailability, ForkChoiceNode, ForkRules, PayloadStatus, Store,
@@ -224,9 +227,30 @@ pub(super) struct Checks {
     payload_timeliness_vote: Option<VoteCheck>,
     /// `[New in Gloas]` the PTC's blob data availability votes for one block.
     payload_data_availability_vote: Option<VoteCheck>,
-    /// `[New in Gloas]` the payload-aware leaves of the filtered block tree,
+    /// `[New in Gloas]` the payload-aware leaves of the filtered node tree,
     /// with their weights, in the generator's own order.
     viable_for_head_roots_and_weights: Option<Vec<ViableLeafCheck>>,
+    // The `fast_confirmation` format's own checks
+    // (`tests/formats/fast_confirmation/README.md`): the Fast Confirmation
+    // Rule's variables, present exactly on the steps the generator emits right
+    // after an `on_fast_confirmation` call (see [`run_case`]), and, from
+    // bellatrix, `get_safe_execution_block_hash`.
+    previous_epoch_observed_justified_checkpoint: Option<CheckpointCheck>,
+    current_epoch_observed_justified_checkpoint: Option<CheckpointCheck>,
+    previous_epoch_greatest_unrealized_checkpoint: Option<CheckpointCheck>,
+    previous_slot_head: Option<String>,
+    current_slot_head: Option<String>,
+    confirmed_root: Option<String>,
+    safe_execution_block_hash: Option<String>,
+}
+
+impl Checks {
+    /// Whether the step follows an `on_fast_confirmation` call: the generator
+    /// writes every one of the rule's variables after each call, and never
+    /// otherwise.
+    fn follows_a_fast_confirmation_run(&self) -> bool {
+        self.confirmed_root.is_some()
+    }
 }
 
 /// One leaf of `viable_for_head_roots_and_weights`.
@@ -875,8 +899,8 @@ fn check_viable_for_head(
     committees: &CommitteeCache,
 ) -> Result<(), String> {
     let index = store.block_index();
-    let blocks = fork_choice::get_filtered_block_tree(store, &index, config).map_err(|err| {
-        format!("viable_for_head_roots_and_weights: get_filtered_block_tree: {err:?}")
+    let nodes = fork_choice::get_filtered_node_tree(store, &index, config).map_err(|err| {
+        format!("viable_for_head_roots_and_weights: get_filtered_node_tree: {err:?}")
     })?;
     let mut pending = vec![ForkChoiceNode {
         root: store.beacon_justified_checkpoint().root,
@@ -895,9 +919,10 @@ fn check_viable_for_head(
     )
     .map_err(|err| format!("viable_for_head_roots_and_weights: compute_node_weights: {err:?}"))?;
     while let Some(node) = pending.pop() {
-        let children = fork_choice::get_node_children(store, &blocks, node).map_err(|err| {
+        let mut children = fork_choice::get_node_children(store, &index, node).map_err(|err| {
             format!("viable_for_head_roots_and_weights: get_node_children: {err:?}")
         })?;
+        children.retain(|child| nodes.contains(child));
         if children.is_empty() {
             let weight = fork_choice::gloas_get_weight(store, node, config, committees)
                 .map_err(|err| format!("viable_for_head_roots_and_weights: get_weight: {err:?}"))?;
@@ -1019,8 +1044,8 @@ fn check_node_weights_against_the_spec(
         return Ok(());
     }
     let index = store.block_index();
-    let blocks = fork_choice::get_filtered_block_tree(store, &index, config)
-        .map_err(|err| format!("get_filtered_block_tree: {err:?}"))?;
+    let nodes = fork_choice::get_filtered_node_tree(store, &index, config)
+        .map_err(|err| format!("get_filtered_node_tree: {err:?}"))?;
     let walked =
         fork_choice::compute_node_weights(store, &index, config, committees, ForkRules::Gloas)
             .map_err(|err| format!("compute_node_weights: {err:?}"))?;
@@ -1058,8 +1083,10 @@ fn check_node_weights_against_the_spec(
             }
         }
         pending.extend(
-            fork_choice::get_node_children(store, &blocks, node)
-                .map_err(|err| format!("get_node_children: {err:?}"))?,
+            fork_choice::get_node_children(store, &index, node)
+                .map_err(|err| format!("get_node_children: {err:?}"))?
+                .into_iter()
+                .filter(|child| nodes.contains(child)),
         );
     }
     Ok(())
@@ -1120,7 +1147,39 @@ fn check_weights_against_the_spec(store: &Store, config: &Config) -> Result<(), 
 /// named a shuffling one of them does not actually have, a committee here
 /// would come out wrong and the case would fail. A fresh cache per call would
 /// pass whatever the key did.
-fn run_case(case: &Case, config: &Config) -> Result<(), String> {
+///
+/// # The `fast_confirmation` runner reads the same steps
+///
+/// Its format extends this one: the generator runs `on_fast_confirmation`
+/// at the start of each slot it chooses to and writes the rule's variables
+/// into the `checks` step it emits right after, so a `checks` step carrying
+/// them ([`Checks::follows_a_fast_confirmation_run`]) is where the run goes.
+/// The rule's variables start where `get_fast_confirmation_store` puts them,
+/// with the store, and carry from run to run through the specification's own
+/// [`fast_confirmation::on_fast_confirmation`], not the node's per-slot
+/// driver, which starts over after a slot without a run (the generator skips
+/// slots on purpose).
+pub(super) fn run_case(case: &Case, config: &Config) -> Result<(), String> {
+    run_steps(case, config)
+}
+
+/// Whether `meta.yaml` says the case was generated with BLS ignored
+/// (`bls_setting: 2`). Such a case's blocks and attestations carry stub
+/// signatures that are not curve points, and every signature check here is
+/// real, so it cannot pass and is reported as ignored instead. Never add a
+/// feature or switch that skips signature checks to run it: one could easily
+/// end up skipping checks in a production build.
+pub(super) fn bls_ignored(case: &Case) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Meta {
+        bls_setting: Option<u8>,
+    }
+    case.yaml_opt::<Meta>("meta")
+        .and_then(|meta| meta.bls_setting)
+        == Some(2)
+}
+
+fn run_steps(case: &Case, config: &Config) -> Result<(), String> {
     let anchor_state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("anchor_state"))
         .map_err(|err| format!("decoding anchor_state: {err:?}"))?;
     let anchor_block = decode_anchor_block(case)?;
@@ -1128,11 +1187,18 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
     let backend = Arc::new(ethlambda_storage::backend::InMemoryBackend::new());
     let mut store = fork_choice::get_forkchoice_store(backend, anchor_state, anchor_block, config)
         .map_err(|err| format!("get_forkchoice_store: {err:?}"))?;
+    let mut fast_confirmation =
+        FastConfirmationVariables::at_finalized(store.beacon_finalized_checkpoint());
 
     let committees = CommitteeCache::default();
     let steps: Vec<Step> = case.yaml("steps");
     for (index, step) in steps.iter().enumerate() {
         let outcome = match &step.checks {
+            Some(checks) if checks.follows_a_fast_confirmation_run() => {
+                run_fast_confirmation(&store, config, &mut fast_confirmation)
+                    .and_then(|()| apply_checks(&mut store, checks, config, &committees))
+                    .and_then(|()| check_fast_confirmation(&store, checks, &fast_confirmation))
+            }
             Some(checks) => apply_checks(&mut store, checks, config, &committees),
             None => apply_execution_step(&mut store, case, step, config, &committees),
         };
@@ -1140,6 +1206,104 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// `on_fast_confirmation` on `variables`, over the store as it stands: what
+/// the generator ran before writing the step's checks.
+fn run_fast_confirmation(
+    store: &Store,
+    config: &Config,
+    variables: &mut FastConfirmationVariables,
+) -> Result<(), String> {
+    let head = fork_choice::get_head_node(store, config)
+        .map_err(|err| format!("get_head for on_fast_confirmation: {err:?}"))?
+        .root;
+    let mut fcr_store = FastConfirmationStore::new(store, config, *variables, head);
+    fast_confirmation::on_fast_confirmation(&mut fcr_store)
+        .map_err(|err| format!("on_fast_confirmation: {err:?}"))?;
+    *variables = fcr_store.variables();
+    Ok(())
+}
+
+/// The `fast_confirmation` format's checks against the rule's variables.
+fn check_fast_confirmation(
+    store: &Store,
+    checks: &Checks,
+    variables: &FastConfirmationVariables,
+) -> Result<(), String> {
+    let checkpoints = [
+        (
+            "previous_epoch_observed_justified_checkpoint",
+            &checks.previous_epoch_observed_justified_checkpoint,
+            variables.previous_epoch_observed_justified_checkpoint,
+        ),
+        (
+            "current_epoch_observed_justified_checkpoint",
+            &checks.current_epoch_observed_justified_checkpoint,
+            variables.current_epoch_observed_justified_checkpoint,
+        ),
+        (
+            "previous_epoch_greatest_unrealized_checkpoint",
+            &checks.previous_epoch_greatest_unrealized_checkpoint,
+            variables.previous_epoch_greatest_unrealized_checkpoint,
+        ),
+    ];
+    for (label, expected, actual) in checkpoints {
+        if let Some(expected) = expected {
+            check_checkpoint(label, expected, actual)?;
+        }
+    }
+    let roots = [
+        (
+            "previous_slot_head",
+            &checks.previous_slot_head,
+            variables.previous_slot_head,
+        ),
+        (
+            "current_slot_head",
+            &checks.current_slot_head,
+            variables.current_slot_head,
+        ),
+        (
+            "confirmed_root",
+            &checks.confirmed_root,
+            variables.confirmed_root,
+        ),
+    ];
+    for (label, expected, actual) in roots {
+        if let Some(expected) = expected {
+            check_root(label, expected, actual)?;
+        }
+    }
+    if let Some(expected) = &checks.safe_execution_block_hash {
+        let actual = safe_execution_block_hash(store, variables.confirmed_root)?;
+        check_root("safe_execution_block_hash", expected, actual)?;
+    }
+    Ok(())
+}
+
+/// `get_safe_execution_block_hash` (bellatrix `fast-confirmation.md`, modified
+/// by gloas), read off the confirmed block: its own payload's hash, or under
+/// gloas its bid's `parent_block_hash`, since only a confirmed block's parent
+/// payload is safe. The node's own version (`ethlambda-blockchain`'s
+/// `beacon_payloads`) also clamps the block to the head's chain, which the
+/// specification's does not.
+fn safe_execution_block_hash(store: &Store, confirmed_root: Root) -> Result<Root, String> {
+    let block = store
+        .get_signed_block(&confirmed_root)
+        .map_err(|err| format!("reading the confirmed block: {err}"))?
+        .ok_or("the confirmed block is not in the store")?;
+    match &block {
+        SignedBeaconBlock::Gloas(inner) => Ok(inner
+            .message
+            .body
+            .signed_execution_payload_bid
+            .message
+            .parent_block_hash),
+        _ => block
+            .execution_block_hash()
+            .ok_or_else(|| "a pre-bellatrix block has no safe execution block hash".to_string()),
+    }
 }
 
 /// The handler half of [`collect_all_handlers`]'s pair is discarded: every

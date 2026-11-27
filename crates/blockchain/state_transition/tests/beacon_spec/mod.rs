@@ -39,6 +39,7 @@
 
 pub mod bls;
 pub mod epoch_processing;
+pub mod fast_confirmation;
 pub mod fork;
 pub mod fork_choice;
 pub mod genesis;
@@ -422,7 +423,7 @@ fn read_dir_sorted(path: &Path) -> Vec<fs::DirEntry> {
 /// know: `gloas` moved out of this list once [`ForkName`] gained that variant,
 /// since its directory now parses and its cases fall under
 /// [`HIGHEST_IMPLEMENTED_FORK`]'s ordinary out-of-scope handling
-/// ([`Case::in_scope`]) instead of this one. At `v1.7.0-beta.2` the release
+/// ([`Case::in_scope`]) instead of this one. At `v1.7.0-beta.5` the release
 /// ships no other directory under either preset tree that `ForkName::parse`
 /// does not know: no in-flight-EIP directory (`eipNNNN`) remains, unlike at
 /// `v1.6.1`, where `eip7805` was one.

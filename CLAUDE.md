@@ -572,7 +572,8 @@ node follows). The ignored-keys warning only ever names heze's keys and
 `INCLUSION_LIST_DUE_BPS`. `GAS_LIMIT_SCHEDULE` (EIP-8261) is a `Config` field
 served on `/eth/v1/config/spec` and stored in a `Metadata` row of its own
 (`config_gas_limit_schedule`), not in `Metadata["config"]`'s encoding, where it
-takes zero bytes. That is the pattern for every `Config` key added after
+takes zero bytes. `MIN_TRANSACTION_GAS` (consensus-specs v1.7.0-beta.5) is
+stored the same way (`config_min_transaction_gas`). That is the pattern for every `Config` key added after
 `DB_VERSION` 7 (`CONFIG_ROWS` in `store.rs`): no version bump, and a directory
 that predates the key resumes, with a beacon resume adding the config file's
 value (`Store::fill_missing_config_keys`) instead of failing. `ConfigFile::parse`
@@ -600,7 +601,8 @@ the preset sets that state's container bounds:
 - `check_constants`: every key the node runs on a compile-time constant for
   instead of reading `Config` (the custody counts, subnet counts,
   `MAX_REQUEST_*`, `MAX_PAYLOAD_SIZE`, the snappy message domains,
-  `MAXIMUM_GOSSIP_CLOCK_DISPARITY`) must equal that constant.
+  `MAXIMUM_GOSSIP_CLOCK_DISPARITY`, `MIN_TRANSACTION_GAS`) must equal that
+  constant.
   `/eth/v1/config/spec` reports these keys off the stored `Config`, so this is
   what keeps it from reporting a value the node does not use. A new such
   constant needs a line in `check_constants`.
@@ -855,6 +857,17 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   target, which read `consensus-spec-tests`); `make test-beacon-mainnet` runs
   them, and without the feature they report as ignored, so a plain `cargo test`
   needs no download.
+- Signature checks are never switched off, in the node or in a test: do not
+  add a cargo feature, flag or thread-local that skips them, even a test-only
+  one. It could easily end up skipping checks in a production build (feature
+  unification, or one mistaken call). To test the other checks without
+  signatures, split the code into a signature-checking half and the rest, so
+  a test calls only the half it needs and production calls both (fork
+  choice's `verified_attesting_indices`/`attesting_indices` already work this
+  way; block processing does not yet). Until then, a fixture generated with
+  BLS ignored (`bls_setting: 2`, whose blocks carry stub signatures) is
+  reported as ignored by name instead of run; at v1.7.0-beta.5 that is every
+  `fast_confirmation` case.
 - Every fixture case is its own test, named `<runner>/<fork>/<handler>/<suite>/<case>`,
   so a failure names the case and not the suite around it. The spec binary
   therefore supplies its own harness (`harness = false`), since a case is only
@@ -1113,8 +1126,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   [`docs/beacon_stf.md`](docs/beacon_stf.md) has the design and
   [`docs/spec_deviations.md`](docs/spec_deviations.md) the deliberate departures
   from the spec, in particular the fulu-to-gloas fork-choice boundary rule.
-- **Fast Confirmation Rule** (`beacon/fast_confirmation.rs`, consensus-specs
-  `master` @ `f993cf2`, not the pinned release): run once per slot by the beacon
+- **Fast Confirmation Rule** (`beacon/fast_confirmation.rs`, at the pinned
+  release; its minimal `fast_confirmation` vectors are collected by
+  `tests/beacon_spec/fast_confirmation.rs` but all ignored, being unsigned): run once per slot by the beacon
   actor's tick after the head recompute and before `forkchoiceUpdated` (not
   past the slot's attestation deadline; a run after a slot without one starts
   over like a restart, offering the last reported root to
@@ -1135,7 +1149,9 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   (every fork's cases for topics it has no validator for, cases from forks a
   validated topic's rules do not cover per `validated_forks`, gloas's
   operation vectors among them, and the vectors in `SKIPPED`, which assume a
-  bad-block cache), and the `heze` fixture tree. `heze` does
+  bad-block cache), cases generated with BLS ignored (`bls_setting: 2`, every
+  `fast_confirmation` case at v1.7.0-beta.5; see the signature-checks bullet
+  above), and the `heze` fixture tree. `heze` does
   not parse as a `ForkName`, so `collect` would skip it silently;
   `UNMODELED_FORKS` names it and
   `fixture_forks/every_directory_is_accounted_for` fails on any fork directory

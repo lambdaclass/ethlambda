@@ -286,6 +286,7 @@ different checkpoints.
 | `time`                         | `u64`        | both   | The store clock, as a **UNIX timestamp in milliseconds**      |
 | `config`                       | `Config`     | both   | The node's runtime configuration, except the keys below that have rows of their own |
 | `config_gas_limit_schedule`    | `List[GasLimitScheduleEntry, 32]` | both | `GAS_LIMIT_SCHEDULE` (gloas, EIP-8261); absent in a directory written before it |
+| `config_min_transaction_gas`   | `u64`        | both   | `MIN_TRANSACTION_GAS` (gloas, consensus-specs v1.7.0-beta.5); absent in a directory written before it |
 | `head`                         | `H256`       | both   | Current fork choice head                                      |
 | `anchor_slot`                  | `u64`        | both   | The slot this directory's chain begins at                     |
 | `states_pruned_below`          | `u64`        | both   | Exclusive upper bound of the `States`/`StateDiffs` slots already range-deleted; absent means 0 |
@@ -331,10 +332,11 @@ Everything coarser is derived from it, exactly and in one direction:
 | Slot | `Store::current_slot` | both chains, including the beacon `get_slots_since_genesis` |
 
 Nothing stores a derived reading, so none of them can fall out of step with
-the row or with each other. The beacon specification denominates its own
-`Store.time` in seconds, so `on_tick` and `on_tick_per_slot` convert on the
-way in and the fixture harness divides on the way out; that conversion lives
-at those edges rather than in a second row.
+the row or with each other. The beacon specification keeps `Store.time_ms` in
+milliseconds too (consensus-specs #5667), which `on_tick_ms` and
+`on_tick_per_slot_ms` take as is; the seconds-taking `on_tick` the fixture
+harness ticks with multiplies on the way in, and the harness divides on the way
+out for the fixtures' `time` check, a whole-second reading.
 
 Lean's `on_tick` writes the row only at interval boundaries, since the
 boundary is what it has actually processed: it walks forward one interval at a

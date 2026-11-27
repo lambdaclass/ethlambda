@@ -41,6 +41,7 @@ fn main() {
     trials.extend(beacon_spec::merkle_proof::trials());
     trials.extend(beacon_spec::networking::trials());
     trials.extend(beacon_spec::epoch_processing::trials());
+    trials.extend(beacon_spec::fast_confirmation::trials());
     trials.extend(beacon_spec::fork::trials());
     trials.extend(beacon_spec::fork_choice::trials());
     trials.extend(beacon_spec::gossip::trials());

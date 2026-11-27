@@ -317,6 +317,101 @@ impl libssz::SszDecode for GasLimitSchedule {
     }
 }
 
+/// `MIN_TRANSACTION_GAS` (gloas p2p config, consensus-specs #5802): the gas
+/// floor per transaction that bounds an envelope's transaction count on
+/// gossip.
+///
+/// A newtype rather than a bare `u64` only for how it is stored. It was added
+/// after `DB_VERSION` 7, so, like [`GasLimitSchedule`] ("Stored in a row of
+/// its own" there), it takes zero bytes in `Metadata["config"]`'s encoding and
+/// the storage crate keeps it in a `Metadata` row of its own
+/// ([`Self::to_row_ssz`]). A directory written before that row existed has
+/// none, and a beacon resume adds the config file's value.
+///
+/// [`Default`] is the specification's value, which is also what a `Config`
+/// decoded from `Metadata["config"]` alone holds, and what `Config::lean`
+/// carries: a lean resume never fills a missing row.
+///
+/// Serializes as the number it wraps (quoted, as the Beacon API writes
+/// integers) and reads it quoted or bare.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(transparent)]
+pub struct MinTransactionGas(
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")] pub u64,
+);
+
+impl MinTransactionGas {
+    /// The stored row: the value as an SSZ `uint64`.
+    pub fn to_row_ssz(self) -> Vec<u8> {
+        libssz::SszEncode::to_ssz(&self.0)
+    }
+
+    /// Decode a stored row.
+    pub fn from_row_ssz(bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
+        <u64 as libssz::SszDecode>::from_ssz_bytes(bytes).map(Self)
+    }
+}
+
+impl Default for MinTransactionGas {
+    fn default() -> Self {
+        Self(4_096)
+    }
+}
+
+/// Prints the number alone, so a mismatch report reads like any other key's.
+impl std::fmt::Debug for MinTransactionGas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl PartialEq<u64> for MinTransactionGas {
+    fn eq(&self, other: &u64) -> bool {
+        self.0 == *other
+    }
+}
+
+/// Zero bytes inside [`Config`]'s encoding: see [`MinTransactionGas`]. The
+/// row itself is [`MinTransactionGas::to_row_ssz`].
+impl libssz::SszEncode for MinTransactionGas {
+    fn is_fixed_size() -> bool {
+        true
+    }
+
+    fn fixed_size() -> usize {
+        0
+    }
+
+    fn encoded_len(&self) -> usize {
+        0
+    }
+
+    fn ssz_append(&self, _buf: &mut Vec<u8>) {}
+}
+
+/// Zero bytes inside [`Config`]'s encoding, decoded as the specification's
+/// value, which the storage crate then replaces with the row's: see
+/// [`MinTransactionGas`].
+impl libssz::SszDecode for MinTransactionGas {
+    fn is_fixed_size() -> bool {
+        true
+    }
+
+    fn fixed_size() -> usize {
+        0
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
+        if !bytes.is_empty() {
+            return Err(libssz::DecodeError::InvalidFixedLength {
+                expected: 0,
+                got: bytes.len(),
+            });
+        }
+        Ok(Self::default())
+    }
+}
+
 /// How many bytes a [`ConfigName`] can hold.
 ///
 /// A storage bound, not a consensus one, for the same reason as
@@ -810,6 +905,10 @@ pub struct Config {
     pub min_epochs_for_blob_sidecars_requests: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_epochs_for_data_column_sidecars_requests: u64,
+    /// Gloas: the gas floor per transaction that bounds an envelope's
+    /// transaction count on gossip (consensus-specs #5802). Zero bytes in
+    /// `Metadata["config"]`, with a row of its own: see [`MinTransactionGas`].
+    pub min_transaction_gas: MinTransactionGas,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub subnets_per_node: u64,
 
@@ -1041,6 +1140,7 @@ impl Config {
             message_domain_valid_snappy: [0x01, 0x00, 0x00, 0x00],
             min_epochs_for_blob_sidecars_requests: 4_096,
             min_epochs_for_data_column_sidecars_requests: 4_096,
+            min_transaction_gas: MinTransactionGas(4_096),
             subnets_per_node: 2,
 
             deposit_chain_id: 1,
@@ -1164,6 +1264,7 @@ impl Config {
             message_domain_valid_snappy: [0x01, 0x00, 0x00, 0x00],
             min_epochs_for_blob_sidecars_requests: 4_096,
             min_epochs_for_data_column_sidecars_requests: 4_096,
+            min_transaction_gas: MinTransactionGas(4_096),
             subnets_per_node: 2,
 
             // configs/minimal.yaml: Ethereum Goerli testnet's chain and
@@ -2012,6 +2113,58 @@ mod tests {
 
         assert_eq!(GasLimitSchedule::default().to_ssz(), Vec::<u8>::new());
         assert!(GasLimitSchedule::from_ssz_bytes(&[0]).is_err());
+    }
+
+    /// `MIN_TRANSACTION_GAS` was added after `DB_VERSION` 7, so it too must
+    /// leave `Metadata["config"]`'s encoding alone and decode from it as the
+    /// specification's value, which is the one `Config::lean` carries.
+    #[test]
+    fn the_config_row_leaves_min_transaction_gas_to_its_own_row() {
+        let mut changed = Config::mainnet();
+        changed.min_transaction_gas = MinTransactionGas(21_000);
+
+        let bytes = changed.to_ssz();
+        assert_eq!(bytes, Config::mainnet().to_ssz());
+
+        let decoded = Config::from_ssz_bytes(&bytes).expect("valid config");
+        assert_eq!(decoded.min_transaction_gas, MinTransactionGas::default());
+        assert_eq!(decoded, Config::mainnet());
+        assert_ne!(decoded, changed);
+        assert_eq!(
+            Config::lean(0, 4_000).min_transaction_gas,
+            MinTransactionGas::default()
+        );
+
+        assert_eq!(MinTransactionGas::default().to_ssz(), Vec::<u8>::new());
+        assert!(MinTransactionGas::from_ssz_bytes(&[0]).is_err());
+    }
+
+    #[test]
+    fn the_min_transaction_gas_row_round_trips() {
+        let value = MinTransactionGas(21_000);
+        assert_eq!(value.to_row_ssz(), 21_000u64.to_le_bytes());
+        assert_eq!(
+            MinTransactionGas::from_row_ssz(&value.to_row_ssz()),
+            Ok(value)
+        );
+        assert!(MinTransactionGas::from_row_ssz(&[0]).is_err());
+    }
+
+    /// Quoted on the way out, as the Beacon API writes integers. On the way
+    /// in, quoted in a node's spec (JSON), and quoted or bare in a
+    /// `config.yaml`: `quoted_or_bare` reads a string, which YAML gives for a
+    /// bare scalar too and JSON does not.
+    #[test]
+    fn min_transaction_gas_serializes_as_a_quoted_number() {
+        let json = serde_json::to_value(Config::mainnet()).expect("serializes");
+        assert_eq!(json["MIN_TRANSACTION_GAS"], serde_json::json!("4096"));
+        let parsed: MinTransactionGas = serde_json::from_str("\"21000\"").expect("parses");
+        assert_eq!(parsed, 21_000u64);
+        for text in ["\"21000\"", "21000"] {
+            let parsed: MinTransactionGas = serde_yaml_ng::from_str(text).expect("parses");
+            assert_eq!(parsed, 21_000u64);
+        }
+        assert_eq!(format!("{:?}", MinTransactionGas(21_000)), "21000");
     }
 
     #[test]

@@ -8,6 +8,21 @@
 //! settled on `blst` as the reference implementation and a second backend would
 //! only be dead code here.
 //!
+//! # No way to skip a signature check, not even for tests
+//!
+//! Do not add a cargo feature, flag, global or thread-local that makes these
+//! functions answer "valid" without checking, even one meant only for spec
+//! fixtures generated with BLS off (`bls_setting: 2`). Such a switch can easily
+//! end up compiled into, or turned on in, a production build (cargo unifies
+//! features across a workspace build, and a test-only toggle is one mistaken
+//! call away from a live code path), and the result would be a node that
+//! accepts forged signatures. To test the other checks on their own, split
+//! the code instead: the signature checks in one function and the rest in
+//! another, the way fork choice's `verified_attesting_indices` and
+//! `attesting_indices` share one body. A test then calls the half it needs,
+//! and production calls both. Until a path is split that way, a fixture that
+//! needs signatures off is reported as ignored.
+//!
 //! # Why every function treats its inputs as unvalidated
 //!
 //! [`ethlambda_types::beacon::primitives::BlsPubkey`] is deliberately *not* validated on

@@ -4146,6 +4146,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2 0.10.9",
+ "sha3 0.10.9",
  "snap",
  "thiserror 2.0.18",
  "tracing",

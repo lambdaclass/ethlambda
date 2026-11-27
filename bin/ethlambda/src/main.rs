@@ -2267,6 +2267,7 @@ fn first_config_difference(
         message_domain_valid_snappy: _,
         min_epochs_for_blob_sidecars_requests: _,
         min_epochs_for_data_column_sidecars_requests: _,
+        min_transaction_gas: _,
         subnets_per_node: _,
 
         // Deposit contract: compared below. Never read by the state

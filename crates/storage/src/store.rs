@@ -25,7 +25,7 @@ use ethlambda_types::{
         bits_is_subset, validator_indices,
     },
     beacon::{
-        config::{Config, GasLimitSchedule},
+        config::{Config, GasLimitSchedule, MinTransactionGas},
         constants::NUM_BLOCK_TIMELINESS_DEADLINES,
         containers::{
             BeaconState, Checkpoint as BeaconCheckpoint, DataColumnSidecar, SignedBeaconBlock,
@@ -181,16 +181,28 @@ struct ConfigRow {
 }
 
 /// Every [`ConfigRow`], in no particular order.
-const CONFIG_ROWS: &[ConfigRow] = &[ConfigRow {
-    name: "GAS_LIMIT_SCHEDULE",
-    key: b"config_gas_limit_schedule",
-    encode: |config| config.gas_limit_schedule.to_row_ssz(),
-    decode: |bytes, config| {
-        config.gas_limit_schedule = GasLimitSchedule::from_row_ssz(bytes)?;
-        Ok(())
+const CONFIG_ROWS: &[ConfigRow] = &[
+    ConfigRow {
+        name: "GAS_LIMIT_SCHEDULE",
+        key: b"config_gas_limit_schedule",
+        encode: |config| config.gas_limit_schedule.to_row_ssz(),
+        decode: |bytes, config| {
+            config.gas_limit_schedule = GasLimitSchedule::from_row_ssz(bytes)?;
+            Ok(())
+        },
+        copy: |from, into| into.gas_limit_schedule = from.gas_limit_schedule.clone(),
     },
-    copy: |from, into| into.gas_limit_schedule = from.gas_limit_schedule.clone(),
-}];
+    ConfigRow {
+        name: "MIN_TRANSACTION_GAS",
+        key: b"config_min_transaction_gas",
+        encode: |config| config.min_transaction_gas.to_row_ssz(),
+        decode: |bytes, config| {
+            config.min_transaction_gas = MinTransactionGas::from_row_ssz(bytes)?;
+            Ok(())
+        },
+        copy: |from, into| into.min_transaction_gas = from.min_transaction_gas,
+    },
+];
 
 /// The `Metadata` entries that store `config`: [`KEY_CONFIG`] and every
 /// [`CONFIG_ROWS`] row. Written together, so the rows can never describe two
@@ -3299,6 +3311,26 @@ impl Store {
     /// scratch accessors below.
     pub fn block_index(&self) -> HashMap<H256, (u64, H256)> {
         self.get_live_chain().expect("live chain scan")
+    }
+
+    /// The [`block_index`](Self::block_index) rows at one `slot`: every
+    /// stored, unfinalized block at that slot as `root -> (slot, parent_root)`.
+    ///
+    /// A seek to the slot's key prefix rather than a scan of the whole
+    /// `LiveChain`, for a caller that asks about one slot only: a gossip rule
+    /// an unauthenticated message can reach must not cost a pass over every
+    /// unfinalized block, which a stalled finality makes long.
+    pub fn block_index_at_slot(&self, slot: u64) -> HashMap<H256, (u64, H256)> {
+        let view = self.backend.begin_read().expect("read view");
+        view.prefix_iterator(Table::LiveChain, &slot.to_be_bytes())
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .map(|(k, v)| {
+                let (slot, root) = decode_slot_root_key(&k);
+                let parent_root = H256::from_ssz_bytes(&v).expect("valid parent_root");
+                (root, (slot, parent_root))
+            })
+            .collect()
     }
 
     /// Get a block (header + body, no signatures) by root.
@@ -9571,7 +9603,7 @@ mod tests {
         let mut store = Store::from_db_state(backend.clone()).unwrap().unwrap();
         assert!(store.config().gas_limit_schedule.is_empty());
         let (filled, missing) = store.fill_missing_config_keys(&scheduled);
-        assert_eq!(missing, ["GAS_LIMIT_SCHEDULE"]);
+        assert_eq!(missing, ["GAS_LIMIT_SCHEDULE", "MIN_TRANSACTION_GAS"]);
         assert_eq!(filled, scheduled);
 
         // What a resume does next: the file's config, rows included.
@@ -11157,6 +11189,35 @@ mod tests {
         let index = store.block_index();
         assert!(index.contains_key(&kept));
         assert!(!index.contains_key(&removed));
+    }
+
+    #[test]
+    fn block_index_at_slot_holds_exactly_that_slots_rows() {
+        let mut store = Store::test_store();
+        let parent = H256::repeat_byte(9);
+        let first = H256::repeat_byte(1);
+        let second = H256::repeat_byte(2);
+        let below = H256::repeat_byte(3);
+        let above = H256::repeat_byte(4);
+
+        store.insert_live_chain_entry(9, first, parent);
+        store.insert_live_chain_entry(9, second, parent);
+        store.insert_live_chain_entry(8, below, parent);
+        store.insert_live_chain_entry(10, above, first);
+
+        let at_nine = store.block_index_at_slot(9);
+        let expected: HashMap<H256, (u64, H256)> =
+            [(first, (9, parent)), (second, (9, parent))].into();
+        assert_eq!(at_nine, expected);
+
+        let full = store.block_index();
+        let from_full: HashMap<H256, (u64, H256)> = full
+            .into_iter()
+            .filter(|(_, (slot, _))| *slot == 9)
+            .collect();
+        assert_eq!(at_nine, from_full);
+
+        assert!(store.block_index_at_slot(11).is_empty());
     }
 
     // ============ Finalized State Pruning Tests ============

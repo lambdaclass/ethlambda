@@ -96,6 +96,11 @@ pub(crate) enum Validated {
     ExecutionPayloadBid {
         bid: Box<SignedExecutionPayloadBid>,
         market: SharedBuilderMarket,
+        /// The builder's bid limit its stateful checks compared the count
+        /// with. Zero, which records nothing, until
+        /// [`Validated::stateful_checks`] fills it in on `Accept`; recording
+        /// compares it again, since bids are validated concurrently.
+        bid_limit: u64,
     },
     /// A gloas `proposer_preferences`.
     ProposerPreferences(Box<SignedProposerPreferences>),
@@ -149,8 +154,19 @@ impl Validated {
                 subnet_id,
             } => gossip::attestation::stateful_checks(store, attestation, *subnet_id),
             Self::Envelope(envelope) => gossip::envelope::stateful_checks(store, envelope),
-            Self::ExecutionPayloadBid { bid, market } => {
-                gossip::execution_payload_bid::stateful_checks(store, market, bid)
+            Self::ExecutionPayloadBid {
+                bid,
+                market,
+                bid_limit,
+            } => {
+                match gossip::execution_payload_bid::stateful_checks_with_limit(store, market, bid)
+                {
+                    Ok(limit) => {
+                        *bid_limit = limit;
+                        Outcome::Accept
+                    }
+                    Err(outcome) => outcome,
+                }
             }
             Self::ProposerPreferences(preferences) => {
                 gossip::proposer_preferences::stateful_checks(store, preferences)
@@ -214,9 +230,9 @@ impl Validated {
                 }
                 recorded
             }
-            Self::ExecutionPayloadBid { bid, .. } => {
-                server.builder_market.record_bid((**bid).clone())
-            }
+            Self::ExecutionPayloadBid { bid, bid_limit, .. } => server
+                .builder_market
+                .record_bid_within((**bid).clone(), *bid_limit),
             Self::ProposerPreferences(preferences) => server.builder_market.record_preferences(
                 (**preferences).clone(),
                 crate::wall_clock_slot(&server.store),
@@ -1834,10 +1850,13 @@ mod tests {
         preferences
     }
 
+    /// A bid object as its stateful checks leave it on `Accept`, with a
+    /// limit that never binds.
     fn bid_object(server: &P2PServer, bid: SignedExecutionPayloadBid) -> Validated {
         Validated::ExecutionPayloadBid {
             bid: Box::new(bid),
             market: server.builder_market.clone(),
+            bid_limit: u64::MAX,
         }
     }
 

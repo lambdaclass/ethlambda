@@ -70,6 +70,7 @@ pub(crate) fn triage_execution_payload_bid(server: &P2PServer, payload: &[u8]) -
     Dispatch::Validate(Validated::ExecutionPayloadBid {
         bid: Box::new(bid),
         market: server.builder_market.clone(),
+        bid_limit: 0,
     })
 }
 
@@ -419,10 +420,13 @@ mod tests {
         ));
     }
 
+    /// Bids here are for the current slot: one for the next would be ignored
+    /// until the current slot's payload attestation deadline
+    /// (consensus-specs #5803), which the wall clock may not have reached.
     #[tokio::test]
     async fn a_bid_with_a_nonzero_payment_is_rejected() {
         let server = unconnected_beacon_server(gloas_from_genesis(), 0).await;
-        let mut bid = bid_at(crate::wall_clock_slot(&server.store) + 1);
+        let mut bid = bid_at(crate::wall_clock_slot(&server.store));
         bid.message.execution_payment = 1;
         assert!(matches!(
             triage_execution_payload_bid(&server, &bid.to_ssz()),
@@ -431,17 +435,18 @@ mod tests {
     }
 
     /// A valid-shaped bid goes on to the stateful checks carrying the shared
-    /// market, and once the market holds its builder's key a second is ignored
-    /// before them.
+    /// market, and once the market holds it, the same bid is ignored before
+    /// them: it does not beat the best value for its slot and parent.
     #[tokio::test]
-    async fn a_valid_shaped_bid_is_validated_unless_its_builder_key_was_seen() {
+    async fn a_valid_shaped_bid_is_validated_unless_it_does_not_beat_the_best() {
         let server = unconnected_beacon_server(gloas_from_genesis(), 0).await;
-        let bid = bid_at(crate::wall_clock_slot(&server.store) + 1);
+        let bid = bid_at(crate::wall_clock_slot(&server.store));
         let payload = bid.to_ssz();
         match triage_execution_payload_bid(&server, &payload) {
             Dispatch::Validate(Validated::ExecutionPayloadBid {
                 bid: decoded,
                 market,
+                ..
             }) => {
                 assert_eq!(*decoded, bid);
                 assert!(std::sync::Arc::ptr_eq(&market, &server.builder_market));
@@ -452,7 +457,7 @@ mod tests {
         assert!(server.builder_market.record_bid(bid));
         assert!(matches!(
             triage_execution_payload_bid(&server, &payload),
-            Dispatch::Report(Outcome::Ignore(IgnoreReason::AlreadySeen))
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::NotHighestBid))
         ));
     }
 

@@ -3,7 +3,8 @@
 //! bids on that slot are judged against.
 //!
 //! The rules are the specification's `validate_proposer_preferences_gossip`
-//! (`specs/gloas/p2p-interface.md`), split like [`super::envelope`]:
+//! (`specs/gloas/p2p-interface.md`, as of consensus-specs v1.7.0-beta.5),
+//! split like [`super::envelope`]:
 //! [`cheap_checks`] inline in the p2p actor, [`stateful_checks`] on a blocking
 //! thread, reading cached states only. The caller records the preferences in
 //! the [`BuilderMarket`] on `Accept`.
@@ -16,10 +17,6 @@
 //!   dependent root (the whole canonical case, and a dependent block about an
 //!   epoch old is usually evicted from the state cache), else from the cached
 //!   checkpoint state of the epoch before the proposal's.
-//! - The signature verifies under the proposal epoch's domain (v1.7.0-beta.4's
-//!   rule, and every client's) or under either of the two that beta.2's rule
-//!   could give, which differ from it only in the first epoch of a fork: see
-//!   [`proposer_preferences_domains`].
 
 use ethlambda_storage::CacheKey;
 
@@ -35,7 +32,6 @@ use crate::beacon::containers::{BeaconState, gloas};
 use crate::beacon::fork_choice::{
     Store, compute_shuffling_dependent_slot, compute_shuffling_lookahead_start_slot,
 };
-use crate::beacon::helpers::accessors::get_domain;
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::precheck::fixed_proposer;
 use crate::beacon::preset;
@@ -120,7 +116,7 @@ fn stateful_rules(store: &Store, signed: &gloas::SignedProposerPreferences) -> R
     if fixed_proposer(&state, preferences.proposal_slot) != Some(preferences.validator_index) {
         return Err(Outcome::Reject(RejectReason::WrongProposer));
     }
-    // [REJECT] The signature is valid, under any candidate domain.
+    // [REJECT] The signature is valid, under the proposal epoch's domain.
     let pubkey = bls::IndexedPubkey {
         index: preferences.validator_index,
         pubkey: state
@@ -128,17 +124,10 @@ fn stateful_rules(store: &Store, signed: &gloas::SignedProposerPreferences) -> R
             .map_err(|_| Outcome::Reject(RejectReason::WrongProposer))?
             .pubkey,
     };
-    let message_root = preferences.hash_tree_root();
-    let valid = proposer_preferences_domains(&state, &config, proposal_epoch)
-        .into_iter()
-        .any(|domain| {
-            bls::verify(
-                &pubkey,
-                compute_signing_root(message_root, domain),
-                &signed.signature,
-            )
-        });
-    if !valid {
+    let domain =
+        proposer_preferences_domain(&config, state.genesis_validators_root(), proposal_epoch);
+    let signing_root = compute_signing_root(preferences.hash_tree_root(), domain);
+    if !bls::verify(&pubkey, signing_root, &signed.signature) {
         return Err(Outcome::Reject(RejectReason::BadSignature));
     }
     Ok(())
@@ -213,51 +202,26 @@ pub fn dependent_root_at(
     ancestor_at(state, state_block_root, dependent_slot)
 }
 
-/// The distinct candidate signing domains for proposal epoch `P`, tried in
-/// order.
+/// The signing domain of a proposer preferences message for proposal epoch
+/// `P`: `compute_domain(DOMAIN_PROPOSER_PREFERENCES, compute_fork_version(P),
+/// genesis_validators_root)`, the one `get_signed_proposer_preferences` signs
+/// with and `validate_proposer_preferences_gossip` verifies with since
+/// consensus-specs v1.7.0-beta.4 (#5665), and what every client (this one's
+/// validator client included) signs under.
 ///
-/// First the schedule's fork version at `P`: consensus-specs v1.7.0-beta.4's
-/// `compute_fork_version(proposal_epoch)`, which `get_signed_proposer_preferences`
-/// signs with and `validate_proposer_preferences_gossip` verifies with, and
-/// what every client (this one's validator client included) signs under.
-///
-/// Then the two that beta.2's rule, `get_domain(lookahead_state,
-/// DOMAIN_PROPOSER_PREFERENCES, P)`, could give: `get_domain` on the state
-/// this node read the lookahead from, and the schedule's version at
-/// `P - MIN_SEED_LOOKAHEAD` (saturating), the epoch beta.2 advances its state
-/// to (this node may have read the head's, a later one). They are kept for a
-/// client still signing by beta.2, until the fixtures move past it. Outside
-/// the first epoch of a fork all three coincide, so accepting the older ones
-/// costs nothing.
-pub fn proposer_preferences_domains(
-    lookahead_state: &BeaconState,
+/// The fork version is the schedule's at `P`, not the lookahead state's: in
+/// the first epoch of a fork the state the lookahead is read from is still at
+/// the fork before it.
+pub fn proposer_preferences_domain(
     config: &Config,
+    genesis_validators_root: Root,
     proposal_epoch: Epoch,
-) -> Vec<Domain> {
-    let genesis_validators_root = lookahead_state.genesis_validators_root();
-    let at = |epoch: Epoch| {
-        compute_domain(
-            DOMAIN_PROPOSER_PREFERENCES,
-            config.fork_version(config.fork_at_epoch(epoch)),
-            genesis_validators_root,
-        )
-    };
-    let domains = [
-        at(proposal_epoch),
-        get_domain(
-            lookahead_state,
-            DOMAIN_PROPOSER_PREFERENCES,
-            Some(proposal_epoch),
-        ),
-        at(proposal_epoch.saturating_sub(preset::MIN_SEED_LOOKAHEAD)),
-    ];
-    let mut distinct: Vec<Domain> = Vec::with_capacity(domains.len());
-    for domain in domains {
-        if !distinct.contains(&domain) {
-            distinct.push(domain);
-        }
-    }
-    distinct
+) -> Domain {
+    compute_domain(
+        DOMAIN_PROPOSER_PREFERENCES,
+        config.fork_version(config.fork_at_epoch(proposal_epoch)),
+        genesis_validators_root,
+    )
 }
 
 /// `now > slot_start + MAXIMUM_GOSSIP_CLOCK_DISPARITY`: the specification's
@@ -276,7 +240,7 @@ mod tests {
     use crate::beacon::fork::ForkName;
     use crate::beacon::gossip::test_support::builder_scene::*;
     use crate::beacon::gossip::test_support::{slot_start_ms, store};
-    use crate::beacon::helpers::test_state::{secret_key_for, with_signing_validators_at};
+    use crate::beacon::helpers::test_state::with_signing_validators_at;
     use crate::beacon::preset::slots_per_epoch;
     use crate::beacon::primitives::ValidatorIndex;
     use crate::beacon::stf;
@@ -335,6 +299,7 @@ mod tests {
     ) -> gloas::SignedProposerPreferences {
         sign_preferences(
             &scene.state,
+            &scene.store.config(),
             gloas::ProposerPreferences {
                 dependent_root,
                 proposal_slot: proposal_slot(),
@@ -606,59 +571,25 @@ mod tests {
         state
     }
 
+    /// In the first epoch of a fork the domain is the proposal epoch's fork
+    /// version (gloas), not the fork of the fulu state the lookahead is read
+    /// from, nor of the epoch before the proposal's: v1.7.0-beta.2's rule,
+    /// which this node stopped accepting with the move to beta.5.
     #[test]
-    fn across_the_fork_both_neighbouring_versions_are_candidates() {
+    fn across_the_fork_the_domain_is_the_proposal_epochs() {
         let config = boundary_config();
         let state = fulu_state_with_fork(&config);
         let root = state.genesis_validators_root();
         let at =
             |fork| compute_domain(DOMAIN_PROPOSER_PREFERENCES, config.fork_version(fork), root);
-        // Proposal epoch 2 is gloas's first. The proposal epoch's version
-        // (gloas, beta.4's rule) comes first; the lookahead state's fork and
-        // the epoch before the proposal's (beta.2's) agree on fulu.
-        let domains = proposer_preferences_domains(&state, &config, 2);
-        assert_eq!(domains, vec![at(ForkName::Gloas), at(ForkName::Fulu)]);
-
-        // A signature under either verifies; one under neither does not.
-        let preferences = gloas::ProposerPreferences {
-            proposal_slot: 2 * slots_per_epoch(),
-            ..Default::default()
-        };
-        let message_root = preferences.hash_tree_root();
-        let sign = |domain| {
-            let signature = secret_key_for(0).sign(
-                compute_signing_root(message_root, domain).as_slice(),
-                crate::beacon::bls::DST,
-                &[],
-            );
-            crate::beacon::primitives::BlsSignature(signature.to_bytes())
-        };
-        let pubkey = state.validator(0).expect("validator 0").pubkey;
-        let accepted = |signature| {
-            domains.iter().any(|domain| {
-                bls::verify(
-                    &pubkey,
-                    compute_signing_root(message_root, *domain),
-                    &signature,
-                )
-            })
-        };
-        assert!(accepted(sign(at(ForkName::Fulu))));
-        assert!(accepted(sign(at(ForkName::Gloas))));
-        assert!(!accepted(sign(at(ForkName::Electra))));
-    }
-
-    #[test]
-    fn away_from_a_fork_there_is_one_candidate_domain() {
-        let config = boundary_config();
-        let mut state = fulu_state_with_fork(&config);
-        *state.fork_mut() = Fork {
-            previous_version: config.fork_version(ForkName::Fulu),
-            current_version: config.fork_version(ForkName::Gloas),
-            epoch: 2,
-        };
-        assert_eq!(proposer_preferences_domains(&state, &config, 5).len(), 1);
-        // And at epoch 0 the saturating subtraction does not wrap.
-        assert!(!proposer_preferences_domains(&state, &config, 0).is_empty());
+        // Proposal epoch 2 is gloas's first; epoch 1, and the state, are fulu.
+        assert_eq!(
+            proposer_preferences_domain(&config, root, 2),
+            at(ForkName::Gloas)
+        );
+        assert_eq!(
+            proposer_preferences_domain(&config, root, 1),
+            at(ForkName::Fulu)
+        );
     }
 }
