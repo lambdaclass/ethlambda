@@ -713,8 +713,8 @@ impl MockBeaconNode {
     /// For a call that checks it: when the node hangs, wait out the timeout
     /// and fail as the HTTP client fails a request that got no answer. Checked
     /// by `sync_status`, `attestation_data`, `publish_block`,
-    /// `submit_attestations` and `publish_execution_payload_envelope`, which
-    /// all also wait out [`Self::slow`] first.
+    /// `submit_attestations`, `publish_execution_payload_envelope` and the two
+    /// selection exchanges, which all also wait out [`Self::slow`] first.
     async fn stall(&self, what: &'static str) -> Result<()> {
         if let Some(delay) = self.slow {
             tokio::time::sleep(delay).await;
@@ -1834,6 +1834,7 @@ impl BeaconNodeApi for MockBeaconNode {
         if selections.is_empty() {
             return Ok(Vec::new());
         }
+        self.stall("beacon_committee_selections").await?;
         self.guard("beacon_committee_selections")?;
         self.selection_requests
             .lock()
@@ -1865,6 +1866,7 @@ impl BeaconNodeApi for MockBeaconNode {
         if selections.is_empty() {
             return Ok(Vec::new());
         }
+        self.stall("sync_committee_selections").await?;
         self.guard("sync_committee_selections")?;
         self.sync_selection_requests
             .lock()
