@@ -1217,11 +1217,21 @@ pub(crate) const MESH_N: usize = 8;
 /// one two epochs later does exactly that.
 const PRUNE_BACKOFF: Duration = Duration::from_secs(60);
 
-/// The most messages one inbound gossipsub RPC may carry, and so also the most
-/// this node asks one peer for with IWANT in a heartbeat: the second must not
-/// exceed the first, or a peer that answers in one RPC is refused for doing
-/// what was asked (see `max_control_messages_sent` in [`gossipsub_config`]).
-const MAX_GOSSIP_MESSAGES_PER_RPC: usize = 500;
+/// The most messages one inbound gossipsub RPC may carry.
+///
+/// libp2p-gossipsub refuses a bigger RPC whole and closes its stream, so this
+/// has to cover what an honest peer packs into one. Teku's jvm-libp2p merges
+/// the publishes it has queued for a peer into one RPC of up to 1000
+/// (`MAX_PUBLISHED_MESSAGES` in its `LibP2PParamsFactory`).
+const MAX_PUBLISH_MESSAGES_PER_RPC: usize = 1000;
+
+/// The most message ids this node asks one peer for with IWANT in a heartbeat,
+/// and names per topic in one IHAVE. Lighthouse's value.
+///
+/// It must not exceed [`MAX_PUBLISH_MESSAGES_PER_RPC`]: a peer that answers an
+/// IWANT in one RPC, as go-libp2p-pubsub does, would be refused for sending
+/// what was asked for.
+const MAX_IWANT_IDS_PER_HEARTBEAT: usize = 500;
 
 /// The gossipsub parameters both wires share.
 ///
@@ -1262,15 +1272,15 @@ pub(crate) fn gossipsub_config(
         // Since libp2p-gossipsub 0.50, an RPC over this limit fails to decode
         // and its inbound stream is closed; earlier releases processed
         // messages up to the limit and dropped the rest.
-        .max_publish_messages(MAX_GOSSIP_MESSAGES_PER_RPC)
+        .max_publish_messages(MAX_PUBLISH_MESSAGES_PER_RPC)
         // How many message ids this node asks one peer for with IWANT in a
         // heartbeat, and names per topic in one IHAVE. go-libp2p-pubsub
         // (Prysm) answers an IWANT with every message it named in one RPC,
         // split only by size, so asking for more than the cap above would
         // have that answer refused whole: its stream closed, and every id in
         // it left a broken promise that scoring charges to an honest peer.
-        // Lighthouse pairs the two limits the same way.
-        .max_control_messages_sent(MAX_GOSSIP_MESSAGES_PER_RPC)
+        // The default, 5000, is over it.
+        .max_control_messages_sent(MAX_IWANT_IDS_PER_HEARTBEAT)
         // libp2p-gossipsub 0.50 refuses an RPC whose subscriptions and control
         // messages add up to more than this, 16 KiB by default, as a decode
         // error that closes the stream it came on. A beacon peer on every
