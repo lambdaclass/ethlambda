@@ -6,11 +6,16 @@
 use std::path::PathBuf;
 
 use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
+use ethlambda_validator::beacon_node::fallback::BroadcastTopic;
 use ethlambda_validator::proposer_settings::{
     DEFAULT_GAS_LIMIT, GRAFFITI_BYTES, graffiti_from_text,
 };
 use ethlambda_validator::{BuilderProposals, ValidatorConfig};
 use eyre::WrapErr as _;
+use tokio::sync::oneshot;
+use tracing::info;
+
+use crate::shutdown::ShutdownSignals;
 
 /// An execution address is exactly this wide.
 const ADDRESS_BYTES: usize = 20;
@@ -19,11 +24,24 @@ const ADDRESS_BYTES: usize = 20;
 pub(crate) struct ValidatorOptions {
     /// Base URL(s) of the beacon node's HTTP API (e.g. http://localhost:5052).
     ///
-    /// Several may be supplied, comma-separated or by repeating the flag. They
-    /// are tried in order and the first that answers is used, so the order is
-    /// a preference, not a load-balancing policy.
+    /// Several may be supplied, comma-separated or by repeating the flag. Each
+    /// is asked whether it is syncing once a slot and ranked by the answer
+    /// (synced, then optimistic or with its execution client offline, then
+    /// syncing or more than 8 slots behind, then failing), the order given
+    /// breaking ties, and the first that answers is used, so the order is a
+    /// preference, not a load-balancing policy.
     #[arg(long, value_delimiter = ',', required = true)]
     pub(crate) beacon_nodes: Vec<String>,
+
+    /// Signed messages to send to every beacon node at once rather than to
+    /// the first that accepts them, comma-separated: `attestations`
+    /// (attestations, aggregates, payload attestations), `blocks` (blocks
+    /// and envelopes; never a blinded block), `sync-committee` (messages and
+    /// contributions), `subscriptions` (always sent to every node, accepted
+    /// for Lighthouse compatibility), `none` (also accepted for Lighthouse
+    /// compatibility, changing nothing). None by default.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) broadcast: Vec<BroadcastTopic>,
 
     /// Directory holding the EIP-2335 keystores and `validator_definitions.yml`.
     /// Without that file, keystores in the Lighthouse layout
@@ -120,35 +138,36 @@ pub(crate) struct ValidatorOptions {
     #[arg(long)]
     pub(crate) web3signer_url: Option<String>,
 
-    /// Propose builder blocks: register each validator with the beacon node's
-    /// builder and accept a blinded block when the builder's bid wins. Requires
-    /// a beacon node started with a builder (ethlambda: `--builder`). The
-    /// registrations and blinded blocks are fulu and earlier only. From gloas
-    /// the builder market works through proposer preferences, which are
-    /// published with or without this flag; there it only sets the boost
-    /// factor that weighs p2p bids in `produceBlockV4`. Without it the factor
-    /// is 0, the local payload unless it cannot be built: a node whose
-    /// execution client fails at the slot may still build on a p2p bid, and
-    /// that block is signed.
+    /// Propose builder blocks before gloas: register each validator with the
+    /// beacon node's builder and accept a blinded block when the builder's bid
+    /// wins. Requires a beacon node started with a builder (ethlambda:
+    /// `--builder`). The registrations and blinded blocks are fulu and earlier
+    /// only. From gloas the builder market works through proposer
+    /// preferences and p2p bids, and those compete with the local payload
+    /// with or without this flag (see `--builder-boost-factor`).
     #[arg(long, default_value = "false")]
     pub(crate) builder_proposals: bool,
 
     /// How a builder's bid is weighed against the local payload: the local
     /// payload wins iff `local >= factor * bid / 100`. 100 compares them as
     /// they are; 0 prefers the local payload unless it cannot be built.
+    ///
+    /// From gloas it weighs the pooled p2p bids in `produceBlockV4`, with or
+    /// without `--builder-proposals`. Before gloas it is sent only with
+    /// `--builder-proposals`; without it the factor is 0.
     #[arg(
         long,
         default_value = "100",
-        requires = "builder_proposals",
-        conflicts_with = "prefer_builder_proposals"
+        conflicts_with_all = ["prefer_builder_proposals", "self_build_only"]
     )]
     pub(crate) builder_boost_factor: u64,
 
     /// Take the builder's block whenever there is a valid bid: this client
     /// sends `builder_boost_factor = u64::MAX`. The beacon node still keeps
     /// its local payload when its execution client sets
-    /// `shouldOverrideBuilder`.
-    #[arg(long, default_value = "false", requires = "builder_proposals")]
+    /// `shouldOverrideBuilder`. From gloas with or without
+    /// `--builder-proposals`; before gloas only with it.
+    #[arg(long, default_value = "false", conflicts_with = "self_build_only")]
     pub(crate) prefer_builder_proposals: bool,
 
     /// The smallest builder bid, in gwei, a gloas block may be built on: the
@@ -159,11 +178,24 @@ pub(crate) struct ValidatorOptions {
     /// matters most with `--prefer-builder-proposals`, which otherwise takes
     /// a 1-gwei bid over the local payload. `0` sets no floor.
     ///
-    /// Taken with or without `--builder-proposals`: without it, a node whose
-    /// execution client fails at the slot may still build on a pooled bid,
-    /// and this is the floor that bid must clear.
-    #[arg(long, default_value_t = 0)]
+    /// Taken with or without `--builder-proposals`, as the boost factor is.
+    #[arg(long, default_value_t = 0, conflicts_with = "self_build_only")]
     pub(crate) builder_min_bid: u64,
+
+    /// Never sign a block built on a builder's payload. From gloas each block
+    /// request asks for no bid (factor 0, `min_bid` `2^64 - 1`), and a block
+    /// whose bid names a builder anyway is refused before slashing protection
+    /// records the slot. When the beacon node cannot build the payload
+    /// itself, the slot is missed rather than built on a bid. Lodestar's
+    /// `executiononly`.
+    ///
+    /// Before gloas nothing changes: a builder's payload comes only as a
+    /// blinded block, which this client refuses without
+    /// `--builder-proposals`. Conflicts with every flag that lets a builder
+    /// in: `--builder-proposals`, the factor, the preference and
+    /// `--builder-min-bid`.
+    #[arg(long, default_value = "false", conflicts_with = "builder_proposals")]
+    pub(crate) self_build_only: bool,
 
     /// Register every loaded key that has no slashing-protection record,
     /// instead of refusing to start.
@@ -204,6 +236,16 @@ pub(crate) struct ValidatorOptions {
         conflicts_with = "enable_doppelganger_protection"
     )]
     pub(crate) distributed: bool,
+    /// Read no beacon node's event stream: every attestation and sync
+    /// committee message waits for its offset into the slot, and every
+    /// payload timeliness committee vote for its deadline, even when the
+    /// slot's block or payload has already arrived.
+    ///
+    /// On by default, the stream lets those duties go out as soon as the
+    /// block (or the payload) does. Off is for a beacon node whose stream is
+    /// broken, or a proxy in front of it that holds events back.
+    #[arg(long, default_value = "false")]
+    pub(crate) disable_event_stream: bool,
 }
 
 impl ValidatorOptions {
@@ -249,17 +291,25 @@ impl ValidatorOptions {
 
     /// The builder configuration these flags describe, or `None` when builder
     /// proposals are off.
+    pub(crate) fn builder(&self) -> Option<BuilderProposals> {
+        self.builder_proposals.then_some(BuilderProposals {
+            boost_factor: self.boost_factor(),
+        })
+    }
+
+    /// The boost factor these flags describe: `u64::MAX` with
+    /// `--prefer-builder-proposals`, `--builder-boost-factor` otherwise (100
+    /// unless given). Before gloas it is sent only with builder proposals;
+    /// from gloas, with or without them.
     ///
     /// `--prefer-builder-proposals` wins over the factor by construction:
     /// clap refuses the two together, so at most one is ever set.
-    pub(crate) fn builder(&self) -> Option<BuilderProposals> {
-        self.builder_proposals.then_some(BuilderProposals {
-            boost_factor: if self.prefer_builder_proposals {
-                u64::MAX
-            } else {
-                self.builder_boost_factor
-            },
-        })
+    pub(crate) fn boost_factor(&self) -> u64 {
+        if self.prefer_builder_proposals {
+            u64::MAX
+        } else {
+            self.builder_boost_factor
+        }
     }
 
     /// Reject a port clash before anything binds, the way the node's own
@@ -280,8 +330,44 @@ impl ValidatorOptions {
 /// `main` stays synchronous, the same way it does for the `node` sub-command:
 /// each sub-command picks its own concurrency model rather than being forced
 /// onto one runtime shared with the others.
-#[tokio::main]
-pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
+///
+/// SIGINT and SIGTERM are listened for from the first line on
+/// ([`listen_for_stop`]). During startup either one ends the process at once;
+/// from then on it stops the client cleanly (see `ethlambda_validator::run`),
+/// and three more end it at once, as they end the node
+/// ([`ShutdownSignals::force_exit_on_repeats`]).
+///
+/// The runtime is built here rather than by `#[tokio::main]` so its teardown
+/// is bounded (see [`RUNTIME_SHUTDOWN`]).
+pub(crate) fn run(options: ValidatorOptions) -> eyre::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .wrap_err("failed to start the tokio runtime")?;
+    let ran = runtime.block_on(run_client(options));
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
+    ran
+}
+
+/// How long the runtime's teardown waits for what is still running on its
+/// threads once the client has returned.
+///
+/// Dropping the runtime would wait with no limit: for a worker still in a
+/// keymanager import's synchronous decryption after the client's own drain
+/// gave up on it, or for a slashing-protection write stuck on a slow disk.
+/// Neither signal could end the process meanwhile. Their handlers stay
+/// installed for the life of the process, and the tasks that read them, the
+/// repeat counter among them, go with the runtime. What still runs here, the
+/// client has already given up on (see `ethlambda_validator::run`). A record
+/// write cut here leaves the previous file, since the new one is renamed into
+/// place, and that write takes milliseconds when the disk answers.
+const RUNTIME_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`run`]'s body, on the runtime it builds.
+async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
+    // First, so that no point of startup leaves a signal its default action,
+    // which for a container's PID 1 is to be ignored.
+    let stop = listen_for_stop();
     options.validate_ports()?;
     // The same raise `run_node` makes, and for a like reason: with remote
     // keys every signing request in flight is a socket (capped per signer,
@@ -293,7 +379,8 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
     let graffiti = options.graffiti()?;
     let suggested_fee_recipient = options.suggested_fee_recipient()?;
     let builder = options.builder();
-    ethlambda_validator::run(ValidatorConfig {
+    let gloas_boost_factor = options.boost_factor();
+    let config = ValidatorConfig {
         beacon_nodes: options.beacon_nodes,
         graffiti,
         suggested_fee_recipient,
@@ -308,12 +395,132 @@ pub(crate) async fn run(options: ValidatorOptions) -> eyre::Result<()> {
         gas_limit: options.gas_limit,
         builder,
         builder_min_bid: options.builder_min_bid,
+        gloas_boost_factor,
+        self_build_only: options.self_build_only,
         init_slashing_protection: options.init_slashing_protection,
         doppelganger_protection: options.enable_doppelganger_protection,
+        broadcast: options.broadcast.into_iter().collect(),
         distributed: options.distributed,
-    })
-    .await
-    .map_err(Into::into)
+        event_stream: !options.disable_event_stream,
+    };
+    ethlambda_validator::run(config, || stop.start())
+        .await
+        .map_err(Into::into)
+}
+
+/// Listen for SIGINT and SIGTERM from here on, and return what makes the
+/// `stop` argument of `ethlambda_validator::run`.
+///
+/// A task of its own waits for the first signal. What it does with it
+/// depends on whether the client's startup is done, which the client marks
+/// by calling `stop` (see [`Handoff`]):
+///
+/// - During startup, it ends the process at once, with exit code 0. Nothing
+///   needs draining yet: no duty has run, so nothing is signed, and the
+///   keymanager has taken no request; the client is still decrypting its
+///   keystores or first asking its beacon node for the chain. Ending there
+///   is what the signal's default action did outside a container, and still
+///   does for the node until it has started (see the `shutdown` module). As
+///   a container's PID 1, where the default action is to ignore the signal,
+///   it is what lets `docker stop` work during startup.
+/// - After, it hands the signal to the future `stop` returned: the client
+///   finishes the work in flight and returns `Ok(())`. Three more signals end
+///   the process with exit code 1
+///   ([`ShutdownSignals::force_exit_on_repeats`]).
+///
+/// The task ends the process itself, rather than `run_client` racing startup
+/// against the signal: startup decrypts the keystores inline, so the client
+/// polls nothing until that is done. The task runs meanwhile on a worker
+/// thread of this multi-threaded runtime, since the client blocks only the
+/// main one.
+fn listen_for_stop() -> Start {
+    let mut signals = ShutdownSignals::listen();
+    let (start, handoff) = Handoff::new();
+    tokio::spawn(async move {
+        if let Some(signal) = handoff.route(signals.recv()).await {
+            info!(signal, "Shutdown signal received during startup; exiting");
+            std::process::exit(0);
+        }
+        signals.force_exit_on_repeats();
+    });
+    start
+}
+
+/// The client's side of the handoff: what it calls once startup is done.
+struct Start {
+    mark_started: oneshot::Sender<()>,
+    signal: oneshot::Receiver<&'static str>,
+}
+
+impl Start {
+    /// Mark startup done, so a signal from now on stops the client rather
+    /// than ending the process, and return the future the signal resolves.
+    fn start(self) -> impl Future<Output = &'static str> {
+        let Self {
+            mark_started,
+            signal,
+        } = self;
+        let _ = mark_started.send(());
+        async move {
+            match signal.await {
+                Ok(signal) => signal,
+                // The listener is gone without handing one on: it ended the
+                // process, or the runtime is shutting down.
+                Err(_) => std::future::pending().await,
+            }
+        }
+    }
+}
+
+/// The signal listener's side of the handoff.
+struct Handoff {
+    /// Resolves once the client calls [`Start::start`], or drops its
+    /// [`Start`] uncalled, which it does when it stops before startup is
+    /// done.
+    started: oneshot::Receiver<()>,
+    /// Where a signal goes once startup is done.
+    stop: oneshot::Sender<&'static str>,
+}
+
+impl Handoff {
+    /// The client's side of the handoff and the listener's.
+    fn new() -> (Start, Self) {
+        let (mark_started, started) = oneshot::channel();
+        let (stop, signal) = oneshot::channel();
+        let start = Start {
+            mark_started,
+            signal,
+        };
+        (start, Self { started, stop })
+    }
+
+    /// Wait for `signal`, and return it if the client's startup is not done,
+    /// for the caller to end the process. Once it is, the signal is handed to
+    /// the client instead, and `None` is returned.
+    ///
+    /// A client that dropped its [`Start`] uncalled counts as started: it is
+    /// already stopping on an error. Such a signal goes nowhere and is only
+    /// logged.
+    async fn route(self, signal: impl Future<Output = &'static str>) -> Option<&'static str> {
+        let Self { started, stop } = self;
+        let mut signal = std::pin::pin!(signal);
+        tokio::select! {
+            // A start and a signal seen in the same poll count as a start:
+            // startup is done by now, so the signal is the client's to
+            // drain.
+            biased;
+            _ = started => {}
+            signal = &mut signal => return Some(signal),
+        }
+        let signal = signal.await;
+        let _ = stop.send(signal).inspect_err(|_| {
+            info!(
+                signal,
+                "Shutdown signal received while the client is already stopping"
+            )
+        });
+        None
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +530,7 @@ mod tests {
     fn options(graffiti: &str) -> ValidatorOptions {
         ValidatorOptions {
             beacon_nodes: vec!["http://localhost:5052".to_string()],
+            broadcast: Vec::new(),
             validators_dir: PathBuf::from("/tmp/validators"),
             secrets_dir: PathBuf::from("/tmp/secrets"),
             http_address: "127.0.0.1".parse().expect("valid address"),
@@ -338,9 +546,11 @@ mod tests {
             builder_boost_factor: 100,
             prefer_builder_proposals: false,
             builder_min_bid: 0,
+            self_build_only: false,
             init_slashing_protection: false,
             enable_doppelganger_protection: false,
             distributed: false,
+            disable_event_stream: false,
         }
     }
 
@@ -364,6 +574,45 @@ mod tests {
             "/tmp/s",
         ];
         Cli::try_parse_from(base.iter().chain(extra)).map(|cli| cli.options)
+    }
+
+    /// A signal before the client calls `stop`, so during startup, is
+    /// returned for the listener to end the process with, and the client
+    /// never hears of it.
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_during_startup_ends_the_process_instead_of_reaching_the_client() {
+        let (start, handoff) = Handoff::new();
+        let routed = handoff.route(async { "SIGTERM" }).await;
+        assert_eq!(routed, Some("SIGTERM"), "the listener ends the process");
+        let heard = tokio::time::timeout(std::time::Duration::from_secs(60), start.start()).await;
+        assert!(heard.is_err(), "the client never hears of that signal");
+    }
+
+    /// Once the client has called `stop`, which it does when startup is
+    /// done, a signal is handed to it to drain, rather than ending the
+    /// process.
+    #[tokio::test]
+    async fn a_signal_once_startup_is_done_is_handed_to_the_client() {
+        let (start, handoff) = Handoff::new();
+        let (send_signal, signal) = oneshot::channel();
+        let signal = async move { signal.await.expect("one is sent") };
+        let routed = tokio::spawn(handoff.route(signal));
+        let stop = start.start();
+        // Sent before the listener has run, so it sees the start and the
+        // signal together, which count as a start.
+        send_signal.send("SIGINT").expect("the listener waits");
+        assert_eq!(stop.await, "SIGINT");
+        assert_eq!(routed.await.expect("the listener ends"), None);
+    }
+
+    /// A client that drops `stop` uncalled is stopping on an error during
+    /// startup, so a signal then does not end the process with exit code 0
+    /// in its place.
+    #[tokio::test]
+    async fn a_signal_once_the_client_dropped_stop_uncalled_does_not_end_the_process() {
+        let (start, handoff) = Handoff::new();
+        drop(start);
+        assert_eq!(handoff.route(async { "SIGTERM" }).await, None);
     }
 
     #[test]
@@ -423,6 +672,37 @@ mod tests {
         assert!(parse(&["--distributed", "--enable-doppelganger-protection"]).is_err());
     }
 
+    /// Nothing is broadcast unless asked for, as in Lighthouse; topics are
+    /// comma-separated or repeated, and an unknown one is refused at startup.
+    #[test]
+    fn broadcast_topics_are_off_unless_named() {
+        use ethlambda_validator::beacon_node::fallback::Broadcast;
+
+        let topics =
+            |options: ValidatorOptions| -> Broadcast { options.broadcast.into_iter().collect() };
+        assert_eq!(topics(parse(&[]).expect("parses")), Broadcast::default());
+        let options = parse(&[
+            "--broadcast",
+            "attestations,blocks",
+            "--broadcast",
+            "sync-committee",
+        ])
+        .expect("parses");
+        assert_eq!(
+            topics(options),
+            Broadcast {
+                attestations: true,
+                blocks: true,
+                sync_committee: true,
+            }
+        );
+        let options = parse(&["--broadcast", "subscriptions"]).expect("parses");
+        assert_eq!(topics(options), Broadcast::default());
+        let options = parse(&["--broadcast", "none"]).expect("parses");
+        assert_eq!(topics(options), Broadcast::default());
+        parse(&["--broadcast", "everything"]).expect_err("not a topic");
+    }
+
     #[test]
     fn builder_proposals_default_to_a_factor_of_100() {
         let options = parse(&["--builder-proposals"]).expect("parses");
@@ -454,17 +734,57 @@ mod tests {
         );
     }
 
+    /// From gloas, with no builder flag at all, p2p bids compete at par: a
+    /// factor of 100 and no floor, as Lighthouse, Teku and Nimbus send.
     #[test]
-    fn the_factor_and_the_preference_need_builder_proposals() {
-        parse(&["--builder-boost-factor", "250"])
-            .expect_err("a factor with builder proposals off is a mistake");
-        parse(&["--prefer-builder-proposals"])
-            .expect_err("a preference with builder proposals off is a mistake");
+    fn by_default_gloas_bids_compete_at_par() {
+        let options = parse(&[]).expect("parses");
+        assert_eq!(options.boost_factor(), 100);
+        assert_eq!(options.builder_min_bid, 0);
+        assert!(!options.self_build_only);
+        assert_eq!(options.builder(), None);
+    }
+
+    /// The factor and the preference no longer need builder proposals: from
+    /// gloas they weigh p2p bids without them. Builder proposals stay off.
+    #[test]
+    fn the_factor_and_the_preference_apply_at_gloas_without_builder_proposals() {
+        let options = parse(&["--builder-boost-factor", "250"]).expect("parses");
+        assert_eq!(options.boost_factor(), 250);
+        assert_eq!(options.builder(), None);
+        let options = parse(&["--prefer-builder-proposals"]).expect("parses");
+        assert_eq!(options.boost_factor(), u64::MAX);
+        assert_eq!(options.builder(), None);
+    }
+
+    #[test]
+    fn self_build_only_is_off_by_default_and_taken_alone() {
+        assert!(!parse(&[]).expect("parses").self_build_only);
+        assert!(
+            parse(&["--self-build-only"])
+                .expect("parses")
+                .self_build_only
+        );
+    }
+
+    /// A self-build-only client takes no builder's payload, so every flag
+    /// that would let one in is refused beside it.
+    #[test]
+    fn self_build_only_conflicts_with_every_flag_that_lets_a_builder_in() {
+        for flags in [
+            &["--builder-proposals"][..],
+            &["--builder-boost-factor", "0"],
+            &["--prefer-builder-proposals"],
+            &["--builder-min-bid", "1"],
+        ] {
+            let line: Vec<&str> = flags.iter().copied().chain(["--self-build-only"]).collect();
+            parse(&line).expect_err("the two say different things");
+        }
     }
 
     /// The floor travels with either way of weighing bids, in gwei as given,
-    /// and without builder proposals too: a node whose local build fails may
-    /// still build on a pooled bid, which the floor then applies to.
+    /// and without builder proposals too: from gloas pooled bids compete
+    /// without them, and the floor applies to those bids.
     #[test]
     fn a_min_bid_is_taken_with_or_without_builder_proposals() {
         let options =

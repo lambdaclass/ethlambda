@@ -676,7 +676,6 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
         let subscribed = subscriptions::subscribe(&self.beacon_node, duties, store, &self.context);
         let _ = subscribed.await.inspect_err(|err| {
             warn!(%epoch, %err, "Failed to subscribe to attestation subnets");
-            crate::metrics::set_beacon_node_available(false);
         });
     }
 }

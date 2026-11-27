@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | `AttesterDuty` | pubkey, validator_index, committee_index, committee_length, committees_at_slot, validator_committee_index, slot | all seven, all used |
 //! | Genesis | genesis_time, genesis_validators_root, genesis_fork_version | the first two; the fork version comes from `/config/spec` |
-//! | Syncing | head_slot, sync_distance, is_syncing, is_optimistic, el_offline | is_syncing and is_optimistic gate signing; el_offline is logged |
+//! | Syncing | head_slot, sync_distance, is_syncing, is_optimistic, el_offline | all five: is_syncing and is_optimistic gate signing; el_offline and sync_distance rank the node, stopping nothing; head_slot is recorded; head_slot and sync_distance are read leniently |
 //! | `ValidatorResponse` | index, balance, status, validator | index, status, validator.pubkey; the single-validator form also reads the activation, exit and withdrawable epochs |
 //! | `ProposerDuty` | pubkey, validator_index, slot | all three, all used |
 //! | `ProposerPreparation` | validator_index, fee_recipient | both, sent not read |
@@ -183,6 +183,48 @@ pub struct SyncingDto {
     /// to; what it cannot do is validate new payloads, and it reports that
     /// through `is_optimistic` when it starts to matter.
     pub el_offline: Option<bool>,
+    /// The node's head slot. Kept in the per-slot probe's record (see
+    /// [`crate::beacon_node::health`]), never read to decide anything.
+    ///
+    /// `None` when absent or not an integer, rather than a failed decode. A
+    /// failed decode reads as a node that did not answer, which does not count
+    /// as syncing, so a node answering `is_syncing: true` beside a malformed
+    /// `head_slot` would open the gate it should hold shut.
+    #[serde(default, deserialize_with = "lenient_u64")]
+    pub head_slot: Option<Slot>,
+    /// How many slots the node's head is behind its own wall clock. Kept and
+    /// read leniently, as `head_slot` is.
+    #[serde(default, deserialize_with = "lenient_u64")]
+    pub sync_distance: Option<u64>,
+}
+
+impl From<SyncingDto> for crate::beacon_node::health::SyncStatus {
+    /// An absent `is_optimistic` or `el_offline` reads as `false`, for the
+    /// reasons given on the two fields.
+    fn from(dto: SyncingDto) -> Self {
+        Self {
+            head_slot: dto.head_slot,
+            sync_distance: dto.sync_distance,
+            is_syncing: dto.is_syncing,
+            is_optimistic: dto.is_optimistic.unwrap_or(false),
+            el_offline: dto.el_offline.unwrap_or(false),
+        }
+    }
+}
+
+/// A 64-bit integer, quoted as the Beacon API sends it or bare, and `None` for
+/// anything else: null, a negative or fractional number, text that is not an
+/// integer. For fields kept for the record, where a malformed value must not
+/// fail the answer around it.
+fn lenient_u64<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(text)) => text.parse().ok(),
+        Some(serde_json::Value::Number(number)) => number.as_u64(),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1221,12 +1263,11 @@ mod tests {
         );
     }
 
-    /// A real `GET /eth/v1/node/syncing` body, carrying all five spec fields;
-    /// only two are declared here.
+    /// A real `GET /eth/v1/node/syncing` body, carrying all five spec fields.
     const SYNCING: &str = r#"{
         "data": {
             "head_slot": "12345678",
-            "sync_distance": "0",
+            "sync_distance": "3",
             "is_syncing": false,
             "is_optimistic": true,
             "el_offline": false
@@ -1234,10 +1275,36 @@ mod tests {
     }"#;
 
     #[test]
-    fn parses_syncing_ignoring_the_fields_it_does_not_declare() {
+    fn parses_every_syncing_field() {
         let response: DataResponse<SyncingDto> = serde_json::from_str(SYNCING).expect("parses");
         assert!(!response.data.is_syncing);
         assert_eq!(response.data.is_optimistic, Some(true));
+        assert_eq!(response.data.el_offline, Some(false));
+        assert_eq!(response.data.head_slot, Some(12_345_678));
+        assert_eq!(response.data.sync_distance, Some(3));
+    }
+
+    /// The head slot and sync distance are kept for the record only, so one
+    /// that is missing or malformed is `None` rather than a failed answer:
+    /// the flags beside it still count.
+    #[test]
+    fn a_missing_or_malformed_head_slot_does_not_fail_the_answer() {
+        for data in [
+            r#"{ "is_syncing": true }"#,
+            r#"{ "is_syncing": true, "head_slot": null, "sync_distance": "-1" }"#,
+            r#"{ "is_syncing": true, "head_slot": "soon", "sync_distance": 1.5 }"#,
+        ] {
+            let body = format!(r#"{{ "data": {data} }}"#);
+            let response: DataResponse<SyncingDto> = serde_json::from_str(&body).expect(data);
+            assert!(response.data.is_syncing, "{data}");
+            assert_eq!(response.data.head_slot, None, "{data}");
+            assert_eq!(response.data.sync_distance, None, "{data}");
+        }
+
+        let bare = r#"{ "data": { "is_syncing": false, "head_slot": 7, "sync_distance": 0 } }"#;
+        let response: DataResponse<SyncingDto> = serde_json::from_str(bare).expect("parses");
+        assert_eq!(response.data.head_slot, Some(7));
+        assert_eq!(response.data.sync_distance, Some(0));
     }
 
     /// A real `POST /eth/v1/beacon/states/head/validators` body, including
