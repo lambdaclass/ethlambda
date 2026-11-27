@@ -64,6 +64,18 @@ one the node does not check:
   request, which costs bandwidth and CPU until the slot or epoch the caller
   named. A sync committee subscription is capped at the end of the next sync
   committee period; an attestation subnet's is not capped.
+- **How many custody groups the node holds.** Both
+  `beacon_committee_subscriptions` (every entry's, an aggregator's or not) and
+  `prepare_beacon_proposer` record every validator index they name as attached
+  to this node, with no check that the node runs it. Once an epoch the node raises its recorded
+  custody count to what those validators' effective balance requires
+  ([Validator custody](./beacon_wire.md#validator-custody)), and that record
+  never falls, as fulu's validator custody has it, so a caller naming
+  validators the node does not run raises its custody, and the bandwidth and
+  storage that go with it, for good: the advertised count at once, within the
+  groups it already holds, and the rest from the next start. Only a new data
+  directory forgets it. The named indices are kept in memory for two epochs
+  past their last mention, however many a caller names.
 - **When the node builds a block.** Every
   `GET /eth/v3/validator/blocks/{slot}` and
   `POST /eth/v4/validator/blocks/{slot}` request has the execution client
