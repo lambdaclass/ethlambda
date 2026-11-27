@@ -35,16 +35,23 @@ used from gloas on; the startup handshake warns when the execution client does n
 
 Two method families a full client would have are deliberately absent:
 
-- **`engine_getPayload*` outside the gloas path.** The follower itself never
-  asks an execution client to start building a block, so its own
-  `forkchoiceUpdated` calls carry `null` payload attributes. Block production for
-  a validator client (`produceBlockV3` for fulu, `produceBlockV4` for gloas) does:
+- **`engine_getPayload*` outside block production.** The follower asks an
+  execution client to build only for a proposal of a validator client it
+  serves (for every slot's proposer with `--always-prepare-payload`), so the
+  `forkchoiceUpdated` calls that follow its head carry `null` payload
+  attributes. Block production for a validator client
+  (`produceBlockV3` for fulu, `produceBlockV4` for gloas) does:
   `forkchoiceUpdatedV3` with `PayloadAttributesV3` then `engine_getPayloadV5`
   before gloas, and `forkchoiceUpdatedV4` with `PayloadAttributesV4` (V3's fields
   plus `slotNumber` and `targetGasLimit`, the parent bid's gas limit) then
   `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
   `slotNumber`) from gloas on. The handshake warns when a gloas network's
-  execution client does not advertise `engine_getPayloadV6`.
+  execution client does not advertise `engine_getPayloadV6`. The chain actor
+  sends that `forkchoiceUpdated` with attributes a third of a slot ahead, for
+  a proposer a validator client registered (every proposer with
+  `--always-prepare-payload`), with the same safe and finalized hashes as the
+  head's own update, and block production collects the build with
+  `getPayload`; see the `payload_attributes` event in [`rpc.md`](rpc.md).
 - **`engine_getPayloadBodies*`.** Nothing consumes them.
 
 Blocks before electra are not asked about at all. This node checkpoint-syncs onto

@@ -358,13 +358,14 @@ beacon node.
 
 | Flag | Meaning |
 |---|---|
-| `--beacon-nodes` | Base URLs of the beacon nodes to use, comma-separated or repeated. Each is asked whether it is syncing once a slot; the ones that said synced are tried first, then the rest, each in the order given, so the order is a preference. A slot in which every node that answered is syncing or on an optimistic head signs nothing |
+| `--beacon-nodes` | Base URLs of the beacon nodes to use, comma-separated or repeated. Each is asked whether it is syncing once a slot and ranked by the answer (synced, then optimistic or with its execution client offline, then syncing or more than 8 slots behind, then failing), the order given breaking ties, so the order is a preference. A slot in which every node that answered is syncing or on an optimistic head signs nothing. `--broadcast` sends chosen signed messages to every node |
 | `--validators-dir` | Directory of EIP-2335 keystores and `validator_definitions.yml`. Without that file, keystores in the Lighthouse layout (`<0xpubkey>/voting-keystore.json`) are discovered and the file is written |
 | `--secrets-dir` | One password file per keystore, named after the validator's public key |
 | `--suggested-fee-recipient` | Execution address for block rewards, `0x`-prefixed. Optional, but without it the beacon node picks an address that is not yours |
 | `--graffiti` | Text for proposed blocks, at most 32 bytes |
 | `--gas-limit` | The gas limit validators target (default `60000000`). From gloas the beacon node builds this client's own payloads toward it, so set it on a network whose limit is elsewhere. Sepolia and Platåberget schedule `200000000`: pass `--gas-limit 200000000` there (until [#795](https://github.com/lambdaclass/ethlambda/issues/795)) |
-| `--builder-proposals` | Propose builder blocks before gloas: register each validator with the beacon node's builder (`--builder` on an ethlambda node) and sign a blinded block when the builder's bid wins. Off by default. From gloas, with or without it, a node that cannot build the payload itself may build on a builder's p2p bid, and that block is signed |
+| `--builder-proposals` | Propose builder blocks before gloas: register each validator with the beacon node's builder (`--builder` on an ethlambda node) and sign a blinded block when the builder's bid wins. Off by default. From gloas, with or without it, builders' p2p bids compete with the local payload (`--builder-boost-factor`, default `100`; `--builder-min-bid`, default `0`), and a block built on the winning bid is signed |
+| `--self-build-only` | Never sign a block built on a builder's payload: from gloas each block request asks for no bid, and a block built on one anyway is refused. A slot whose local payload cannot be built is missed. Off by default |
 | `--enable-keymanager` | Serve the keymanager API on `--keymanager-port` (default `5062`). Off by default, since it mutates key material |
 | `--enable-doppelganger-protection` | Sign no attestation or block for a key until the beacon node has seen it stay silent for a full epoch, and stop if another client turns out to be running it. Costs two to three epochs of attestations per start. Off by default |
 

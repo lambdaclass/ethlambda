@@ -29,10 +29,13 @@ pub mod aggregation_selection;
 pub mod attestation;
 pub mod beacon_node;
 pub mod chain_check;
+pub mod client_health;
+pub mod clock_check;
 pub mod doppelganger;
 pub mod duties;
 pub mod error;
 pub mod exit;
+pub mod head_monitor;
 pub mod http_api;
 pub(crate) mod in_flight;
 pub mod keys;
@@ -109,6 +112,7 @@ use crate::beacon_node::http::HttpBeaconNode;
 use crate::beacon_node::{BeaconNodeApi, ValidatorEntry};
 use crate::chain_check::ChainId;
 use crate::duties::{DutiesService, ProposerDutiesVersion};
+use crate::head_monitor::DutyTriggers;
 use crate::in_flight::InFlight;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
@@ -160,10 +164,16 @@ pub struct ValidatorConfig {
     /// The smallest p2p bid, in gwei, a gloas block may be built on
     /// (`produceBlockV4`'s `min_bid`). `0` takes any bid that wins on value.
     ///
-    /// Not part of [`BuilderProposals`]: without them a node whose local build
-    /// fails may still build on a pooled bid, and this floor applies to that
-    /// bid too.
+    /// Not part of [`BuilderProposals`]: gloas requests carry it with or
+    /// without them.
     pub builder_min_bid: u64,
+    /// The `builder_boost_factor` every gloas block request carries, with or
+    /// without builder proposals: `--builder-boost-factor` (default 100), or
+    /// `u64::MAX` with `--prefer-builder-proposals`.
+    pub gloas_boost_factor: u64,
+    /// `--self-build-only`: from gloas, ask for no bid and sign no block built
+    /// on one. See [`ProposalService::with_self_build_only`].
+    pub self_build_only: bool,
     /// Register keys that have no slashing-protection record as never having
     /// signed, instead of refusing to start. See
     /// [`slashing_protection::SlashingProtection::open`].
@@ -172,16 +182,24 @@ pub struct ValidatorConfig {
     /// has seen it stay silent for a full epoch, and stop if it does not. See
     /// [`doppelganger`].
     pub doppelganger_protection: bool,
+    /// `--broadcast`: the signed messages sent to every beacon node rather
+    /// than the first that accepts them. See [`beacon_node::fallback`].
+    pub broadcast: beacon_node::fallback::Broadcast,
+    /// Read the beacon nodes' event streams, so attestations and sync
+    /// committee messages go out when the slot's block arrives and payload
+    /// votes when its payload does, rather than only at their deadlines. See
+    /// [`head_monitor`].
+    pub event_stream: bool,
 }
 
 /// Builder proposals: register each validator with the beacon node's builder
 /// and accept a blinded block when the builder's bid wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuilderProposals {
-    /// The `builder_boost_factor` sent with every block request (in the query
-    /// before gloas, in `produceBlockV4`'s body from gloas): 100 compares the
-    /// bid and the local payload as they are; `u64::MAX` takes the builder
-    /// whenever there is a bid.
+    /// The `builder_boost_factor` sent in every block request's query before
+    /// gloas: 100 compares the bid and the local payload as they are;
+    /// `u64::MAX` takes the builder whenever there is a bid. From gloas
+    /// [`ValidatorConfig::gloas_boost_factor`] is sent, with or without these.
     pub boost_factor: u64,
 }
 
@@ -280,6 +298,12 @@ where
     // The keymanager mutates this at runtime while the duty loop reads it, so
     // it is shared rather than owned outright from here on.
     let store = Arc::new(RwLock::new(store));
+    // What `/health` reports. The nodes and the record are attached once
+    // they exist; until the first refresh it answers `starting`.
+    let health = Arc::new(client_health::ClientHealth::new(
+        config.beacon_nodes.len(),
+        store.clone(),
+    ));
 
     // Bound before any beacon-node network call, deliberately: a validator
     // that cannot reach its beacon node waits for one at startup, for as long
@@ -294,8 +318,9 @@ where
             source,
         })?;
     info!(address = %config.metrics, "Metrics listening");
+    let router = metrics::router(health.clone());
     tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, metrics::router()).await {
+        if let Err(err) = axum::serve(listener, router).await {
             error!(%err, "Metrics server stopped");
         }
     });
@@ -305,7 +330,7 @@ where
         .iter()
         .map(HttpBeaconNode::new)
         .collect::<Result<Vec<_>>>()?;
-    let beacon_node = Arc::new(FallbackBeaconNode::new(nodes));
+    let beacon_node = Arc::new(FallbackBeaconNode::new(nodes).with_broadcast(config.broadcast));
 
     // The chain the client runs on is the first node's that answers, waiting
     // for one while none does; every other node is checked against it, and a
@@ -359,6 +384,11 @@ where
         "Slashing protection loaded"
     );
     let protection = slashing_protection::SharedProtection::new(protection);
+    health.attach(
+        beacon_node.health().clone(),
+        clock.clone(),
+        protection.clone(),
+    );
 
     // Every key loaded is registered before anything that signs exists, in
     // the epoch the clock is in now, so this process's own activity before a
@@ -392,6 +422,10 @@ where
     }
     let context = Arc::new(context);
 
+    // Every node's stream, read until `run` returns and `_monitor` with it.
+    let (_monitor, triggers) =
+        head_monitor::start(&config.beacon_nodes, &context, config.event_stream)?;
+
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation =
         AttestationService::new(beacon_node.clone(), context.clone(), protection.clone());
@@ -418,6 +452,8 @@ where
     )
     .with_clock(clock.clone())
     .with_builder_min_bid(config.builder_min_bid)
+    .with_gloas_boost_factor(config.gloas_boost_factor)
+    .with_self_build_only(config.self_build_only)
     .with_preferences(preferences.clone())
     .with_tasks(tasks.clone());
     // The proposer preparations' per-slot re-send. The epoch's own send is
@@ -435,12 +471,34 @@ where
             settings.clone(),
         ))
     });
-    // Logged above when builder proposals are on.
-    if config.builder.is_none() && config.builder_min_bid > 0 {
+    // From gloas, with or without builder proposals. Said only on a network
+    // that schedules gloas: elsewhere the factor and the floor do nothing yet,
+    // which an operator who set them without builder proposals (once refused
+    // at startup) is warned of instead.
+    let gloas_epoch = context.config().gloas_fork_epoch;
+    if gloas_epoch == ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH {
+        let builder_settings_given = config.gloas_boost_factor
+            != proposal::DEFAULT_BUILDER_BOOST_FACTOR
+            || config.builder_min_bid > 0;
+        if config.builder.is_none() && builder_settings_given {
+            warn!(
+                boost_factor = config.gloas_boost_factor,
+                min_bid_gwei = config.builder_min_bid,
+                "This network schedules no gloas, and before gloas a boost factor is sent only \
+                 with --builder-proposals: these builder settings do nothing yet"
+            );
+        }
+    } else if config.self_build_only {
         info!(
+            %gloas_epoch,
+            "Self-build only: from gloas, no block built on a builder's bid is signed"
+        );
+    } else {
+        info!(
+            %gloas_epoch,
+            boost_factor = config.gloas_boost_factor,
             min_bid_gwei = config.builder_min_bid,
-            "Builder proposals off; --builder-min-bid still applies to a p2p bid taken when the local \
-             payload cannot be built"
+            "From gloas, builders' p2p bids compete with the local payload"
         );
     }
 
@@ -566,6 +624,9 @@ where
         // The validators the last refresh resolved, whose proposer
         // preparations are re-sent every slot (see `Preparations`).
         let mut resolved: Arc<Vec<ValidatorEntry>> = Arc::default();
+        // Warns when the wall clock stepped since the last pass. See
+        // `clock_check::StepWatch`.
+        let mut steps = crate::clock_check::StepWatch::default();
         // Whether the last refresh attempt found the node syncing or
         // optimistic, until one gets through (see `settle_refresh`).
         let mut node_syncing = false;
@@ -577,6 +638,8 @@ where
         let mut schedule_seen = context.schedule_generation();
 
         loop {
+            steps.check(&clock, served);
+
             // One wake per slot, at the slot boundary, rather than one at the
             // attester offset.
             //
@@ -675,6 +738,9 @@ where
                 match settled {
                     Ok(settled) => owed = settled,
                     Err(err) => return Err(err),
+                }
+                if owed.is_some() {
+                    report_refreshed(&health, &duties, epoch, resolved.len());
                 }
             }
 
@@ -834,16 +900,19 @@ where
             let slot_work = async {
                 // The rest of the way to the first of the slot's remaining
                 // duties: the attester offset, or the sync committee offset
-                // when the network puts it earlier. Zero if the proposal above
-                // already ran past it, in which case the duty is late rather
-                // than skipped. Each branch of `serve_slot_duties` waits for
-                // its own offset.
-                tokio::time::sleep(clock.until_first_slot_duty(slot, SystemTime::now())).await;
+                // when the network puts it earlier, or the slot's block (or
+                // its payload) when a beacon node reports it first. Zero if
+                // the proposal above already ran past it, in which case the
+                // duty is late rather than skipped. Each branch of
+                // `serve_slot_duties` waits for its own trigger.
+                let first_duty = clock.until_first_slot_duty(slot, SystemTime::now());
+                triggers.report_within(slot, first_duty).await;
                 serve_slot_duties(
                     &attestation,
                     &aggregation,
                     &payload_attestation,
                     &sync_committee,
+                    &triggers,
                     &clock,
                     slot,
                     &slot_duties,
@@ -864,6 +933,7 @@ where
                 );
                 match settled {
                     Ok(Some(owed)) => {
+                        report_refreshed(&health, &duties, epoch, resolved.len());
                         send_owed(
                             owed,
                             epoch,
@@ -891,10 +961,10 @@ where
             // recipient (the zero address without one) until it hears from
             // this client. Once the slot's duties are done, so they reach the
             // node ahead of the next slot's proposal rather than racing this
-            // one's: a third of the way in on a slot with no duties, after the
-            // aggregation or the payload vote on one with them. Off the slot
-            // loop like the sends above. The refresh's slot too, although its
-            // refresh sent them: see `Preparations`.
+            // one's: on the slot's block or a third of the way in on a slot
+            // with no duties, after the aggregation or the payload vote on one
+            // with them. Off the slot loop like the sends above. The refresh's
+            // slot too, although its refresh sent them: see `Preparations`.
             preparations.after_slot(slot, &resolved, &store);
 
             // Whether a reorg moved a held schedule since it was fetched, so
@@ -1161,24 +1231,29 @@ async fn run_until_stopped(
     stopped.inspect(|()| info!("Shutdown complete"))
 }
 
-/// Everything a slot owes after its proposal: attest and aggregate, then the
-/// payload timeliness committee vote.
+/// Everything a slot owes after its proposal: attest and aggregate, the
+/// payload timeliness committee vote, and the sync committee's work.
 ///
-/// The two halves are independent on purpose. Committee membership is drawn
+/// The parts are independent on purpose. Committee membership is drawn
 /// separately from attester duties, so a client can sit on a slot's committee
 /// with no attester duty in it at all, and an early return for "no attester
-/// duties" would skip exactly those votes. The committee half is also gated on
+/// duties" would skip exactly those votes. The committee part is also gated on
 /// the slot being a gloas one: before the fork there is no committee and no
 /// payload to vote on.
 ///
-/// Three quarters into the slot the committee sleeps until its own deadline,
-/// then runs bounded by the end of the slot like the other duties.
+/// Each part waits for its own trigger (see [`head_monitor`]): the slot's
+/// block or the attester offset, its payload or three quarters into the slot,
+/// the block or the sync message offset. They run side by side rather than
+/// one after another, so the committee vote, which the payload can start
+/// before the aggregation is due, is not held behind it. Each is bounded by
+/// the end of the slot.
 #[allow(clippy::too_many_arguments)]
 async fn serve_slot_duties<B: BeaconNodeApi>(
     attestation: &AttestationService<B>,
     aggregation: &AggregationService<B>,
     payload_attestation: &PayloadAttestationService<B>,
     sync_committee: &SyncCommitteeService<B>,
+    triggers: &DutyTriggers,
     clock: &SlotClock,
     slot: u64,
     slot_duties: &[crate::beacon_node::dto::AttesterDutyDto],
@@ -1186,34 +1261,42 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
     sync_duties: &[crate::beacon_node::dto::SyncDutyDto],
     store: &RwLock<ValidatorStore>,
 ) {
-    // The sync committee work runs beside the attester and PTC work rather
-    // than after it: its deadline is not ordered against theirs (gloas moves
-    // it before the attestation) and each is bounded by the slot on its own.
-    let attest_then_ptc = async {
+    let attest = async {
         if !slot_duties.is_empty() {
-            tokio::time::sleep(clock.until_attestation(slot, SystemTime::now())).await;
-            attest_and_aggregate(attestation, aggregation, clock, slot, slot_duties, store).await;
+            attest_and_aggregate(
+                attestation,
+                aggregation,
+                triggers,
+                clock,
+                slot,
+                slot_duties,
+                store,
+            )
+            .await;
         }
-
+    };
+    let vote = async {
         if clock.is_gloas(slot) && !committee.is_empty() {
-            tokio::time::sleep(clock.until_payload_attestation(slot, SystemTime::now())).await;
-            payload_attest(payload_attestation, clock, slot, committee, store).await;
+            payload_attest(payload_attestation, triggers, clock, slot, committee, store).await;
         }
     };
     tokio::join!(
-        attest_then_ptc,
-        sync_committee_duty(sync_committee, clock, slot, sync_duties, store)
+        attest,
+        vote,
+        sync_committee_duty(sync_committee, triggers, clock, slot, sync_duties, store)
     );
 }
 
-/// Run one slot's sync committee duty: sign the head at the message deadline,
-/// then aggregate at the contribution deadline if a root was signed.
+/// Run one slot's sync committee duty: sign the head when the slot's block
+/// arrives or at the message deadline, whichever comes first, then aggregate
+/// at the contribution deadline if a root was signed.
 ///
 /// Each half is bounded by the end of the slot, like the other duties, and
 /// failures are logged and counted rather than propagated. Nothing here is
 /// slashable, so abandoning a half costs only that half.
 async fn sync_committee_duty<B: BeaconNodeApi>(
     service: &SyncCommitteeService<B>,
+    triggers: &DutyTriggers,
     clock: &SlotClock,
     slot: u64,
     duties: &[crate::beacon_node::dto::SyncDutyDto],
@@ -1222,27 +1305,29 @@ async fn sync_committee_duty<B: BeaconNodeApi>(
     if duties.is_empty() {
         return;
     }
-    tokio::time::sleep(clock.until_sync_message(slot, SystemTime::now())).await;
-    let budget = clock.remaining_in(slot, SystemTime::now());
-    let root =
-        match tokio::time::timeout(budget, service.publish_messages(slot, duties, store)).await {
-            Ok(Ok(root)) => root,
-            Ok(Err(err)) => {
-                error!(%slot, %err, "Failed to publish sync committee messages for this slot");
-                metrics::inc_sync_committee_failures();
-                metrics::set_beacon_node_available(false);
-                return;
-            }
-            Err(_) => {
-                warn!(
-                    %slot,
-                    budget_ms = budget.as_millis() as u64,
-                    "Sync committee messages ran past the end of their slot and were abandoned"
-                );
-                metrics::inc_sync_committee_failures();
-                return;
-            }
-        };
+    let now = SystemTime::now();
+    let (wait, budget) = (
+        clock.until_sync_message(slot, now),
+        clock.remaining_in(slot, now),
+    );
+    let messages = triggers.publish_sync_messages(service, slot, wait, duties, store);
+    let root = match tokio::time::timeout(budget, messages).await {
+        Ok(Ok(root)) => root,
+        Ok(Err(err)) => {
+            error!(%slot, %err, "Failed to publish sync committee messages for this slot");
+            metrics::inc_sync_committee_failures();
+            return;
+        }
+        Err(_) => {
+            warn!(
+                %slot,
+                budget_ms = budget.as_millis() as u64,
+                "Sync committee messages ran past the end of their slot and were abandoned"
+            );
+            metrics::inc_sync_committee_failures();
+            return;
+        }
+    };
     let Some(root) = root else {
         return;
     };
@@ -1266,14 +1351,16 @@ async fn sync_committee_duty<B: BeaconNodeApi>(
     }
 }
 
-/// Run one slot's attestation duty and, when it produced data, the aggregation
-/// duty that follows it.
+/// Run one slot's attestation duty, when the slot's block arrives or at the
+/// attester offset, whichever comes first, and, when it produced data, the
+/// aggregation duty that follows it at its own offset.
 ///
 /// Split out of the loop so the loop can go on to the payload committee duty
 /// whether or not this client has an attester duty in the slot.
 async fn attest_and_aggregate<B: BeaconNodeApi>(
     attestation: &AttestationService<B>,
     aggregation: &AggregationService<B>,
+    triggers: &DutyTriggers,
     clock: &SlotClock,
     slot: u64,
     slot_duties: &[crate::beacon_node::dto::AttesterDutyDto],
@@ -1294,8 +1381,13 @@ async fn attest_and_aggregate<B: BeaconNodeApi>(
     // the same target. That is the intended outcome and matches `attest`'s
     // own "do not retry within a slot" rule; the attestation is simply
     // lost.
-    let budget = clock.remaining_in(slot, SystemTime::now());
-    let attempt = tokio::time::timeout(budget, attestation.attest(slot, slot_duties, store));
+    let now = SystemTime::now();
+    let (wait, budget) = (
+        clock.until_attestation(slot, now),
+        clock.remaining_in(slot, now),
+    );
+    let attested = triggers.attest(attestation, slot, wait, slot_duties, store);
+    let attempt = tokio::time::timeout(budget, attested);
     match attempt.await.unwrap_or_else(|_| {
         warn!(
             %slot,
@@ -1333,19 +1425,13 @@ async fn attest_and_aggregate<B: BeaconNodeApi>(
         Err(err) => {
             error!(%slot, %err, "Failed to publish attestations for this slot");
             metrics::inc_attestation_failures();
-            // Every error `attest` can return originates from the beacon
-            // node (a failed fetch, a bad or mismatched response, a
-            // failed submission), so a failure here is exactly the signal
-            // this gauge exists for: `refresh_epoch` only runs once an
-            // epoch and would otherwise leave it reporting stale
-            // availability for up to that long.
-            metrics::set_beacon_node_available(false);
         }
     }
 }
 
-/// Run one slot's payload timeliness committee duty, bounded by what is left of
-/// the slot.
+/// Run one slot's payload timeliness committee duty, when the slot's payload
+/// and its blob data are available or three quarters into the slot,
+/// whichever comes first, bounded by what is left of the slot.
 ///
 /// The budget is the end of the slot, like the aggregation's and for the same
 /// reason: this is the last duty in its slot, so the only thing past its
@@ -1358,19 +1444,24 @@ async fn attest_and_aggregate<B: BeaconNodeApi>(
 /// and counted rather than propagated, like every other duty's.
 async fn payload_attest<B: BeaconNodeApi>(
     service: &PayloadAttestationService<B>,
+    triggers: &DutyTriggers,
     clock: &SlotClock,
     slot: u64,
     committee: &[crate::beacon_node::dto::PtcDutyDto],
     store: &RwLock<ValidatorStore>,
 ) {
-    let budget = clock.remaining_in(slot, SystemTime::now());
-    let attempt = tokio::time::timeout(budget, service.attest(slot, committee, store));
+    let now = SystemTime::now();
+    let (wait, budget) = (
+        clock.until_payload_attestation(slot, now),
+        clock.remaining_in(slot, now),
+    );
+    let votes = triggers.attest_payload(service, slot, wait, committee, store);
+    let attempt = tokio::time::timeout(budget, votes);
     match attempt.await {
         Ok(Ok(_)) => {}
         Ok(Err(err)) => {
             error!(%slot, %err, "Failed to publish payload attestations for this slot");
             metrics::inc_payload_attestation_failures();
-            metrics::set_beacon_node_available(false);
         }
         Err(_) => {
             warn!(
@@ -1568,7 +1659,6 @@ async fn ahead_of_block<B: BeaconNodeApi>(
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 warn!(%slot, %err, "Proposer duties fetch failed; asking again next slot");
-                metrics::set_beacon_node_available(false);
             }
             Err(_) => {
                 warn!(
@@ -1646,7 +1736,6 @@ fn settle_refresh(
                 "Failed to refresh duties: the beacon node is syncing or optimistic; keeping the \
                  previous schedule and proposing no block until a refresh gets through"
             );
-            metrics::set_beacon_node_available(false);
             *node_syncing = true;
             Ok(None)
         }
@@ -1656,7 +1745,6 @@ fn settle_refresh(
         // hide the cause behind a warning every slot.
         Err(err) if err.is_retryable() => {
             warn!(%epoch, %err, "Failed to refresh duties; keeping the previous schedule");
-            metrics::set_beacon_node_available(false);
             Ok(None)
         }
         // Unreachable today: every error `refresh_epoch` can produce comes
@@ -1671,6 +1759,26 @@ fn settle_refresh(
             Err(err)
         }
     }
+}
+
+/// Tell `/health` that `epoch`'s refresh got through, resolving `resolved`
+/// validators, and how far the schedule it left reaches: through the
+/// lookahead epoch only when its fetch went through, since `refresh_around`
+/// shrugs a failed one off and the schedule then ends with this epoch. With
+/// no validator resolved there is no schedule to run out, and nothing to fetch
+/// for the next epoch either, so it stands until the next refresh.
+fn report_refreshed<B: BeaconNodeApi>(
+    health: &client_health::ClientHealth,
+    duties: &DutiesService<B>,
+    epoch: u64,
+    resolved: usize,
+) {
+    let covered_through = if resolved == 0 || duties.holds_attesters(epoch + 1) {
+        epoch + 1
+    } else {
+        epoch
+    };
+    health.epoch_refreshed(resolved, covered_through);
 }
 
 /// Send what a refresh left owing, from tasks of their own, once the slot's
@@ -1725,7 +1833,6 @@ fn spawn_subscriptions<B: BeaconNodeApi + 'static>(
         let subscribed = subscriptions::subscribe(&beacon_node, &schedule, &store, &context);
         let _ = subscribed.await.inspect_err(|err| {
             warn!(%epoch, %err, "Failed to subscribe to attestation subnets");
-            metrics::set_beacon_node_available(false);
         });
     });
 }
@@ -1864,7 +1971,6 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     refresh_ptc(duties, epoch, context).await;
     refresh_sync(beacon_node, duties, epoch, context).await;
     metrics::set_duties_held(duties.all().len() as u64);
-    metrics::set_beacon_node_available(true);
     let registrable = entries.iter().filter(|entry| is_registrable(&entry.status));
     Ok(Refreshed {
         // Taken here, after the last await, rather than from
@@ -3288,6 +3394,7 @@ mod tests {
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
+            &DutyTriggers::off(),
             &clock,
             slot,
             &[],
@@ -3299,6 +3406,139 @@ mod tests {
 
         assert_eq!(node.attestation_data_call_count(), 0, "no attester duty");
         assert_eq!(node.submitted_payload_attestations().len(), 1);
+    }
+
+    /// With live triggers, each of a gloas slot's duties signs once, and the
+    /// payload vote, started by its payload event, does not wait behind the
+    /// slot's attestation: here that one's early request hangs until its
+    /// deadline, and the vote is out before it.
+    #[tokio::test]
+    async fn with_live_triggers_each_duty_signs_once_and_the_vote_does_not_wait() {
+        use crate::beacon_node::events::{
+            EventSource, HeadEvent, NodeEvent, PayloadAvailableEvent, Topic,
+        };
+        use crate::beacon_node::mock::{MockBeaconNode, StreamEnd, StreamStep};
+        use crate::head_monitor::HeadMonitor;
+        use ethlambda_types::beacon::containers::gloas::PayloadAttestationData;
+        use std::time::Duration;
+
+        let mut config = ethlambda_types::beacon::config::Config::mainnet()
+            .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 0);
+        config.slot_duration_ms = 1_000;
+        let context = Arc::new(SigningContext::new(config.clone(), Root::ZERO));
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch");
+        let genesis = now.as_secs() - 100;
+        let clock = SlotClock::from_config(genesis, &config);
+        let slot = clock.now().expect("after genesis") + 1;
+        // When the slot starts, from now: its events are scripted from there.
+        let slot_start = Duration::from_secs(genesis + slot) - now;
+        let at = |millis: u64| StreamStep::Wait(slot_start + Duration::from_millis(millis));
+
+        let (store, pubkeys) = crate::test_support::store_with_keys(1);
+        let store = RwLock::new(store);
+        let pubkey = crate::beacon_node::dto::encode_hex(&pubkeys[0].0);
+        let block = Root::repeat_byte(5);
+
+        let head = NodeEvent::Head(HeadEvent {
+            slot,
+            block,
+            execution_optimistic: false,
+        });
+        let payload = NodeEvent::PayloadAvailable(PayloadAvailableEvent {
+            slot,
+            block_root: block,
+        });
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_attestation_data(slot)
+                .with_attestation_block_root(block)
+                // The early attestation request hangs past its deadline.
+                .with_first_call_delay("attestation_data", Duration::from_secs(10))
+                .with_head_root(block)
+                .with_payload_attestation_data(PayloadAttestationData {
+                    beacon_block_root: block,
+                    slot,
+                    payload_present: true,
+                    blob_data_available: true,
+                })
+                .with_topic_stream(
+                    Topic::Head,
+                    vec![at(30), StreamStep::Event(head)],
+                    StreamEnd::Hang,
+                )
+                .with_topic_stream(
+                    Topic::ExecutionPayloadAvailable,
+                    vec![at(60), StreamStep::Event(payload)],
+                    StreamEnd::Hang,
+                ),
+        );
+        let sources = vec![("mock".to_string(), node.clone() as Arc<dyn EventSource>)];
+        let (_monitor, triggers) = HeadMonitor::spawn(sources, || true);
+
+        let attester = [crate::beacon_node::dto::AttesterDutyDto {
+            pubkey: pubkey.clone(),
+            validator_index: 3,
+            committee_index: 0,
+            committee_length: 128,
+            committees_at_slot: 1,
+            validator_committee_index: 0,
+            slot,
+        }];
+        let committee = [crate::beacon_node::dto::PtcDutyDto {
+            pubkey: pubkey.clone(),
+            validator_index: 3,
+            slot,
+        }];
+        let sync = [crate::beacon_node::dto::SyncDutyDto {
+            pubkey,
+            validator_index: 3,
+            validator_sync_committee_indices: vec![0],
+        }];
+
+        let attestation = AttestationService::new(
+            node.clone(),
+            context.clone(),
+            slashing_protection::SlashingProtection::in_memory(),
+        );
+        let aggregation = AggregationService::new(node.clone(), context.clone());
+        let payload_attestation = PayloadAttestationService::new(node.clone(), context.clone());
+        let sync_committee = SyncCommitteeService::new(node.clone(), context.clone());
+        let serve = serve_slot_duties(
+            &attestation,
+            &aggregation,
+            &payload_attestation,
+            &sync_committee,
+            &triggers,
+            &clock,
+            slot,
+            &attester,
+            &committee,
+            &sync,
+            &store,
+        );
+        // How many attestations were out when the vote went out.
+        let watch = async {
+            while node.submitted_payload_attestations().is_empty() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            node.submitted().len()
+        };
+        let ((), attested_before_the_vote) = tokio::join!(serve, watch);
+
+        assert_eq!(
+            attested_before_the_vote, 0,
+            "the vote waited for the attestation"
+        );
+        assert_eq!(node.submitted().len(), 1, "one attestation");
+        assert_eq!(
+            node.attestation_data_call_count(),
+            2,
+            "early, then deadline"
+        );
+        assert_eq!(node.submitted_sync_messages().len(), 1, "one sync message");
+        assert_eq!(node.submitted_payload_attestations().len(), 1, "one vote");
     }
 
     fn altair_context() -> SigningContext {
@@ -3425,6 +3665,7 @@ mod tests {
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
+            &DutyTriggers::off(),
             &clock,
             slot,
             &[],
@@ -3462,6 +3703,7 @@ mod tests {
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
+            &DutyTriggers::off(),
             &clock,
             5,
             &[],
