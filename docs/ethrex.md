@@ -12,6 +12,13 @@ cargo build --release --features include-ethrex
 docker build --build-arg FEATURES=include-ethrex -t ethlambda:ethrex .
 ```
 
+Every release artifact is this build, and has a `-minimal` twin without ethrex:
+the binaries `ethlambda-<platform>` and `ethlambda-minimal-<platform>`, the
+images `ghcr.io/lambdaclass/ethlambda:<tag>` and `<tag>-minimal`, and the
+Homebrew formulas `ethlambda` and `ethlambda-minimal` (see
+[`RELEASE.md`](https://github.com/lambdaclass/ethlambda/blob/main/RELEASE.md#release-binaries)).
+Up to v1.0.0, every artifact was the build without ethrex.
+
 ## Choosing the execution client
 
 | Build | `--execution-endpoint` given | Execution client |

@@ -2,8 +2,11 @@
 
 This document describes how we publish and distribute ethlambda: Docker images on
 GitHub Container Registry (`ghcr.io/lambdaclass/ethlambda`), binaries attached
-to [GitHub Releases](https://github.com/lambdaclass/ethlambda/releases), and a
-Homebrew formula in [lambdaclass/homebrew-tap](https://github.com/lambdaclass/homebrew-tap).
+to [GitHub Releases](https://github.com/lambdaclass/ethlambda/releases), and
+Homebrew formulas in [lambdaclass/homebrew-tap](https://github.com/lambdaclass/homebrew-tap).
+Every one of them comes in two builds: the default one embeds
+[ethrex](https://github.com/lambdaclass/ethrex) as the beacon node's execution
+client, and a `-minimal` one does not.
 
 A release is cut as a **release candidate** (`vX.Y.Z-rc.N`), tested, and then
 **promoted** to the final version (`vX.Y.Z`). Promotion re-publishes the tested
@@ -13,11 +16,11 @@ Three workflows do the publishing:
 
 | Workflow | Trigger | Publishes |
 |----------|---------|-----------|
-| [Release](.github/workflows/release.yaml) | push to `main` | `unstable`, `sha-<7>` (and `-shadow` twins). It also builds the binaries and the changelog, publishing neither, so a broken release path fails on the commit that broke it |
-| | push of a `vX.Y.Z-rc.N` tag | `X.Y.Z-rc.N` image, binaries, GitHub pre-release |
+| [Release](.github/workflows/release.yaml) | push to `main` | `unstable`, `sha-<7>` (and `-minimal` and `-shadow` twins). It also builds the binaries and the changelog, publishing neither, so a broken release path fails on the commit that broke it |
+| | push of a `vX.Y.Z-rc.N` tag | `X.Y.Z-rc.N` and `X.Y.Z-rc.N-minimal` images, binaries, GitHub pre-release |
 | | manual run, given a `vX.Y.Z-rc.N` tag | nothing: a dry run of pushing that tag on the chosen ref. It shows the pre-release it would create and keeps its assets as a workflow artifact |
-| [Release promotion](.github/workflows/release_promote.yaml) | a pre-release edited into a final release, or manual run | `X.Y.Z`, `latest` |
-| [Publish Docker Image](.github/workflows/docker_publish.yaml) | manual run | devnet and other ad-hoc tags, plus `sha-<7>` (and `-shadow` twins) |
+| [Release promotion](.github/workflows/release_promote.yaml) | a pre-release edited into a final release, or manual run | `X.Y.Z`, `latest` (and `-minimal` twins) |
+| [Publish Docker Image](.github/workflows/docker_publish.yaml) | manual run | devnet and other ad-hoc tags, plus `sha-<7>` (and `-minimal` and `-shadow` twins) |
 
 ## Docker image tags
 
@@ -31,26 +34,44 @@ Three workflows do the publishing:
 | `devnetX` | yes | the latest image built with `devnetX` support, published by hand |
 
 Images are multi-arch (`amd64` and `arm64`), so `docker pull` fetches the right
-one for your machine. Images from `main` and from the manual workflow also come
-as a Shadow-simulator build, tagged with a `-shadow` suffix (e.g.
-`unstable-shadow`). Release images do not.
+one for your machine.
+
+Every tag comes in two builds, as the release binaries do. The tag itself
+embeds [ethrex](https://github.com/lambdaclass/ethrex) as the beacon node's
+execution client (`include-ethrex`, see [`docs/ethrex.md`](docs/ethrex.md)):
+`ethlambda beacon` without `--execution-endpoint` starts it. The same tag with a
+`-minimal` suffix (e.g. `latest-minimal`) is the build without ethrex. Images up
+to v1.0.0 have no `-minimal` twin and were all the build without ethrex. Images
+from `main` and from the manual workflow also come as a Shadow-simulator build,
+tagged with a `-shadow` suffix (e.g. `unstable-shadow`). Release images do not.
 
 ```bash
-docker pull ghcr.io/lambdaclass/ethlambda:latest        # latest release
-docker pull ghcr.io/lambdaclass/ethlambda:unstable      # latest from main
-docker pull ghcr.io/lambdaclass/ethlambda:devnet5       # devnet5-compatible
-docker pull ghcr.io/lambdaclass/ethlambda:sha-12f8377   # pinned to a specific commit
+docker pull ghcr.io/lambdaclass/ethlambda:latest          # latest release, ethrex embedded
+docker pull ghcr.io/lambdaclass/ethlambda:latest-minimal  # latest release, without ethrex
+docker pull ghcr.io/lambdaclass/ethlambda:unstable        # latest from main
+docker pull ghcr.io/lambdaclass/ethlambda:devnet5         # devnet5-compatible
+docker pull ghcr.io/lambdaclass/ethlambda:sha-12f8377     # pinned to a specific commit
 ```
 
 ## Release binaries
 
-Every release candidate attaches these binaries, plus a `SHA256SUMS` file:
+Every release candidate attaches two builds for each platform, plus a
+`SHA256SUMS` file covering all of them. `ethlambda-<platform>` is built with
+the `include-ethrex` feature: `ethlambda beacon` without `--execution-endpoint`
+runs [ethrex](https://github.com/lambdaclass/ethrex) in its own process as its
+execution client (see [`docs/ethrex.md`](docs/ethrex.md)).
+`ethlambda-minimal-<platform>` is built without it. Both take
+`--execution-endpoint`, so either runs beside an external execution client.
+Up to v1.0.0, `ethlambda-<platform>` was the build without ethrex.
 
-| Asset | Platform |
-|-------|----------|
-| `ethlambda-linux-x86_64` | Linux x86_64, glibc 2.35+ (built on Ubuntu 22.04). Targets x86-64-v3, so it needs AVX2 (Haswell or later) |
-| `ethlambda-linux-aarch64` | Linux aarch64, glibc 2.35+ |
-| `ethlambda-macos-aarch64` | macOS on Apple silicon |
+| Platform | ethlambda (ethrex embedded) | ethlambda-minimal |
+|----------|-----------------------------|-------------------|
+| Linux x86_64, glibc 2.35+ (built on Ubuntu 22.04). Targets x86-64-v3, so it needs AVX2 (Haswell or later) | `ethlambda-linux-x86_64` | `ethlambda-minimal-linux-x86_64` |
+| Linux aarch64, glibc 2.35+ | `ethlambda-linux-aarch64` | `ethlambda-minimal-linux-aarch64` |
+| macOS on Apple silicon | `ethlambda-macos-aarch64` | `ethlambda-minimal-macos-aarch64` |
+
+The Docker images come in the same two builds: see
+[Docker image tags](#docker-image-tags).
 
 ## Verifying a release
 
@@ -175,9 +196,10 @@ If they differ, move the final tag onto the candidate's commit:
 `git tag -f vX.Y.Z <rc-commit> && git push origin vX.Y.Z --force`.
 
 The Release promotion workflow then publishes `X.Y.Z` and `latest` from the
-candidate's images and attests them. It checks that `latest` resolves to
-`X.Y.Z`, that the promoted image reports `vX.Y.Z-stable`, and that its
-attestation verifies.
+candidate's images, and `X.Y.Z-minimal` and `latest-minimal` from its
+`-minimal` ones, and attests them. For each of the two it checks that `latest`
+resolves to `X.Y.Z`, that the promoted image reports `vX.Y.Z-stable`, and that
+its attestation verifies.
 
 #### Release notes
 
@@ -204,14 +226,24 @@ in this order, and drop the boxes that do not apply:
 > - <highlight>
 ```
 
-### 6. Update the Homebrew formula
+### 6. Update the Homebrew formulas
 
-The `ethlambda` formula in [lambdaclass/homebrew-tap](https://github.com/lambdaclass/homebrew-tap)
-builds from the final tag's source tarball. Apple silicon gets a bottle instead,
-repackaged from the release's `ethlambda-macos-aarch64` binary, so it installs
-the same binary the release ships; every other platform builds from source. The
-bottle is attached to a tap release tagged `ethlambda-vX.Y.Z`, because the tap's
-bare `vX.Y.Z` tags are ethrex's.
+[lambdaclass/homebrew-tap](https://github.com/lambdaclass/homebrew-tap) has two
+formulas, one per build, both from the final tag's source tarball:
+
+| Formula | Builds | Apple silicon bottle from |
+|---------|--------|---------------------------|
+| `ethlambda` | `cargo install --features include-ethrex` (ethrex embedded) | `ethlambda-macos-aarch64` |
+| `ethlambda-minimal` | `cargo install`, no features | `ethlambda-minimal-macos-aarch64` |
+
+Apple silicon installs the bottle, repackaged from the release binary, so it
+gets the same binary the release ships; every other platform builds from source.
+A formula's source build and its bottle must be the same build, so the
+`ethlambda` formula's feature flag and its bottle's asset go together. Both
+formulas install a binary named `ethlambda`, so each declares `conflicts_with`
+the other. Up to v1.0.0 the tap had only `ethlambda`, built without ethrex. Both
+bottles are attached to one tap release tagged `ethlambda-vX.Y.Z`, because the
+tap's bare `vX.Y.Z` tags are ethrex's.
 
 Set the released version once; the commands below are then copy/paste:
 
@@ -219,44 +251,51 @@ Set the released version once; the commands below are then copy/paste:
 export V=X.Y.Z   # no `v` prefix
 ```
 
-1. Hash the source tarball. GitHub generates it from the final tag, so the tag
-   must be on the tested commit (step 5) before this hash is taken:
+1. Hash the source tarball, which both formulas build from. GitHub generates it
+   from the final tag, so the tag must be on the tested commit (step 5) before
+   this hash is taken:
 
    ```bash
    gh release download "v$V" -R lambdaclass/ethlambda --archive=tar.gz
    shasum -a 256 "ethlambda-$V.tar.gz"
    ```
 
-2. Build the bottle from the release binary and hash it. The `ethlambda`
-   directory is the bottle root, laid out as `ethlambda/<version>/bin/ethlambda`:
+2. Build both bottles from the release binaries and hash them. A bottle's root
+   is a directory named after its formula, laid out as
+   `<formula>/<version>/bin/ethlambda`:
 
    ```bash
-   gh release download "v$V" -R lambdaclass/ethlambda -p ethlambda-macos-aarch64 -p SHA256SUMS
+   gh release download "v$V" -R lambdaclass/ethlambda \
+     -p ethlambda-macos-aarch64 -p ethlambda-minimal-macos-aarch64 -p SHA256SUMS
    shasum -a 256 -c --ignore-missing SHA256SUMS
-   chmod +x ethlambda-macos-aarch64
-   mkdir -p "ethlambda/$V/bin"
-   mv ethlambda-macos-aarch64 "ethlambda/$V/bin/ethlambda"
-   # Keep macOS extended attributes (quarantine, provenance) out of the archive.
-   tar --no-xattrs --no-mac-metadata -czf "ethlambda-$V.arm64_sonoma.bottle.tar.gz" ethlambda
-   shasum -a 256 "ethlambda-$V.arm64_sonoma.bottle.tar.gz"
+   for formula in ethlambda ethlambda-minimal; do
+     chmod +x "$formula-macos-aarch64"
+     mkdir -p "$formula/$V/bin"
+     mv "$formula-macos-aarch64" "$formula/$V/bin/ethlambda"
+     # Keep macOS extended attributes (quarantine, provenance) out of the archive.
+     tar --no-xattrs --no-mac-metadata -czf "$formula-$V.arm64_sonoma.bottle.tar.gz" "$formula"
+     shasum -a 256 "$formula-$V.arm64_sonoma.bottle.tar.gz"
+   done
    ```
 
-3. Create the tap release with the bottle attached. It must exist before the
+3. Create the tap release with both bottles attached. It must exist before the
    formula PR is opened, since the tap's CI installs from it. `--latest=false`
    leaves the tap's latest release on ethrex's:
 
    ```bash
    gh release create "ethlambda-v$V" -R lambdaclass/homebrew-tap --latest=false \
-     --title "ethlambda v$V" --notes "ethlambda v$V bottle (arm64_sonoma)." \
-     "ethlambda-$V.arm64_sonoma.bottle.tar.gz"
+     --title "ethlambda v$V" --notes "ethlambda v$V bottles (arm64_sonoma): ethlambda and ethlambda-minimal." \
+     "ethlambda-$V.arm64_sonoma.bottle.tar.gz" "ethlambda-minimal-$V.arm64_sonoma.bottle.tar.gz"
    ```
 
-4. In the tap's `Formula/ethlambda.rb`, update the `url`, both `sha256` values
-   and the bottle's `root_url`, plus the `rustup toolchain install` version if
-   `rust-toolchain.toml` changed. Open a PR: its `Formula CI` installs the
-   formula from the bottle and from source on macOS Sonoma, and `brew test-bot`
-   builds it on Linux and on Apple silicon macOS. test-bot skips Intel macOS,
-   which has no `rustup` bottle, so no CI builds the formula there.
+4. In the tap's `Formula/ethlambda.rb` and `Formula/ethlambda-minimal.rb`,
+   update the `url`, both `sha256` values (the tarball's is the same in both;
+   each bottle's is its own) and the bottle's `root_url`, plus the
+   `rustup toolchain install` version if `rust-toolchain.toml` changed. Open one
+   PR for both: its `Formula CI` installs each formula from the bottle and from
+   source on macOS Sonoma, and `brew test-bot` builds them on Linux and on Apple
+   silicon macOS. test-bot skips Intel macOS, which has no `rustup` bottle, so no
+   CI builds the formulas there.
 
 ### 7. Merge the release branch
 
@@ -267,7 +306,8 @@ any candidate fixes land on `main`.
 
 Releases are published to GitHub Releases, GHCR, and the
 [lambdaclass/tap](https://github.com/lambdaclass/homebrew-tap) Homebrew tap
-(`brew install lambdaclass/tap/ethlambda`). Not covered yet:
+(`brew install lambdaclass/tap/ethlambda`, or `lambdaclass/tap/ethlambda-minimal`
+for the build without ethrex). Not covered yet:
 
 - **crates.io**: not possible while the workspace depends on `leanvm` from git,
   since crates.io rejects crates with git dependencies.
@@ -279,8 +319,12 @@ Releases are published to GitHub Releases, GHCR, and the
 **`latest` did not move after promotion.** Usually the tag rename and the
 pre-release untick were saved as two edits. Go to **Actions → Release promotion →
 Run workflow** and set `rc_tag` to the tested candidate (e.g. `v0.2.0-rc.1`) and
-`version` to the final version (e.g. `v0.2.0`). Its `Verify promotion` job
-confirms the result.
+`version` to the final version (e.g. `v0.2.0`). Its `Verify promotion` jobs
+confirm the result.
+
+**Only one of `latest` and `latest-minimal` moved.** The promotion ran, but one
+of its two legs failed. Fix the cause and re-run the promotion run's failed
+jobs. A candidate missing either image fails both legs before either tag moves.
 
 **The release run failed after the tag was pushed.** Fix the cause and re-run the
 failed jobs. If the pre-release already exists, `Create GitHub pre-release`
@@ -299,10 +343,12 @@ Devnet tags (`devnetX`) and other ad-hoc tags are published by hand:
 3. Select the branch (prefer `main`) and enter the tags, comma-separated (e.g.
    `devnet5`).
 
-The workflow builds `amd64` and `arm64` images, regular and `-shadow`, and
-publishes a multi-arch manifest for each tag plus a `sha-<7chars>` one for the
-commit. It refuses `latest`, `unstable`, `sha-*` and version tags, which belong
-to the release workflows.
+The workflow builds `amd64` and `arm64` images, regular (ethrex embedded),
+`-minimal` and `-shadow`, and publishes a multi-arch manifest for each tag plus
+a `sha-<7chars>` one for the commit. It refuses `latest`, `unstable`, `sha-*`
+and version tags, which belong to the release workflows, and any tag ending in
+`-minimal` or `-shadow`, the suffixes it adds itself: enter `devnet5`, not
+`devnet5-minimal`.
 
 ## Building locally
 

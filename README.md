@@ -75,11 +75,16 @@ default, too.
   image reports `vX.Y.Z-stable-<sha>`. Both run the same code; see
   [`RELEASE.md`](./RELEASE.md#version-string).
 
-To skip payload validation, run the node without ethrex: drop it, the JWT
-secret and the two `--execution-*` flags. The node then follows the chain and
-serves the Beacon API without validating execution payloads, but it cannot
-serve a validator client, since it answers attestation data, aggregation and
-block production requests with `503`.
+To skip payload validation, run the node without ethrex: download
+`ethlambda-minimal-<platform>` in place of `ethlambda-<platform>`, and drop
+ethrex, the JWT secret and the two `--execution-*` flags. The node then follows
+the chain and serves the Beacon API without validating execution payloads, but
+it cannot serve a validator client, since it answers attestation data,
+aggregation and block production requests with `503`. `ethlambda-<platform>`
+would instead start the ethrex it embeds, since no `--execution-endpoint` is
+given. Releases up to v1.0.0 have no `-minimal` binaries, and their
+`ethlambda-<platform>` is the build without ethrex: while v1.0.0 is the latest
+release, keep it.
 
 The first start downloads the finalized state (several hundred MB) and logs
 `Beacon checkpoint sync complete`, then a few minutes of
@@ -173,11 +178,15 @@ docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT --
 <details>
 <summary>Running without an execution client</summary>
 
-The node without ethrex, as described above: no shared network, no JWT secret
-and no `--execution-*` flags.
+The node without ethrex, as described above: the `latest-minimal` image, no
+shared network, no JWT secret and no `--execution-*` flags. `latest` would
+instead start the ethrex it embeds, since no `--execution-endpoint` is given.
+Releases up to v1.0.0 have no `-minimal` image, and their `latest` is the build
+without ethrex: while v1.0.0 is the latest release, use `latest` in both
+commands.
 
 ```sh
-docker pull ghcr.io/lambdaclass/ethlambda:latest
+docker pull ghcr.io/lambdaclass/ethlambda:latest-minimal
 
 mkdir -p beacon-data
 # This host's public address, published in the node's ENR (see above)
@@ -191,7 +200,7 @@ docker run -d --name ethlambda-beacon --stop-signal SIGINT --stop-timeout 60 \
   -p 9000:9000/udp -p 9001:9001/udp -p 9001:9001/tcp \
   -p 127.0.0.1:5052:5052 \
   -v "$PWD/beacon-data:/data" \
-  ghcr.io/lambdaclass/ethlambda:latest beacon \
+  ghcr.io/lambdaclass/ethlambda:latest-minimal beacon \
   --network                mainnet \
   --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
   --data-dir               /data/db \
@@ -465,8 +474,14 @@ Additional features:
 ### Releases
 
 Binaries for Linux (x86_64, aarch64) and macOS (Apple silicon) are attached to
-[GitHub Releases](https://github.com/lambdaclass/ethlambda/releases). Docker
-images are published to `ghcr.io/lambdaclass/ethlambda` with the following tags:
+[GitHub Releases](https://github.com/lambdaclass/ethlambda/releases). Releases
+after v1.0.0 carry two builds: `ethlambda-<platform>`, which embeds ethrex as
+the beacon node's execution client ([`docs/ethrex.md`](docs/ethrex.md)), and
+`ethlambda-minimal-<platform>`, without it. Both take `--execution-endpoint`,
+so either runs beside an external execution client. Up to v1.0.0,
+`ethlambda-<platform>` was the build without ethrex.
+Docker images are published to `ghcr.io/lambdaclass/ethlambda` with the
+following tags:
 
 | Tag | Description |
 |-----|-------------|
@@ -476,6 +491,11 @@ images are published to `ghcr.io/lambdaclass/ethlambda` with the following tags:
 | `devnetX` | Stable image for a specific devnet (e.g. `devnet4`) |
 | `unstable` | Built from the latest main commit |
 | `sha-XXXXXXX` | Specific commit |
+
+Each tag embeds ethrex as the beacon node's execution client, like
+`ethlambda-<platform>`, and has a `-minimal` twin without it (e.g.
+`latest-minimal`), like `ethlambda-minimal-<platform>`. Images up to v1.0.0
+were all the build without ethrex.
 
 Release binaries and images carry GitHub build provenance attestations;
 [`RELEASE.md`](./RELEASE.md#verifying-a-release) shows how to verify them.
