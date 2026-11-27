@@ -277,7 +277,10 @@ impl BuilderMarket {
     /// The pooled preferences still owed a publish (see
     /// [`Self::record_preferences_publish`]) for a proposal slot after `slot`,
     /// in slot order. Those for `slot` and earlier are left out: the slot has
-    /// started, so peers ignore them and no bid can use them.
+    /// started, so its proposer has chosen its bid and none can use them.
+    /// Peers still take them for the first `MAXIMUM_GOSSIP_CLOCK_DISPARITY`
+    /// of the slot, but that allows for clock skew; it does not make them
+    /// useful.
     pub fn preferences_owed_a_publish(&self, slot: Slot) -> Vec<gloas::SignedProposerPreferences> {
         lock(&self.preferences)
             .iter()
