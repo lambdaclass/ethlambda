@@ -188,6 +188,10 @@ proofs through one of two backends, chosen once per process:
   12-second slot. On 14 cores of an Apple M4 Max, a `release-fast` build
   proves 128 signatures in about 0.28 s and 512 in about 0.86 s; verifying
   takes about 6 ms either way, and the proofs are 160 to 200 KB.
+- **What it costs on a running node.** The node's `/metrics` times every
+  committee proof, block-proof merge and proof verification, and when in the
+  slot attestations and aggregates arrive: see
+  [metrics.md](./metrics.md#pq-aggregation-timing).
 
 pq-devnet-0 ran the prover as a separate `leanvm-sidecar` (bindings v0.15.0),
 which the image built and its `ethlambda-pq` supervisor started and

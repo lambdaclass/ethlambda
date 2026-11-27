@@ -11,7 +11,7 @@
 //! (queued ones too, as for gloas). Blocks and data column sidecars take the
 //! shared path.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use std::time::Instant as StdInstant;
 
@@ -21,7 +21,8 @@ use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::pq::get_committee_indices;
 use ethlambda_storage::{Store, pools::PooledPqAggregate};
 use ethlambda_types::beacon::containers::{SignedExecutionPayloadEnvelope, pq};
-use ethlambda_types::beacon::primitives::ValidatorIndex;
+use ethlambda_types::beacon::primitives::{Slot, ValidatorIndex};
+use ethlambda_types::chain_config::ChainConfig;
 use ethlambda_types::time::unix_now_ms;
 use tracing::{debug, trace, warn};
 
@@ -282,6 +283,18 @@ pub(crate) fn triage(
     );
     let now_ms = unix_now_ms();
     let store = &server.store;
+    // When in its slot a vote reached this node, whatever the rules below
+    // make of it: gossipsub hands over each message once.
+    let vote_slot = match &decoded {
+        PqGossip::Aggregate(signed) => Some(signed.message.aggregate.data.slot),
+        PqGossip::Attestation(attestation) => Some(attestation.data.slot),
+        _ => None,
+    };
+    if let Some(slot) = vote_slot {
+        let arrived_ms = now_ms.saturating_sub(received_at.elapsed().as_millis() as u64);
+        let offset = arrival_offset(&store.config().time_grid(), slot, arrived_ms);
+        metrics::observe_pq_gossip_arrival_offset(metric_kind, offset);
+    }
     let cheap = match &decoded {
         PqGossip::Aggregate(signed) => {
             gossip::pq::aggregate_cheap_checks(&server.seen_aggregates, store, signed, now_ms)
@@ -347,6 +360,15 @@ pub(crate) fn triage(
         PqGossip::Envelope(envelope) => PqValidated::Envelope(envelope),
     };
     Some(Dispatch::Validate(Validated::Pq(Box::new(object))))
+}
+
+/// How far into `slot` the wall clock read `arrived_ms`. Zero for a message
+/// that arrived ahead of its slot, which gossip allows by the clock disparity.
+fn arrival_offset(grid: &ChainConfig, slot: Slot, arrived_ms: u64) -> Duration {
+    let slot_start_ms = grid
+        .genesis_time_ms()
+        .saturating_add(slot.saturating_mul(grid.milliseconds_per_slot));
+    Duration::from_millis(arrived_ms.saturating_sub(slot_start_ms))
 }
 
 /// Gossip one of a validator client's PQ messages, which the Beacon API
@@ -480,6 +502,19 @@ mod tests {
         triage(server, kind, payload, Instant::now())
     }
 
+    /// A vote's arrival is measured from the start of its own slot, not the
+    /// wall clock's: an aggregate of slot 2 that arrives in slot 3 is 13 s in.
+    #[test]
+    fn a_votes_arrival_is_measured_from_its_own_slot() {
+        let grid = ChainConfig::new(100, 12_000);
+        let slot_2_ms = 100_000 + 2 * 12_000;
+        let offset = |arrived_ms| arrival_offset(&grid, 2, arrived_ms);
+        assert_eq!(offset(slot_2_ms + 7_300), Duration::from_millis(7_300));
+        assert_eq!(offset(slot_2_ms + 13_000), Duration::from_secs(13));
+        // Ahead of its slot, within the clock disparity gossip allows.
+        assert_eq!(offset(slot_2_ms - 200), Duration::ZERO);
+    }
+
     /// A message this build cannot decode under a PQ digest is this build's
     /// gap, as on every topic of a fork the node does not follow: ignored,
     /// so no peer is scored down for it.
@@ -497,6 +532,63 @@ mod tests {
                 IgnoreReason::UnsupportedFork
             )))
         ));
+    }
+
+    /// A vote that decodes is timed against its own slot under its topic
+    /// kind, an attestation's whatever subnet it came on, and whatever the
+    /// rules then make of it. A message that is not a vote is not.
+    #[tokio::test]
+    async fn a_decoded_votes_arrival_is_recorded_under_its_topic_kind() {
+        let server = unconnected_beacon_server(config(), 0).await;
+        let arrivals = |kind: &str| {
+            let series =
+                format!(r#"lean_beacon_pq_gossip_arrival_offset_seconds_count{{kind="{kind}"}}"#);
+            ethlambda_metrics::series_value(&series).unwrap_or(0.0)
+        };
+        let (attestations, aggregates) = (
+            arrivals(beacon_topics::BEACON_ATTESTATION_KIND),
+            arrivals(beacon_topics::BEACON_AGGREGATE_AND_PROOF),
+        );
+
+        let attestation = pq::SingleAttestation {
+            committee_index: 0,
+            attester_index: 0,
+            data: Default::default(),
+            signature: Default::default(),
+        };
+        let subnet_topic = format!("{}3", beacon_topics::BEACON_ATTESTATION_PREFIX);
+        assert!(triage_now(&server, &subnet_topic, &attestation.to_ssz()).is_some());
+        let aggregate = pq::SignedAggregateAndProof {
+            message: pq::AggregateAndProof {
+                aggregator_index: 0,
+                aggregate: pq::Attestation {
+                    aggregation_bits: Default::default(),
+                    data: Default::default(),
+                    committee_bits: Default::default(),
+                },
+                proof: Default::default(),
+            },
+            signature: Default::default(),
+        };
+        let aggregate_topic = beacon_topics::BEACON_AGGREGATE_AND_PROOF;
+        assert!(triage_now(&server, aggregate_topic, &aggregate.to_ssz()).is_some());
+        // Not a vote, and not one that decodes.
+        let slashing = pq::ProposerSlashing::default();
+        triage_now(
+            &server,
+            beacon_topics::PROPOSER_SLASHING,
+            &slashing.to_ssz(),
+        );
+        triage_now(&server, aggregate_topic, &[0xff; 9]);
+
+        assert_eq!(
+            arrivals(beacon_topics::BEACON_ATTESTATION_KIND) - attestations,
+            1.0
+        );
+        assert_eq!(
+            arrivals(beacon_topics::BEACON_AGGREGATE_AND_PROOF) - aggregates,
+            1.0
+        );
     }
 
     /// A block or a column takes the shared path under a PQ digest too.

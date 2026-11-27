@@ -899,6 +899,71 @@ Observability into how many validators/subnets are covered by the attestations t
 | `lean_attestation_aggregate_coverage_subnets` | Gauge | Number of covered subnets in attestation aggregate reports | Per round, per section (see note above) | section=timely,late,block,combined,agg_start_new,proposal_combined |
 | `lean_attestation_aggregate_coverage_diff_validators` | Gauge | Validators in the symmetric difference between block-included aggregates and locally-aggregated timely aggregates for the same slot | On block import, when the head carries the round's votes (see note above) | direction=block_only,timely_only |
 
+### PQ Aggregation Timing
+
+On a network that schedules the PQ fork, `ethlambda beacon` proves its
+aggregators' committees with leanVM, merges the proofs a block packs into one,
+and verifies the proofs other nodes made (see
+[beacon_pq.md](./beacon_pq.md#validator-duties)). These time each of those, and
+when in the slot votes reach the node. They are ethlambda-specific, appear only
+once the node has done the work they measure, and lean nodes never emit them.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_beacon_pq_committee_proof_seconds` | Histogram | Time leanVM took to prove one committee's aggregate | On each committee proof an aggregator seat of this node made, late ones included | position=0..3 | 0.05, 0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1, 1.2, 1.6, 2, 2.4, 3.2, 4.8, 8 |
+| `lean_beacon_pq_committee_proof_ready_offset_seconds` | Histogram | How far into its slot the proof was ready | Same | position=0..3 | 1, 2, 2.4, 3, 3.6, 4.2, 4.8, 5.1, 5.4, 5.7, 6, 6.3, 6.6, 6.9, 7.2, 7.8, 8.4, 9, 10, 12 |
+| `lean_beacon_pq_committee_proof_signatures` | Histogram | Signatures the proof proves | Same | | 1, 2, 4, … 4096 (powers of two) |
+| `lean_beacon_pq_committee_proof_size_bytes` | Histogram | Bytes size of the proof | Same | | 131072, 163840, 196608, 229376, 262144, 327680, 393216, 524288, 786432, 1048576 |
+| `lean_beacon_pq_committee_proofs_total` | Counter | Committees an aggregator seat of this node was due to prove, by what became of them | Once per seat, when its proving pass ends | position=0..3, outcome=proved,late,failed,already_proven,unproved | |
+| `lean_beacon_pq_merge_seconds` | Histogram | Time leanVM took to merge a block's attestation proofs into one | When a merge ends, in time or not | phase=ahead,production | 0.1, 0.2, 0.4, 0.6, 0.8, 1, 1.5, 2, 3, 4, 6, 8, 12 |
+| `lean_beacon_pq_merge_children` | Histogram | Child proofs the merge folded | Same | | 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64 |
+| `lean_beacon_pq_merged_proof_size_bytes` | Histogram | Bytes size of the merged proof | When a merge ends with a proof | | 131072, 163840, 196608, 229376, 262144, 327680, 393216, 524288, 786432, 1048576 |
+| `lean_beacon_pq_merges_total` | Counter | Packings with several proofs to merge, by what became of the merge | Once per such packing | phase=ahead,production, outcome=merged,failed,late,skipped | |
+| `lean_beacon_pq_proof_verification_seconds` | Histogram | Time to verify one attestation proof | On each aggregate that reached the proof check, and each block with attestations whose transition ran | kind=aggregate,block | 0.001, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2 |
+| `lean_beacon_pq_gossip_arrival_offset_seconds` | Histogram | How far into its vote's slot an attestation or aggregate arrived on gossip | On each one decoded, before any rule judges it | kind=beacon_attestation,beacon_aggregate_and_proof | 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 4.8, 6, 7.2, 7.5, 7.8, 8.1, 8.4, 8.7, 9, 9.5, 10, 12, 24 |
+
+**Committee proofs.** `position` is the aggregator's seat in its committee's
+aggregation committee. Seat `p` stops collecting at 40% + `p` × 5% of the slot
+and broadcasts at 60% + `p` × 5%, so each has a fifth of a slot to prove in:
+2.4 s of a 12-second slot, which is where the bucket bounds of the two offset
+histograms come from (cutoffs at 4.8, 5.4, 6.0 and 6.6 s, broadcasts at 7.2,
+7.8, 8.4 and 9.0 s). Read `committee_proof_seconds` against that window and
+`ready_offset` against the seat's broadcast time. The proving time includes
+any wait for a proof leanVM was already making, since it makes one at a time:
+a block-proof merge running at a seat's cutoff shows up here.
+
+`committee_proofs_total` is the ledger. `late` is a proof finished after its
+seat's broadcast time, which is discarded; `unproved` is a committee the seat
+ran out of time before starting; `already_proven` is one an earlier seat of
+this node proved in full, which is the staggered design working and not a
+miss. `late` or `unproved` climbing means the host's prover does not keep up
+with its committees: `ethlambda pq-prover-check` measures the same proof
+offline.
+
+**Merges.** `phase` is `ahead` for the packing the chain actor starts a third
+of a slot before this node's proposal, and `production` for one block
+production runs itself when that result cannot be used. A packing with one
+proof has nothing to merge and counts nowhere here. Every outcome but `merged`
+means the block packed one committee's attestation in place of everything
+selected: `skipped` is no time left or another merge holding leanVM, `late` a
+merge that outlived its budget (its duration is still observed when it ends),
+`failed` a leanVM error.
+
+**Verification.** `aggregate` is one committee's proof, from gossip or from
+this node's validator client through the Beacon API, which runs the same
+rules; a proof that does not verify is observed too, and a gossip one is
+counted by `lean_beacon_gossip_validation_total{reason="aggregate_proof"}`.
+`block` is a block's merged proof in `process_stark`: at import, and when the
+node computes the state root of a block it produces. A block without
+attestations is not a sample.
+
+**Arrival.** Measured from the start of the vote's own slot, at the instant
+gossipsub delivered the message, so an aggregate that arrives a slot late
+reads over 12 s. It covers every attestation and aggregate that decodes,
+whatever validation then makes of it, and none of this node's own: gossip
+never hands a node its messages back. The time from arrival to verdict is
+`lean_beacon_gossip_validation_seconds`, under the same `kind` values.
+
 ---
 
 ✅(*) **Partial support**: These metrics are implemented but not collected "on scrape" as the spec requires. They are updated on specific events (e.g., on tick, on block processing) rather than being computed fresh on each Prometheus scrape.

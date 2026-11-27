@@ -64,6 +64,7 @@ use ethlambda_types::primitives::H256;
 use tokio::sync::{Semaphore, SemaphorePermit, watch};
 use tracing::{debug, info, warn};
 
+use crate::metrics;
 use crate::payload_attributes::advance_for_proposal;
 
 /// What a PQ block packs: its attestations and the proof of all of them.
@@ -137,6 +138,16 @@ pub enum PermitWait<'a> {
     Wait { abandoned: &'a AtomicBool },
 }
 
+impl PermitWait<'_> {
+    /// The `phase` label the merge metrics record this packing under.
+    fn phase(self) -> &'static str {
+        match self {
+            Self::TryOnce => "production",
+            Self::Wait { .. } => "ahead",
+        }
+    }
+}
+
 /// The pool's candidates for a block at `slot`: aggregates from
 /// `slot - MIN_ATTESTATION_INCLUSION_DELAY_PQ` and earlier.
 fn candidates_for(store: &Store, slot: Slot) -> Vec<Arc<PooledPqAggregate>> {
@@ -186,7 +197,10 @@ pub async fn pack_attestations(
         return unmerged(slot, packed, true, candidates);
     }
     let children = packed.children.len();
-    let fall_back = |reason: &str| {
+    let phase = permit_wait.phase();
+    // `outcome` is the merge's, as `metrics::inc_pq_merges` counts it.
+    let fall_back = |outcome: &str, reason: &str| {
+        metrics::inc_pq_merges(phase, outcome);
         warn!(%slot, children, reason, "Packing one PQ attestation instead of merging every proof");
         match fallback.clone() {
             Some(single) => unmerged(slot, single, false, candidates.clone()),
@@ -194,7 +208,7 @@ pub async fn pack_attestations(
         }
     };
     let Some(remaining) = merge_budget(config, slot) else {
-        return fall_back("no time left to merge");
+        return fall_back("skipped", "no time left to merge");
     };
     let permit = match merge_permit(permit_wait, remaining).await {
         Ok(permit) => permit,
@@ -203,19 +217,21 @@ pub async fn pack_attestations(
             debug!(%slot, "A PQ attestation packing was abandoned before its merge");
             return PackedAttestations::new(Vec::new(), Vec::new(), false, candidates);
         }
-        Err(NoPermit::Refused(reason)) => return fall_back(reason),
+        Err(NoPermit::Refused(reason)) => return fall_back("skipped", reason),
     };
     // The wait for the permit came out of the budget.
     let Some(remaining) = merge_budget(config, slot) else {
-        return fall_back("no time left to merge");
+        return fall_back("skipped", "no time left to merge");
     };
     let budget_ms = remaining.as_millis() as u64;
     let job = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let started = Instant::now();
         let proof = packed.merge().map_err(|err| err.to_string());
-        // Logged when it ends, deadline or not: what a merge costs here, how
-        // big it was and how much of the budget it used.
+        let took = started.elapsed();
+        // Recorded and logged when it ends, deadline or not: what a merge
+        // costs here, how big it was and how much of the budget it used.
+        metrics::observe_pq_merge(phase, took, children, proof.as_ref().ok().map(Vec::len));
         let signatures: usize = packed
             .children
             .iter()
@@ -228,7 +244,7 @@ pub async fn pack_attestations(
             children,
             signatures,
             proof_bytes = proof.as_ref().map_or(0, Vec::len),
-            took_ms = started.elapsed().as_millis() as u64,
+            took_ms = took.as_millis() as u64,
             budget_ms,
             ok = proof.is_ok(),
             "Merged PQ attestation proofs"
@@ -237,6 +253,7 @@ pub async fn pack_attestations(
     });
     match tokio::time::timeout(remaining, job).await {
         Ok(Ok(Ok((packed, proof)))) => {
+            metrics::inc_pq_merges(phase, "merged");
             info!(
                 %slot,
                 attestations = packed.attestations.len(),
@@ -246,12 +263,12 @@ pub async fn pack_attestations(
             );
             PackedAttestations::new(packed.attestations, proof, true, candidates)
         }
-        Ok(Ok(Err(err))) => fall_back(&format!("the merge failed: {err}")),
-        Ok(Err(err)) => fall_back(&format!("the merge task failed: {err}")),
-        Err(_) => fall_back(&format!(
-            "the merge missed its {} ms budget",
-            remaining.as_millis()
-        )),
+        Ok(Ok(Err(err))) => fall_back("failed", &format!("the merge failed: {err}")),
+        Ok(Err(err)) => fall_back("failed", &format!("the merge task failed: {err}")),
+        Err(_) => fall_back(
+            "late",
+            &format!("the merge missed its {} ms budget", remaining.as_millis()),
+        ),
     }
 }
 
@@ -715,6 +732,103 @@ mod tests {
     }
 
     /// An abandoned packing gives the merge permit up without taking it.
+    /// A network aggregate of every member of `committee` at `data`'s slot.
+    fn full_aggregate(
+        state: &BeaconState,
+        store: &Store,
+        data: AttestationData,
+        committee: u64,
+    ) -> PooledPqAggregate {
+        use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
+        let members = store
+            .committee_cache()
+            .committees(state, data.target.epoch)
+            .committee(data.slot, committee)
+            .unwrap()
+            .to_vec();
+        let mut aggregation_bits = AggregationBits::with_length(members.len());
+        for position in 0..members.len() {
+            aggregation_bits.set(position, true).unwrap();
+        }
+        let mut committee_bits = pq::CommitteeBits::new();
+        committee_bits.set(committee as usize, true).unwrap();
+        let mut attesting_indices = members;
+        attesting_indices.sort_unstable();
+        PooledPqAggregate {
+            attestation: Attestation {
+                aggregation_bits,
+                data,
+                committee_bits,
+            },
+            committee_index: committee,
+            attesting_indices,
+            proof: vec![committee as u8; 4].try_into().unwrap(),
+        }
+    }
+
+    /// A packing with two proofs to merge and no time left for it packs
+    /// without them, and `/metrics` counts the merge as skipped under the
+    /// packing's phase: ahead of the slot, or at production.
+    #[tokio::test]
+    async fn a_merge_with_no_time_left_is_counted_as_skipped_by_phase() {
+        use ethlambda_metrics::series_value;
+        use ethlambda_state_transition::beacon::helpers::accessors::{
+            get_block_root, get_block_root_at_slot,
+        };
+        use ethlambda_state_transition::beacon::helpers::test_state::with_validators_at;
+        use ethlambda_types::beacon::containers::shared::Checkpoint;
+        use ethlambda_types::beacon::fork::ForkName;
+        use ethlambda_types::beacon::preset;
+
+        // Two committees per slot under either preset.
+        let validators = 2 * preset::slots_per_epoch() * preset::target_committee_size();
+        let state = with_validators_at(ForkName::Pq, validators as usize);
+        let store = empty_pool_store();
+        let data_slot = state.slot() - MIN_ATTESTATION_INCLUSION_DELAY_PQ;
+        let epoch = compute_epoch_at_slot(data_slot);
+        let data = AttestationData {
+            slot: data_slot,
+            index: 0,
+            beacon_block_root: get_block_root_at_slot(&state, data_slot).unwrap(),
+            source: state.current_justified_checkpoint(),
+            target: Checkpoint {
+                epoch,
+                root: get_block_root(&state, epoch).unwrap(),
+            },
+        };
+        for committee in 0..2 {
+            let aggregate = full_aggregate(&state, &store, data, committee);
+            store.pq_aggregate_pool().insert(aggregate);
+        }
+        // Genesis at the UNIX epoch: the state's slot ended long ago.
+        let mut config = Config::mainnet();
+        config.genesis_time = 0;
+        assert!(merge_budget(&config, state.slot()).is_none());
+
+        let skipped = |phase: &str| {
+            let series =
+                format!(r#"lean_beacon_pq_merges_total{{outcome="skipped",phase="{phase}"}}"#);
+            series_value(&series).unwrap_or(0.0)
+        };
+        let abandoned = AtomicBool::new(false);
+        let waits = [
+            ("production", PermitWait::TryOnce),
+            (
+                "ahead",
+                PermitWait::Wait {
+                    abandoned: &abandoned,
+                },
+            ),
+        ];
+        for (phase, wait) in waits {
+            let before = skipped(phase);
+            let packed = pack_attestations(&store, &state, &config, wait).await;
+            assert!(!packed.complete, "{phase}");
+            assert!(packed.proof.is_empty(), "{phase}");
+            assert_eq!(skipped(phase) - before, 1.0, "{phase}");
+        }
+    }
+
     #[tokio::test]
     async fn an_abandoned_packing_does_not_take_the_merge_permit() {
         let abandoned = AtomicBool::new(true);

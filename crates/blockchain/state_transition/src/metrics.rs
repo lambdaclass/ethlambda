@@ -536,6 +536,35 @@ pub fn time_data_column_kzg_verify() -> TimingGuard {
     TimingGuard::new(&LEAN_DATA_COLUMN_KZG_VERIFY_SECONDS)
 }
 
+/// Record one verification of a PQ attestation proof (`stark.VerifyAggregates`,
+/// leanVM's on a node that follows PQ), by what was verified: `aggregate` for
+/// an aggregate's proof of one committee, `block` for a block's merged proof.
+/// A proof that does not verify is observed too.
+///
+/// Here because both run inside this crate's rules: the aggregate's in
+/// `beacon::gossip::pq`, which the p2p layer calls for gossip and the Beacon
+/// API for a validator client's own aggregates, and the block's in
+/// `process_stark`.
+pub fn observe_pq_proof_verification(kind: &str, elapsed: std::time::Duration) {
+    static LEAN_BEACON_PQ_PROOF_VERIFICATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(
+        || {
+            register_histogram_vec!(
+                "lean_beacon_pq_proof_verification_seconds",
+                "Time to verify one PQ attestation proof, by what it proves (one aggregate, a block's attestations)",
+                &["kind"],
+                vec![
+                    0.001, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+                    2.0
+                ]
+            )
+            .unwrap()
+        },
+    );
+    LEAN_BEACON_PQ_PROOF_VERIFICATION_SECONDS
+        .with_label_values(&[kind])
+        .observe(elapsed.as_secs_f64());
+}
+
 /// Register the metrics above that should be visible before their first
 /// observation.
 pub fn init() {

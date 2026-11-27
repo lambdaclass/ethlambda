@@ -334,7 +334,10 @@ pub fn aggregate_stateful_checks(
     // [Modified in PQ] [REJECT] The aggregate stark is valid.
     let statements = get_attestation_statements(&state, aggregate, &committees)
         .map_err(|_| Outcome::Reject(RejectReason::AggregateProof))?;
-    if !verify_aggregates(&statements, &aggregate_and_proof.proof) {
+    let verifying = std::time::Instant::now();
+    let proven = verify_aggregates(&statements, &aggregate_and_proof.proof);
+    crate::metrics::observe_pq_proof_verification("aggregate", verifying.elapsed());
+    if !proven {
         return Err(Outcome::Reject(RejectReason::AggregateProof));
     }
     let attesting_indices = get_attesting_indices(&state, aggregate, &committees)
@@ -1127,6 +1130,14 @@ mod tests {
             message: vote_root.0,
         };
         let proof = stark::prove_aggregates(&[statement], &[vec![vote.0.to_vec()]]).unwrap();
+        // An aggregate that reaches the proof check has its verification
+        // timed: the valid one and the unproven one below, not the two
+        // refused before it.
+        let verifications = || {
+            let series = r#"lean_beacon_pq_proof_verification_seconds_count{kind="aggregate"}"#;
+            ethlambda_metrics::series_value(series).unwrap_or(0.0)
+        };
+        let verified_before = verifications();
 
         let valid = aggregate(
             &state,
@@ -1175,6 +1186,7 @@ mod tests {
             aggregate_stateful_checks(&store, &unproven),
             Err(Outcome::Reject(RejectReason::AggregateProof))
         );
+        assert_eq!(verifications() - verified_before, 2.0);
     }
 
     #[test]

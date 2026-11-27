@@ -12,5 +12,5 @@ pub use prometheus::{
 };
 
 // Re-export commonly used items
-pub use gather::{GatherError, gather_default_metrics};
+pub use gather::{GatherError, gather_default_metrics, series_value};
 pub use timing::TimingGuard;
