@@ -25,7 +25,7 @@ use ethlambda_types::{
         bits_is_subset, validator_indices,
     },
     beacon::{
-        config::Config,
+        config::{Config, GasLimitSchedule},
         constants::NUM_BLOCK_TIMELINESS_DEADLINES,
         containers::{
             BeaconState, Checkpoint as BeaconCheckpoint, DataColumnSidecar, SignedBeaconBlock,
@@ -145,7 +145,65 @@ pub struct CustodyRecord {
 /// configuration can still compare it against a wall clock.
 const KEY_TIME: &[u8] = b"time";
 /// Key for "config" field of the Store. Its value has type [`Config`] and it's SSZ-encoded.
+///
+/// Every key added to `Config` after [`DB_VERSION`] 7 takes zero bytes in this
+/// row's encoding and lives in a row of its own instead: see [`CONFIG_ROWS`].
 const KEY_CONFIG: &[u8] = b"config";
+
+/// A `Config` key stored in a `Metadata` row of its own, outside
+/// [`KEY_CONFIG`]'s encoding.
+///
+/// `KEY_CONFIG` holds a positional SSZ container, which has no notion of a
+/// missing key: a field added to it leaves every row written before it
+/// undecodable, so each one used to cost a [`DB_VERSION`] bump and a resync of
+/// every data directory. A key with a row of its own does not:
+/// - **an older directory** has no row, which [`Store::fill_missing_config_keys`]
+///   reports and a beacon resume fills from the config file, then writes, instead
+///   of failing;
+/// - **an older build** never looks for the row, and still decodes `KEY_CONFIG`,
+///   since the key's field takes zero bytes there.
+///
+/// So a new `Config` key gets an entry in [`CONFIG_ROWS`], a zero-width field
+/// encoding inside `Config`, and a row codec of its own. Its zero-width decode
+/// must give the value `Config::lean` holds: a lean resume never fills a
+/// missing row, so a lean directory that predates the key runs on that decode.
+struct ConfigRow {
+    /// The key's name in a `config.yaml`, for logs.
+    name: &'static str,
+    /// Its `Metadata` key.
+    key: &'static [u8],
+    /// The field's value, as its row stores it.
+    encode: fn(&Config) -> Vec<u8>,
+    /// Decode a row into the field.
+    decode: fn(&[u8], &mut Config) -> Result<(), libssz::DecodeError>,
+    /// Copy the field from the first config into the second.
+    copy: fn(&Config, &mut Config),
+}
+
+/// Every [`ConfigRow`], in no particular order.
+const CONFIG_ROWS: &[ConfigRow] = &[ConfigRow {
+    name: "GAS_LIMIT_SCHEDULE",
+    key: b"config_gas_limit_schedule",
+    encode: |config| config.gas_limit_schedule.to_row_ssz(),
+    decode: |bytes, config| {
+        config.gas_limit_schedule = GasLimitSchedule::from_row_ssz(bytes)?;
+        Ok(())
+    },
+    copy: |from, into| into.gas_limit_schedule = from.gas_limit_schedule.clone(),
+}];
+
+/// The `Metadata` entries that store `config`: [`KEY_CONFIG`] and every
+/// [`CONFIG_ROWS`] row. Written together, so the rows can never describe two
+/// different configs.
+fn config_entries(config: &Config) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let rows = CONFIG_ROWS
+        .iter()
+        .map(|row| (row.key.to_vec(), (row.encode)(config)));
+    std::iter::once((KEY_CONFIG.to_vec(), config.to_ssz()))
+        .chain(rows)
+        .collect()
+}
+
 /// Key for "head" field of the Store. Its value has type [`H256`] and it's SSZ-encoded.
 const KEY_HEAD: &[u8] = b"head";
 /// Key for "safe_target" field of the Store. Its value has type [`H256`] and it's SSZ-encoded.
@@ -265,6 +323,9 @@ const KEY_CUSTODY_SINCE_SLOT: &[u8] = b"custody_since_slot";
 /// [`Store::prune_finalized_states`]). A directory written by the previous
 /// version holds rows no lookup can find, and there is no migration, by the
 /// same policy every previous change followed.
+///
+/// A `Config` key added since 7 needs no bump: it gets a row of its own (see
+/// `ConfigRow`), which a directory written before it simply lacks.
 pub const DB_VERSION: u64 = 7;
 
 /// The consensus protocol a data directory holds.
@@ -1528,11 +1589,20 @@ impl Store {
                 .expect("read anchor slot")
                 .expect("a versioned directory always carries an anchor slot");
 
-            (
-                Config::from_ssz_bytes(&bytes).expect("valid config"),
-                chain,
-                anchor_slot,
-            )
+            let mut config = Config::from_ssz_bytes(&bytes).expect("valid config");
+            // A key whose row is absent stays as `KEY_CONFIG` decoded it
+            // (empty): the directory predates it, and a resume fills it from
+            // the config file (`fill_missing_config_keys`).
+            for row in CONFIG_ROWS {
+                let Some(bytes) = view.get(Table::Metadata, row.key).expect("get config row")
+                else {
+                    continue;
+                };
+                (row.decode)(&bytes, &mut config)
+                    .unwrap_or_else(|err| panic!("invalid {} row: {err:?}", row.name));
+            }
+
+            (config, chain, anchor_slot)
         };
 
         info!(?chain, anchor_slot, "Loaded store from persisted DB state");
@@ -1825,7 +1895,7 @@ impl Store {
             let mut batch = backend.begin_write().expect("write batch");
 
             // Metadata
-            let metadata_entries = vec![
+            let mut metadata_entries = vec![
                 (KEY_DB_VERSION.to_vec(), DB_VERSION.to_ssz()),
                 (KEY_CHAIN.to_vec(), vec![Chain::Lean.selector()]),
                 (KEY_PRESET.to_vec(), vec![Preset::active().selector()]),
@@ -1833,13 +1903,13 @@ impl Store {
                 // millisecond, so the value that means "the clock has not
                 // advanced past genesis" is genesis itself.
                 (KEY_TIME.to_vec(), runtime_config.genesis_time_ms().to_ssz()),
-                (KEY_CONFIG.to_vec(), runtime_config.to_ssz()),
                 (KEY_HEAD.to_vec(), anchor_block_root.to_ssz()),
                 (KEY_SAFE_TARGET.to_vec(), anchor_block_root.to_ssz()),
                 (KEY_LATEST_JUSTIFIED.to_vec(), anchor_checkpoint.to_ssz()),
                 (KEY_LATEST_FINALIZED.to_vec(), anchor_checkpoint.to_ssz()),
                 (KEY_ANCHOR_SLOT.to_vec(), anchor_slot.to_ssz()),
             ];
+            metadata_entries.extend(config_entries(&runtime_config));
             batch
                 .put_batch(Table::Metadata, metadata_entries)
                 .expect("put metadata");
@@ -1939,7 +2009,7 @@ impl Store {
         // and the finalized slot it is advancing *past*, so both chains have
         // to start with those rows present rather than have that one writer
         // grow an absent-key branch.
-        let metadata_entries = vec![
+        let mut metadata_entries = vec![
             (KEY_DB_VERSION.to_vec(), DB_VERSION.to_ssz()),
             (KEY_CHAIN.to_vec(), vec![Chain::Beacon.selector()]),
             (KEY_PRESET.to_vec(), vec![Preset::active().selector()]),
@@ -1948,7 +2018,6 @@ impl Store {
             // anchor's own time; the seed matters only for the window before
             // it does.
             (KEY_TIME.to_vec(), runtime_config.genesis_time_ms().to_ssz()),
-            (KEY_CONFIG.to_vec(), runtime_config.to_ssz()),
             (KEY_HEAD.to_vec(), anchor_block_root.to_ssz()),
             (KEY_LATEST_JUSTIFIED.to_vec(), anchor_checkpoint.to_ssz()),
             (KEY_LATEST_FINALIZED.to_vec(), anchor_checkpoint.to_ssz()),
@@ -1962,6 +2031,7 @@ impl Store {
             ),
             (KEY_ANCHOR_SLOT.to_vec(), anchor_slot.to_ssz()),
         ];
+        metadata_entries.extend(config_entries(&runtime_config));
 
         let mut batch = backend.begin_write().expect("write batch");
         batch
@@ -2201,8 +2271,40 @@ impl Store {
             Arc::get_mut(&mut self.config).is_some(),
             "replace_config needs the only handle to the cached config"
         );
-        self.set_metadata(KEY_CONFIG, &config);
+        // `KEY_CONFIG` and every `CONFIG_ROWS` row, in one commit; this is also
+        // what adds a row the directory predates.
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::Metadata, config_entries(&config))
+            .expect("put config");
+        batch.commit().expect("commit");
         self.config = Arc::new(config);
+    }
+
+    /// This store's config with every key the directory predates taken from
+    /// `supplied`, plus those keys' names.
+    ///
+    /// A predated key is a `ConfigRow` with no row in this directory. Its
+    /// field holds whatever [`Store::from_db_state`] left there (empty), which
+    /// is not a value this directory ever recorded. So the caller should
+    /// compare the returned config, not [`Store::config`], against the config
+    /// file, then hand the file's to [`Store::replace_config`] to write the
+    /// missing rows. Reads only.
+    pub fn fill_missing_config_keys(&self, supplied: &Config) -> (Config, Vec<&'static str>) {
+        let view = self.backend.begin_read().expect("read view");
+        let mut config = (*self.config).clone();
+        let mut missing = Vec::new();
+        for row in CONFIG_ROWS {
+            if view
+                .get(Table::Metadata, row.key)
+                .expect("get config row")
+                .is_none()
+            {
+                (row.copy)(supplied, &mut config);
+                missing.push(row.name);
+            }
+        }
+        (config, missing)
     }
 
     /// Which consensus protocol this data directory holds.
@@ -9385,6 +9487,106 @@ mod tests {
         // whichever other test happens to build this shape.
         store.repair_head().expect("repair head leaves this alone");
         assert_eq!(store.head().expect("head"), anchor.root);
+    }
+
+    /// A beacon directory over `config`, as `init_beacon` writes one.
+    fn beacon_directory(config: Config) -> Arc<InMemoryBackend> {
+        let backend = Arc::new(InMemoryBackend::new());
+        let anchor = BeaconCheckpoint {
+            epoch: 0,
+            root: H256::from([1u8; 32]),
+        };
+        Store::init_beacon(
+            backend.clone(),
+            1_606_824_023,
+            config,
+            anchor.root,
+            Store::beacon_checkpoint_as_stored(anchor),
+            0,
+        );
+        backend
+    }
+
+    fn scheduled_config() -> Config {
+        use ethlambda_types::beacon::config::GasLimitScheduleEntry;
+        let mut config = Config::mainnet();
+        config.gas_limit_schedule = vec![GasLimitScheduleEntry {
+            epoch: 100,
+            gas_limit: 200_000_000,
+        }]
+        .into();
+        config
+    }
+
+    /// Every `CONFIG_ROWS` key is written at bootstrap and read back on a
+    /// resume, and none is reported missing.
+    #[test]
+    fn a_config_key_stored_in_its_own_row_is_read_back() {
+        let scheduled = scheduled_config();
+        let backend = beacon_directory(scheduled.clone());
+
+        let store = Store::from_db_state(backend).unwrap().unwrap();
+
+        assert_eq!(
+            store.config().gas_limit_schedule,
+            scheduled.gas_limit_schedule
+        );
+        let (filled, missing) = store.fill_missing_config_keys(&Config::mainnet());
+        assert!(missing.is_empty(), "{missing:?}");
+        assert_eq!(filled.gas_limit_schedule, scheduled.gas_limit_schedule);
+
+        // An empty schedule (mainnet's, Hoodi's) is written as a row too, so
+        // every later resume finds it rather than adding it again.
+        let unscheduled = Store::from_db_state(beacon_directory(Config::mainnet()))
+            .unwrap()
+            .unwrap();
+        let (filled, missing) = unscheduled.fill_missing_config_keys(&scheduled);
+        assert!(missing.is_empty(), "{missing:?}");
+        assert!(filled.gas_limit_schedule.is_empty());
+    }
+
+    /// A directory written before a key's row existed loads, reports the key
+    /// missing, and takes its value from the supplied config. Its `config`
+    /// row is the same bytes an older build wrote and reads.
+    #[test]
+    fn a_directory_that_predates_a_config_row_reports_the_key_missing() {
+        let scheduled = scheduled_config();
+        let backend = beacon_directory(scheduled.clone());
+        let config_row = backend
+            .begin_read()
+            .unwrap()
+            .get(Table::Metadata, KEY_CONFIG)
+            .unwrap()
+            .expect("config row");
+        assert_eq!(
+            config_row,
+            Config::mainnet().to_ssz(),
+            "the config row does not carry the schedule"
+        );
+        let mut batch = backend.begin_write().unwrap();
+        let keys = CONFIG_ROWS.iter().map(|row| row.key.to_vec()).collect();
+        batch.delete_batch(Table::Metadata, keys).unwrap();
+        batch.commit().unwrap();
+
+        let mut store = Store::from_db_state(backend.clone()).unwrap().unwrap();
+        assert!(store.config().gas_limit_schedule.is_empty());
+        let (filled, missing) = store.fill_missing_config_keys(&scheduled);
+        assert_eq!(missing, ["GAS_LIMIT_SCHEDULE"]);
+        assert_eq!(filled, scheduled);
+
+        // What a resume does next: the file's config, rows included.
+        store.replace_config(scheduled.clone());
+        let reopened = Store::from_db_state(backend).unwrap().unwrap();
+        assert_eq!(
+            reopened.config().gas_limit_schedule,
+            scheduled.gas_limit_schedule
+        );
+        assert!(
+            reopened
+                .fill_missing_config_keys(&Config::mainnet())
+                .1
+                .is_empty()
+        );
     }
 
     #[test]

@@ -12,9 +12,7 @@ use ethlambda_validator::beacon_node::Genesis;
 use ethlambda_validator::beacon_node::fallback::BroadcastTopic;
 use ethlambda_validator::chain_check::{ChainId, ExpectedNetwork};
 use ethlambda_validator::graffiti_file::GraffitiFile;
-use ethlambda_validator::proposer_settings::{
-    DEFAULT_GAS_LIMIT, GRAFFITI_BYTES, graffiti_from_text,
-};
+use ethlambda_validator::proposer_settings::{GRAFFITI_BYTES, graffiti_from_text};
 use ethlambda_validator::{BuilderProposals, ValidatorConfig};
 use eyre::WrapErr as _;
 use tokio::sync::oneshot;
@@ -148,17 +146,14 @@ pub(crate) struct ValidatorOptions {
     /// Before gloas it goes into builder registrations (with
     /// `--builder-proposals`). From gloas it goes into the proposer
     /// preferences, published for every proposal, and the beacon node builds
-    /// this client's own payloads toward it too, so on a network whose gas
-    /// limit is not the default, set it or every proposal pulls the limit
-    /// toward 60M. Sepolia and Platåberget schedule 200000000: pass
-    /// `--gas-limit 200000000` there. The network config's
-    /// `GAS_LIMIT_SCHEDULE` is not read yet (#795).
-    #[arg(
-        long,
-        default_value_t = DEFAULT_GAS_LIMIT,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    pub(crate) gas_limit: u64,
+    /// this client's own payloads toward it too.
+    ///
+    /// Without it, the gas limit is the one the network's `GAS_LIMIT_SCHEDULE`
+    /// (read off the beacon node's `/eth/v1/config/spec`) names for the
+    /// proposal's epoch, and 60000000 for an epoch it names none, or when the
+    /// node does not serve the key.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) gas_limit: Option<u64>,
 
     /// Serve the keymanager API: keystores, remote keys, plus each validator's
     /// own fee recipient, graffiti and gas limit.
@@ -657,7 +652,7 @@ mod tests {
             graffiti: Some(graffiti.to_string()),
             graffiti_file: None,
             suggested_fee_recipient: None,
-            gas_limit: DEFAULT_GAS_LIMIT,
+            gas_limit: None,
             enable_keymanager: false,
             web3signer_url: None,
             builder_proposals: false,
@@ -733,11 +728,12 @@ mod tests {
         assert_eq!(handoff.route(async { "SIGTERM" }).await, None);
     }
 
+    /// Unset unless given, so the network's schedule can supply the default.
     #[test]
-    fn the_gas_limit_defaults_to_60m_and_takes_any_positive_value() {
-        assert_eq!(parse(&[]).expect("parses").gas_limit, DEFAULT_GAS_LIMIT);
+    fn the_gas_limit_is_unset_by_default_and_takes_any_positive_value() {
+        assert_eq!(parse(&[]).expect("parses").gas_limit, None);
         let options = parse(&["--gas-limit", "200000000"]).expect("parses");
-        assert_eq!(options.gas_limit, 200_000_000);
+        assert_eq!(options.gas_limit, Some(200_000_000));
         parse(&["--gas-limit", "0"]).expect_err("a zero gas limit is a mistake");
     }
 

@@ -564,7 +564,15 @@ the next fork the node cannot follow: the first refuses such an anchor with
 `UnsupportedFork`, the second warns once per scheduled fork for which
 `ForkName::is_followed` answers no (the one place that says which forks the
 node follows). The ignored-keys warning only ever names heze's keys and
-`GAS_LIMIT_SCHEDULE`/`INCLUSION_LIST_DUE_BPS`.
+`INCLUSION_LIST_DUE_BPS`. `GAS_LIMIT_SCHEDULE` (EIP-8261) is a `Config` field
+served on `/eth/v1/config/spec` and stored in a `Metadata` row of its own
+(`config_gas_limit_schedule`), not in `Metadata["config"]`'s encoding, where it
+takes zero bytes. That is the pattern for every `Config` key added after
+`DB_VERSION` 7 (`CONFIG_ROWS` in `store.rs`): no version bump, and a directory
+that predates the key resumes, with a beacon resume adding the config file's
+value (`Store::fill_missing_config_keys`) instead of failing. `ConfigFile::parse`
+refuses a schedule with an entry before `GLOAS_FORK_EPOCH`, two at one epoch,
+or more than 32 entries.
 Platåberget (the Glamsterdam testnet) is already past its `GLOAS_FORK_EPOCH`,
 so its checkpoint anchor is a gloas state: it is accepted, starts with no
 payload known (head EMPTY), and its first FULL child is held until the anchor's
@@ -993,7 +1001,11 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   protection records the slot, a gloas block whose bid is not
   `BUILDER_INDEX_SELF_BUILD` (`ProposalService::produce_and_sign`).
   `--gas-limit` sets the target gas limit the preferences
-  carry, which the node's own gloas payload is built toward.
+  carry, which the node's own gloas payload is built toward; without it, the
+  one the beacon node's `GAS_LIMIT_SCHEDULE` names for the proposal's epoch,
+  else 60M (the chain check re-reads the schedule every round from the first usable
+  node that serves a non-empty one, and hands it to `ProposerSettings`; an unusable
+  schedule is ignored with a warning, not an error that costs the node).
   Every slot it probes each beacon node's `/eth/v1/node/syncing` a sixth of a
   slot before the boundary, on its own task (`beacon_node::health`, records
   in `NodeHealth`, shared by the fallback): a slot in which every node that
