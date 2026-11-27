@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d189a536.js";
+            window.path_to_searchindex_js = "searchindex-c139ba93.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -5026,7 +5026,8 @@ behind by its sync distance) is logged once, when it changes.</li>
 because the head looks old: during a network-wide stall every head is old,
 and clients that stop signing then keep the chain stalled. Only the node’s
 own <code>is_syncing</code> and <code>is_optimistic</code> count. <code>sync_distance</code> only ranks the
-nodes, and in a stall every node is about as far behind.</li>
+nodes, and in a stall every node is about as far behind. The
+<a href="#clock-checks">clock checks</a> read it and <code>head_slot</code> as well, and only warn.</li>
 </ul>
 <h3 id="ranking-and-broadcast"><a class="header" href="#ranking-and-broadcast">Ranking and broadcast</a></h3>
 <p>With several <code>--beacon-nodes</code>, every request walks the nodes in rank order
@@ -5103,6 +5104,45 @@ with no blobs can be revealed through any of them.</li>
 <li><strong>Signed once.</strong> Every message is signed, and recorded by slashing
 protection, before it is sent, however many nodes it is sent to.</li>
 </ul>
+<h3 id="clock-checks"><a class="header" href="#clock-checks">Clock checks</a></h3>
+<p>Every duty is timed by this client’s own clock. Ahead by more than half a
+second, an ethlambda beacon node refuses its block requests; ahead by a few
+seconds, its attestations vote for the parent; behind, every duty goes out late
+and nothing refuses it. So the client compares its clock with each beacon
+node’s on every sync probe, and watches its own for steps. These checks only
+warn, since a difference does not say which clock is off. A client and a node
+on one host share a clock, so between the two only a split setup is caught.</p>
+<ul>
+<li><strong><code>Date</code>.</strong> The probe answer’s <code>Date</code> header, taken at the middle of the
+second it names, less the midpoint of the round trip; answers slower than a
+second are not used. A node is warned about once the median of its last three
+samples is 2 s or more off, which is as fine as a one-second header can tell.
+A sample is read for six slots, so a node that stops sending a usable <code>Date</code>
+loses its estimate rather than keeping an old one.</li>
+<li><strong>Slots.</strong> A <code>head_slot</code> more than one slot past this client’s wall slot
+means this client’s clock is behind, as Lighthouse checks. A node that
+reports a nonzero <code>sync_distance</code> and is not syncing also gives its own wall
+slot, <code>head_slot + sync_distance</code>, compared with this client’s at send and at
+receive, so a boundary crossed while the request was out does not count.
+(Teku reports a distance of 0 whenever it is in sync, so no other distance
+is read.) A node that sends no <code>Date</code> gets this check alone.</li>
+<li><strong>Steps.</strong> Each pass of the duty loop compares how far the wall clock moved
+with how far the monotonic clock did. A step of half a second or more is
+logged and counted on <code>ethlambda_validator_clock_steps_total</code>: back before
+the slot served, the loop waits for the wall clock to reach the next slot
+again; forward past the next slot, the slots stepped over are lost; within
+those, only the next boundary moves. A loop back more than a slot late with no step (a duty
+overran, or the process was paused) is logged too.</li>
+</ul>
+<p>The warnings name the node by its position in <code>--beacon-nodes</code>, from 0, and
+recur at most once an epoch while the clocks disagree.
+<code>ethlambda_validator_beacon_node_clock_offset_seconds</code> carries each node’s
+offset. A warning from the slots alone shows there only the offset the slots
+prove, which can read under 2 (about 1.9 s on 12 s slots when this client is
+behind), so an alert meant to match the warnings fires lower; see
+<a href="#validator-client">Metrics</a>. A slot disagreement proving less
+than half a second, a boundary crossed inside a long round trip, is not
+warned about.</p>
 <h3 id="doppelganger-protection"><a class="header" href="#doppelganger-protection">Doppelganger protection</a></h3>
 <p>Off unless <code>--enable-doppelganger-protection</code> is passed. A doppelganger is a
 second validator client running the same key, usually a key moved to a new
@@ -7904,6 +7944,8 @@ and absent is not the same as zero.</p>
 <tr><td><code>ethlambda_validator_slots_skipped_syncing_total</code></td><td>Counter</td><td>Slots in which nothing was signed because every beacon node that answered the slot’s sync probe (<code>/eth/v1/node/syncing</code>, a sixth of a slot before the boundary) reported syncing or optimistic. Should read zero once the nodes are synced; a steady climb is a node that stays syncing or on an optimistic head, usually because its execution client is behind. Nodes that did not answer are not counted against the slot, so this stays flat while every node is down. See <a href="#the-per-slot-sync-check">The per-slot sync check</a></td></tr>
 <tr><td><code>ethlambda_validator_beacon_node_available</code></td><td>Gauge</td><td>1 when at least one configured beacon node answered its latest sync probe neither syncing nor optimistic, and that probe is at most two slots old. 0 before the first probe answers, and while every node is down, syncing or optimistic, which includes every slot the sync check withholds. Set on every scrape from the per-node probe records <code>/health</code> reads, so it follows the nodes rather than the last duty: a failed attestation no longer sets it to 0, and a node that comes back sets it to 1 within a slot, without waiting for the next epoch’s refresh</td></tr>
 <tr><td><code>ethlambda_validator_healthy</code></td><td>Gauge</td><td>1 when <code>/health</code> answers <code>200</code>, 0 when it answers <code>503</code>: the client has run a duty refresh whose attester schedule reaches the current epoch, at least one beacon node is usable, and the last slashing-protection write went through. Set on every scrape from the same report <code>/health</code> answers with, so an alert on it and a probe of the endpoint cannot disagree. 0 while the client is starting. See <a href="#metrics-1">Metrics</a> for the checks</td></tr>
+<tr><td><code>ethlambda_validator_beacon_node_clock_offset_seconds</code></td><td>Gauge</td><td>Each beacon node’s clock minus this client’s, labelled <code>node</code> by its position in <code>--beacon-nodes</code> (from 0), so positive means this client’s clock is behind. Set from every answer to the sync probe: the median of the node’s last three <code>Date</code> header samples once three are kept from the last six slots, good to about a second. When the node’s <code>head_slot</code> and <code>sync_distance</code> put it in another slot than this client, the value is held to at least the offset that allows, so a <code>Date</code> written by something else (a reverse proxy) cannot hide it; that offset is also the value until three samples are kept, or for a node that sends no <code>Date</code>. Otherwise 0. Every node the client warns about reads at least 1.5 in absolute value on 12 s slots, so alert there: a <code>Date</code> warning needs 2, and a warning from the slots alone shows the least offset they prove, which for this client being behind is about the probe’s lead before the boundary less the round trip (about 1.9 s; a sixth of a slot in general, so lower the threshold on shorter slots). A synced node’s <code>Date</code> estimate stays within about a second. Unlike the other series, a node’s is absent until its first answer, and again from a probe it does not answer until one it does. See <a href="#clock-checks">Clock checks</a></td></tr>
+<tr><td><code>ethlambda_validator_clock_steps_total</code></td><td>Counter</td><td>Steps of half a second or more, forward or back, of this client’s wall clock against its monotonic clock, checked once per pass of the duty loop and each logged at warn with its size. A host suspended under the client counts as a forward step. Should read zero once time sync has settled</td></tr>
 <tr><td><code>ethlambda_validator_signing_duration_seconds</code></td><td>Histogram</td><td>Time a duty waited for its batch of signatures. With local keys that is the signing itself. With keys in a remote signer it is the batch’s slowest answer, round trip and verification included, and at most the 2 s signing budget, so a sample in the top bucket means a signer that did not answer in time</td></tr>
 <tr><td><code>ethlambda_validator_remote_signer_request_duration_seconds</code></td><td>Histogram</td><td>Time one signing request to a remote signer took, from sending it to its answer or failure, not counting the wait for one of the signer’s 64 request slots. The number to watch for a slow signer; empty when every key is local</td></tr>
 <tr><td><code>ethlambda_validator_slashing_protection_write_seconds</code></td><td>Histogram</td><td>Time to durably write the slashing-protection record, once per slot’s attestation batch and once per block, before signing. Milliseconds on a local disk; worth an alert above about a second, since the duty waits for it and a write held past 3 s is refused</td></tr>
