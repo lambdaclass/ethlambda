@@ -636,6 +636,20 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             .unwrap_or_default()
     }
 
+    /// The duties of `epoch` at `slot` or after it.
+    pub fn from_slot(&self, slot: Slot, epoch: Epoch) -> Vec<AttesterDutyDto> {
+        self.by_epoch
+            .get(&epoch)
+            .map(|held| {
+                held.duties
+                    .iter()
+                    .filter(|duty| duty.slot >= slot)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Every duty held, across the epochs currently loaded.
     pub fn all(&self) -> Vec<AttesterDutyDto> {
         self.by_epoch

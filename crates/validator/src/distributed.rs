@@ -198,6 +198,9 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
     /// committee exchange for `sync_duties`, bounded by the slot's
     /// contribution deadline, where its proofs are read. Each runs on a task
     /// of its own, so a slow middleware never delays a duty.
+    ///
+    /// `attester_duties` need only hold what a retry reads: the current
+    /// epoch's duties from `slot` on, and nothing when `round` is set.
     pub fn after_proposal(
         self: &Arc<Self>,
         slot: Slot,
@@ -522,6 +525,12 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
         if asked.is_empty() {
             return Ok(0);
         }
+        // Which slots this request covers, so that one retry's line can be
+        // told from another's: a retry sends a request per slot.
+        let slots = asked.iter().map(|selection| selection.slot);
+        let (first_slot, last_slot) = slots.fold((Slot::MAX, 0), |(first, last), slot| {
+            (first.min(slot), last.max(slot))
+        });
 
         let answers = self.beacon_node.beacon_committee_selections(&asked).await?;
         // A swap that moved a fork while the request was out may have moved
@@ -531,6 +540,8 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
         // starts for the swap asks for them again under the new schedule.
         if self.context.schedule_generation() != generation {
             debug!(
+                first_slot,
+                last_slot,
                 asked = asked.len(),
                 "Schedule swapped during the attester selection exchange; its answer is dropped"
             );
@@ -549,13 +560,20 @@ impl<B: BeaconNodeApi + 'static> Distributed<B> {
             .remember_combined_selection_proofs(generation, answered);
         if combined < asked.len() && !lookahead {
             warn!(
+                first_slot,
+                last_slot,
                 asked = asked.len(),
-                combined, "Middleware left some duties without a combined selection proof"
+                combined,
+                "Middleware left some duties without a combined selection proof"
             );
         }
         debug!(
+            first_slot,
+            last_slot,
             asked = asked.len(),
-            combined, lookahead, "Exchanged attester selection proofs"
+            combined,
+            lookahead,
+            "Exchanged attester selection proofs"
         );
         Ok(combined)
     }
@@ -1100,6 +1118,28 @@ mod tests {
 
         // Nothing is missing any more, so the slot after asks for nothing.
         distributed.retry(EPOCH_START + 2, &duties, &store).await;
+        assert_eq!(node.selection_requests().len(), 1);
+    }
+
+    /// The next epoch's duties are left to that epoch's round, its first
+    /// slot's included: the retry at an epoch's last slot asks for nothing
+    /// across the boundary, and the one at that slot itself does.
+    #[tokio::test]
+    async fn a_retry_asks_for_nothing_in_the_next_epoch() {
+        let (store, pubkey) = store();
+        let first_of_next = EPOCH_START + slots_per_epoch();
+        let node = Arc::new(MockBeaconNode::new().with_combined_selection(
+            1,
+            first_of_next,
+            attester_proof(true),
+        ));
+        let distributed = Distributed::new(node.clone(), distributed_context());
+        let duties = vec![duty(&pubkey, 1, first_of_next)];
+
+        distributed.retry(first_of_next - 1, &duties, &store).await;
+        assert!(node.selection_requests().is_empty());
+
+        distributed.retry(first_of_next, &duties, &store).await;
         assert_eq!(node.selection_requests().len(), 1);
     }
 

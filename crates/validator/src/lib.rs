@@ -884,8 +884,17 @@ where
             // and the slot's sync committee exchange. See `distributed`.
             if let Some(distributed) = &distributed {
                 let round = owed_moved || resubscribe;
-                let (schedule, sync_owed) = (duties.all(), duties.sync_at_slot(slot));
-                distributed.after_proposal(slot, round, schedule, sync_owed, &store, &clock);
+                // Only what a retry reads: this epoch's duties still ahead,
+                // and nothing when a round covers them. The whole schedule
+                // is two epochs of duties to clone, every slot, on the way
+                // to the slot's duties.
+                let retried = if round {
+                    Vec::new()
+                } else {
+                    duties.from_slot(slot, epoch)
+                };
+                let sync_owed = duties.sync_at_slot(slot);
+                distributed.after_proposal(slot, round, retried, sync_owed, &store, &clock);
             }
             if let Some((registrable, sync_owed)) = readmission {
                 let node = beacon_node.clone();
