@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-99750670.js";
+            window.path_to_searchindex_js = "searchindex-dd8a831e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -658,6 +658,8 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.</p>
 <tr><td><code>lean_beacon_gossip_validation_total</code></td><td>Counter</td><td>Verdicts, by topic kind, outcome and reason</td><td>On every verdict reported to gossipsub</td><td>kind, outcome=accept,queue,ignore,reject, reason</td><td></td></tr>
 <tr><td><code>lean_beacon_gossip_validation_seconds</code></td><td>Histogram</td><td>Time from a message’s arrival to its verdict</td><td>On every verdict reported to gossipsub</td><td>kind</td><td>0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8</td></tr>
 <tr><td><code>lean_beacon_gossip_verdict_expired_total</code></td><td>Counter</td><td>Verdicts that arrived after gossipsub evicted the message, so an Accept propagated nothing</td><td>When <code>report_message_validation_result</code> returns <code>false</code></td><td>kind</td><td></td></tr>
+<tr><td><code>lean_beacon_gossip_parked_votes_total</code></td><td>Counter</td><td>Subnet attestations and aggregates whose verdict waited for their block’s post-state, by what happened to them</td><td>When a vote is parked, refused by the full queue (or by the half of it votes for a block not stored yet may take), checked again, or past its deadline. <code>rechecked</code> and <code>expired</code> also count a vote checked again at once because its block was announced before its first verdict arrived, which is never <code>parked</code></td><td>kind, result=parked,full,rechecked,expired</td><td></td></tr>
+<tr><td><code>lean_beacon_gossip_parked_votes</code></td><td>Gauge</td><td>Votes parked right now</td><td>On every park, release and sweep</td><td></td><td></td></tr>
 </tbody>
 </table>
 </div>
@@ -682,10 +684,19 @@ envelope verifies. When the execution client has found that parent’s payload
 invalid, nothing will verify it, and the block is ignored instead
 (<code>parent_payload_invalid</code>). The aggregate, attestation,
 <code>payload_attestation_message</code>, <code>execution_payload_bid</code> and <code>proposer_preferences</code>
-topics never answer <code>queue</code>, since the vote
-block’s post-state is either cached or it is not
-(<code>IgnoreReason::UnknownBlock</code>/<code>StateUnavailable</code>), with nothing to hold the
-message for. <strong><code>verdict_expired_total</code> should stay at
+topics never answer <code>queue</code>. An aggregate or a subnet attestation whose vote
+block is not stored yet, or has no cached post-state yet
+(<code>IgnoreReason::UnknownBlock</code>/<code>StateUnavailable</code>), is held anyway, though not
+as <code>queue</code>: its verdict is withheld while it waits for the block’s import, then
+its checks run again, on a permit pool of their own (<code>pool="recheck"</code>)
+(<code>lean_beacon_gossip_parked_votes_total</code>, and
+<code>crates/net/p2p/src/beacon/parked_votes.rs</code>). A vote whose block was imported
+but whose state has left the cache is checked once more at once and not held. A vote counted under those two
+reasons is one still waiting at its deadline, 2.5 s after it arrived, one the
+full queue refused, or one whose second check still found its block or state
+missing. Its time to verdict includes the wait, so
+<code>lean_beacon_gossip_validation_seconds</code> for these two kinds reads up to that
+deadline. <strong><code>verdict_expired_total</code> should stay at
 zero</strong>: a rising count means validation is too slow for gossipsub’s message
 cache.</p>
 <p>The two topics add reasons the others do not, all <code>reason</code> label values on
@@ -749,10 +760,10 @@ ethlambda-specific, not part of the leanMetrics spec.</p>
 <tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
 </thead>
 <tbody>
-<tr><td><code>lean_beacon_validation_permits_in_use</code></td><td>Gauge</td><td>Permits held per pool: blocking tasks queued or running</td><td>A permit is acquired / released</td><td>pool=gossip,attestation,builder,sync,column_check</td><td></td></tr>
+<tr><td><code>lean_beacon_validation_permits_in_use</code></td><td>Gauge</td><td>Permits held per pool: blocking tasks queued or running</td><td>A permit is acquired / released</td><td>pool=gossip,attestation,builder,sync,column_check,recheck</td><td></td></tr>
 <tr><td><code>lean_beacon_validation_permit_exhausted_total</code></td><td>Counter</td><td>Objects reported <code>Ignore(Overloaded)</code> because their pool had no free permit</td><td>On each failed <code>try_acquire</code></td><td>pool=gossip,attestation,builder,sync</td><td></td></tr>
 <tr><td><code>lean_beacon_validation_queue_seconds</code></td><td>Histogram</td><td>Time from <code>spawn_blocking</code> being called to the closure starting (tokio blocking-pool queueing)</td><td>When the closure starts</td><td>kind</td><td>0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4</td></tr>
-<tr><td><code>lean_beacon_validation_run_seconds</code></td><td>Histogram</td><td>Run time of the closure itself</td><td>When the closure ends (panic included)</td><td>kind</td><td>same as above</td></tr>
+<tr><td><code>lean_beacon_validation_run_seconds</code></td><td>Histogram</td><td>Run time of the closure itself. A batch of up to 64 parked votes checked again is one closure, timed under <code>beacon_attestation_recheck</code> or <code>beacon_aggregate_and_proof_recheck</code></td><td>When the closure ends (panic included)</td><td>kind</td><td>same as above</td></tr>
 <tr><td><code>lean_beacon_column_check_permit_wait_seconds</code></td><td>Histogram</td><td>Time a block’s fetched or replayed columns (their prechecks, or a further KZG sub-batch) or a fetched envelope waited for a <code>column_check</code> permit</td><td>When the permit is granted</td><td>kind=column_check,envelope_check</td><td>same as above</td></tr>
 <tr><td><code>lean_beacon_epoch_precompute_running</code></td><td>Gauge</td><td>1 while an epoch precompute worker runs its advance</td><td>Worker start / end</td><td></td><td></td></tr>
 </tbody>

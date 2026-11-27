@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-99750670.js";
+            window.path_to_searchindex_js = "searchindex-dd8a831e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-9d125e03.js"></script>
@@ -618,6 +618,40 @@ rebuilds them.</li>
 block’s ancestor at the target epoch (REJECT), and the finalized checkpoint
 is an ancestor of the vote block (IGNORE).</li>
 </ol>
+<p>Steps 1 and 2 fail for a while on every block this node imports: validators
+vote as soon as the block reaches them, so the first votes for it arrive
+while this node is still waiting for its columns or running its state
+transition. Those IGNOREs are not reported straight away. The vote is parked
+under the block’s root with its verdict withheld, so gossipsub keeps holding
+the message, and when the chain actor’s import caches the post-state it tells
+p2p (<code>BlockChainToP2P::block_state_ready</code>), which runs the stateful checks
+again, in blocking batches, and reports what they answer then. An accepted
+vote propagates as the original message. This is lighthouse’s reprocess
+queue, which the specification allows (“a client MAY queue attestations for
+processing once block is retrieved”). Without it, a devnet with ~130 ms
+imports lost 5 to 8% of each node’s subnet votes, all of them the earliest.</p>
+<p>A vote is parked once: its second check reports whatever it answers. One
+still parked 2.5 s after it arrived gets its first verdict, since gossipsub
+drops a message awaiting a verdict as early as 3.5 s in (6 heartbeats of
+700 ms of history). The queue holds at most 16,384 votes, lighthouse’s own
+cap, since nothing about a parked vote has been verified, and at most 2,048
+aggregates among them, since an aggregate’s bits can reach 16 KiB before its
+signature is checked; past either, a vote gets its first verdict at once.
+Released votes are checked again on a permit pool of their own, so a big
+release takes no permit from the votes arriving meanwhile, and each keeps its
+place under both caps until that check answers, since its batch may wait for
+a permit while the next releases come in. Votes for a block this node has
+not stored at all take at most half of each cap: any peer can name a
+root nobody signed, and since no import releases it, its votes would sit
+until their deadline and end in an IGNORE that costs the peer nothing. A
+vote for a block this node has stored names one it was handed and is still
+importing, nearly always after checking its proposer’s signature, and those
+are nearly every early vote an honest network sends, so a peer flooding
+made-up roots cannot crowd them out. A vote whose block
+was imported but whose state has left the cache is checked once more at once
+and not parked, since no release would come for it. Unlike lighthouse, a vote for a block this
+node has never seen does not start a lookup for that block: it waits for
+gossip or sync to bring it. See <code>crates/net/p2p/src/beacon/parked_votes.rs</code>.</p>
 <p>The seen caches (<code>SeenAggregates</code>, keyed both by <code>(target_epoch, aggregator_index)</code> and by <code>(hash_tree_root(data), committee_index)</code>;
 <code>SeenAttestations</code>, by <code>(target_epoch, attester_index)</code>) live in p2p now,
 recorded only on <code>Accept</code> by <code>verdict::settle</code>, and are bounded by capacity
@@ -1167,6 +1201,8 @@ stays at that start’s slot rather than moving back as a backfill would let it.
 <tr><td><code>lean_beacon_gossip_messages_total{topic,result}</code></td><td>Gossip received, by topic and by <code>decoded</code> / <code>decode_failed</code> / <code>decompress_failed</code> / <code>unsupported_fork</code></td></tr>
 <tr><td><code>lean_beacon_gossip_validation_total{kind,outcome,reason}</code></td><td>Gossip verdicts, now including <code>beacon_aggregate_and_proof</code> and <code>beacon_attestation</code>; see <a href="./metrics.html#beacon-gossip-validation">metrics.md</a></td></tr>
 <tr><td><code>lean_beacon_gossip_verdict_expired_total{kind}</code></td><td>Verdicts that came too late to propagate anything; should stay at zero</td></tr>
+<tr><td><code>lean_beacon_gossip_parked_votes_total{kind,result}</code></td><td>Votes whose verdict waited for their block’s post-state: <code>parked</code>, <code>full</code>, <code>rechecked</code>, <code>expired</code></td></tr>
+<tr><td><code>lean_beacon_gossip_parked_votes</code></td><td>Votes parked right now</td></tr>
 <tr><td><code>lean_beacon_status_digest_mismatch_total</code></td><td>Peers whose <code>Status</code> moved onto another fork digest, once per move (not per refresh)</td></tr>
 <tr><td><code>lean_beacon_fork_digest{digest}</code></td><td>The digest computed at startup, as a label</td></tr>
 <tr><td><code>lean_beacon_aggregate_decode_seconds</code></td><td>Time spent decoding one aggregate off the wire</td></tr>
