@@ -17,9 +17,15 @@
 //! reorged out would stay for good. The balances come from the fork choice's
 //! snapshot for the finalized checkpoint when it still holds one, which it
 //! usually does, since it keeps the last few epoch boundaries; only otherwise
-//! is the state read. The work is off the actor because that read may rebuild
-//! a mainnet state from disk, which would stall it; the outcome comes back
-//! through the actor's mailbox ([`finish`]).
+//! is the state read, and it is the state that snapshot is built from: the
+//! checkpoint's state at its epoch's first slot (`checkpoint_state`), not the
+//! checkpoint block's own post-state, which is an epoch earlier when that slot
+//! was empty and so may hold other effective balances. Reading one view for
+//! the snapshot and another without it would make the recorded count, which
+//! never falls, depend on what happened to be cached. The work is off the
+//! actor because that read may rebuild a mainnet state from disk and run an
+//! epoch transition, which would stall it; the outcome comes back through the
+//! actor's mailbox ([`finish`]).
 //! Startup custodies and advertises the larger of `--custody-group-count` and
 //! that recorded count.
 //!
@@ -41,7 +47,7 @@
 //! peer reading only the record, which costs that peer nothing it relied on.
 
 use ethlambda_network_api::AttachedValidators;
-use ethlambda_state_transition::beacon::das;
+use ethlambda_state_transition::beacon::{das, fork_choice};
 use ethlambda_storage::Store;
 use ethlambda_types::ShortRoot;
 use ethlambda_types::beacon::containers::{BeaconState, Checkpoint};
@@ -208,9 +214,21 @@ pub(crate) fn refresh(server: &mut P2PServer, ctx: &Context<P2PServer>) {
 
 /// A run's blocking half: the attached validators' effective balances at
 /// `finalized`, from the fork choice's balances snapshot for it when one is
-/// cached ([`conclude_from_balances`]), else from the state finalized there
-/// ([`conclude`]). Reading the state may rebuild it from disk, which is why
-/// this is never called on the actor.
+/// cached ([`conclude_from_balances`]), else from the state that snapshot is
+/// built from ([`conclude`]).
+///
+/// That state is `checkpoint_state`'s: the checkpoint block's post-state
+/// advanced to the first slot of the checkpoint's epoch. When that slot was
+/// empty, the block's own post-state is still in the epoch before, ahead of
+/// the epoch transition that updates effective balances, so reading it here
+/// would give a different requirement than the snapshot for the same
+/// checkpoint, and which one got recorded would depend on the cache.
+///
+/// Reading the state may rebuild it from disk and run that epoch transition,
+/// which is why this is never called on the actor. A missing state, or a
+/// transition that fails, is [`CustodyRun::Unavailable`]; a storage error
+/// panics inside `checkpoint_state`, which [`refresh`] reports as unavailable
+/// too.
 pub(crate) fn compute(
     store: &Store,
     finalized: Checkpoint,
@@ -219,18 +237,16 @@ pub(crate) fn compute(
     if let Some(balances) = store.justified_balances(&finalized) {
         return conclude_from_balances(store, &balances, attached);
     }
-    let finalized_root = finalized.root;
-    match store.get_state(&finalized_root) {
-        Ok(Some(state)) => conclude(store, &state, attached),
-        Ok(None) => {
-            debug!(
-                finalized_root = %ShortRoot(&finalized_root.0),
-                "No finalized state to compute validator custody from"
-            );
-            CustodyRun::Unavailable
-        }
+    let config = store.config();
+    match fork_choice::checkpoint_state(store, &finalized, &config) {
+        Ok(state) => conclude(store, &state, attached),
         Err(err) => {
-            debug!(%err, "Cannot read the finalized state for validator custody");
+            debug!(
+                finalized_epoch = finalized.epoch,
+                finalized_root = %ShortRoot(&finalized.root.0),
+                %err,
+                "Cannot read the finalized checkpoint's state for validator custody"
+            );
             CustodyRun::Unavailable
         }
     }
@@ -471,6 +487,48 @@ mod tests {
         let store = empty_store();
         let finalized = store.beacon_finalized_checkpoint();
         assert_eq!(compute(&store, finalized, &[0]), CustodyRun::Unavailable);
+    }
+
+    /// With no balances snapshot cached, a run reads the state the snapshot is
+    /// built from: the finalized checkpoint's state at its epoch's first slot,
+    /// primed here in the state cache with the effective balances an epoch
+    /// transition left. Nothing is stored under the checkpoint's root, so a
+    /// run reading the checkpoint block's own post-state would find none and
+    /// answer `Unavailable`. Once the fork choice has built its snapshot from
+    /// that same state, a run reading the snapshot gives the same answer.
+    #[test]
+    fn a_run_without_the_snapshot_reads_the_checkpoint_state() {
+        let store = empty_store();
+        let finalized = Checkpoint {
+            epoch: 2,
+            root: Root::repeat_byte(0x42),
+        };
+        let mut state =
+            ethlambda_state_transition::beacon::helpers::test_state::with_validators(16);
+        // Ten validators at 64 ETH: 640 ETH, twenty groups, where the
+        // builder's 32 ETH each would give ten.
+        for index in 0..10 {
+            state.validator_mut(index).unwrap().effective_balance = 64_000_000_000;
+        }
+        state.apply_pending_mutations();
+        let key = ethlambda_storage::CacheKey::CheckpointState {
+            epoch: finalized.epoch,
+            root: finalized.root,
+        };
+        store.cache_state(key, std::sync::Arc::new(state));
+        let attached: Vec<ValidatorIndex> = (0..10).collect();
+        let twenty = CustodyRun::Required {
+            required: 20,
+            highest: 20,
+        };
+
+        assert!(store.justified_balances(&finalized).is_none());
+        assert_eq!(compute(&store, finalized, &attached), twenty);
+
+        let config = store.config();
+        fork_choice::checkpoint_balances(&store, &finalized, &config).expect("snapshot");
+        assert!(store.justified_balances(&finalized).is_some());
+        assert_eq!(compute(&store, finalized, &attached), twenty);
     }
 
     /// With the fork choice's balances snapshot for the finalized checkpoint
