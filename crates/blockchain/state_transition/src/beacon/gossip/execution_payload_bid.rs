@@ -283,7 +283,10 @@ pub fn is_bid_compatible_with_head(
                 if fork_choice::is_head_late(store, node.root).map_err(internal)? {
                     return Ok(true);
                 }
-                let index = store.block_index();
+                // The head's own slot is the only one the equivocation check
+                // reads, so this seeks to it rather than building the whole
+                // live index: no part of the bid is authenticated yet.
+                let index = store.block_index_at_slot(slot);
                 return fork_choice::is_proposer_equivocation(store, &index, node.root)
                     .map_err(internal);
             }

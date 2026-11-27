@@ -3331,12 +3331,13 @@ pub fn is_parent_strong(store: &Store, root: Root, config: &Config) -> Result<bo
 /// Whether `root`'s proposer has published more than one block for its slot.
 ///
 /// The specification scans every known block for one sharing `root`'s slot
-/// and proposer. `index` is not free (it is a `Store::block_index` call, a
-/// full `LiveChain` scan), but every caller here has already paid for one for
-/// its own purposes and passes that same result on, so this answers the slot
-/// half with no *further* scan, and pays for [`Store::get_signed_block`] only
-/// on the handful of blocks that actually compete at that one slot, not the
-/// whole indexed history.
+/// and proposer. `index` must hold at least every live block at `root`'s
+/// slot: the whole [`Store::block_index`], or just
+/// [`Store::block_index_at_slot`] for that slot, which the bid gossip rule
+/// passes so that an unauthenticated message never costs a full `LiveChain`
+/// scan. Either way this answers the slot half with no scan of its own, and
+/// pays for [`Store::get_signed_block`] only on the handful of blocks that
+/// actually compete at that one slot, not the whole indexed history.
 pub fn is_proposer_equivocation(
     store: &Store,
     index: &HashMap<Root, (Slot, Root)>,
