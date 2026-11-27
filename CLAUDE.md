@@ -246,7 +246,7 @@ let _timing = metrics::time_state_transition();
 **All metrics use `ethlambda_metrics::*` re-exports** — the `ethlambda-metrics` crate re-exports
 prometheus types (`IntGauge`, `IntCounter`, `Histogram`, etc.) and provides `TimingGuard` + `gather_default_metrics()`.
 
-**Naming convention:** All metrics use `lean_` prefix (e.g., `lean_head_slot`, `lean_state_transition_time_seconds`).
+**Naming convention:** Node metrics use the `lean_` prefix (e.g., `lean_head_slot`, `lean_state_transition_time_seconds`); the validator client's (`crates/validator`) use `ethlambda_validator_` (e.g., `ethlambda_validator_validators_slashed`).
 
 ### Logging Patterns
 
@@ -392,6 +392,27 @@ actual_slot = finalized_slot + 1 + relative_index
     **Known gap**: ethrex's `DiscoveryServer` cannot replace the served ENR at runtime, so its
     `eth2` entry keeps the startup digest until a restart; peers discovering the node after a
     boundary reject the record
+  - Validator custody (fulu `validator.md`; `p2p/src/beacon/validator_custody.rs`): the Beacon
+    API records every validator index named to `beacon_committee_subscriptions` and
+    `prepare_beacon_proposer` in `AttachedValidators` (`net/api`; expires after two silent
+    epochs), and the p2p actor, once an epoch, has a `spawn_blocking` task compute
+    `das::get_validators_custody_requirement` off the latest finalized state, as the spec
+    says (not the head: the record never falls, so a reorged-out branch must not raise it;
+    the balances come from the fork choice's `JustifiedBalances` snapshot for the
+    finalized checkpoint when cached, else the state it is built from (`checkpoint_state`,
+    advanced to the epoch's first slot, so both agree), which may need a rebuild, hence off
+    the actor; the outcome returns as `ValidatorCustodyComputed`). None with no attached validator in the registry, so a
+    plain follower is never raised to 8. It records the highest count in `Metadata`
+    (`Store::raise_validator_custody_count`, never lowered).
+    `beacon::startup_custody` starts the node at the larger of `--custody-group-count` and
+    that record. **The custody set is fixed per process** (`BeaconWire::custody_columns`, the
+    chain actor's, rpc's `CustodyColumns`): at runtime only `MetaData` v3's
+    `custody_group_count` rises (seq bump), never past the startup `sampling_size`, and a
+    larger requirement waits for a restart, so the node never advertises what it does not
+    hold. Same **known gap** as `eth2`: the ENR's `cgc` keeps its startup value. A start that
+    holds more groups than the directory's `CustodyRecord` moves `Status`'s
+    `earliest_available_slot` to the slot after the highest stored block (no backfill); the
+    record is written just before the chain actor spawns, so a failed start leaves it alone
   - `voluntary_exit`, `proposer_slashing`, `attester_slashing` and `bls_to_execution_change`
     validate in p2p like aggregates (`gossip::operations`, against the unadvanced head state,
     which must be electra, fulu or gloas) and feed `Store::operation_pool`; the attestation
@@ -404,7 +425,8 @@ actual_slot = finalized_slot + 1 + relative_index
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
   - Beacon adds `beacon_blocks_by_{range,root}/2` alongside its Status/Ping/MetaData/Goodbye set.
     Both serve from the checkpoint-anchored store, and `build_status` advertises it
-    (head, finalized checkpoint, and the anchor's slot as `earliest_available_slot`), so peers
+    (head, finalized checkpoint, and as `earliest_available_slot` the anchor's slot, or the
+    later slot a custody set grown at startup is complete from), so peers
     have a reason to ask. Asking runs too: a peer's Status starts a range session from the
     higher of `P2PServer::range_fetched_through` (the highest slot a range answer handed to
     the chain actor, since the store's head trails a delivered batch by the whole actor
@@ -644,11 +666,12 @@ See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults,
 
 ## Block telemetry (`crates/common/telemetry`)
 
-`--telemetry.clickhouse-url` writes Silver's `block_events` rows (one per point in a block's
-life, per data column arrival) to ClickHouse over HTTP. A global sink, installed in `run_node`
+`--telemetry.clickhouse-url` writes `block_events` rows in Silver's table layout (one per
+section start or end in a block's life, `<section>_start`/`<section>_end`, and per data column)
+to ClickHouse over HTTP. A global sink, installed in `run_node`
 before `P2P::spawn`; `ethlambda_telemetry::emit(|| ...)` builds nothing when it is off. Rows
 come from `BlockImportReport::telemetry_events` (final pass only, `imported_here`),
-`CascadeTelemetry` (arrival rows, and beacon `attestable` at the per-arrival head
+`CascadeTelemetry` (arrival rows, and beacon `fc_head_*` at the per-arrival head
 recomputation), and p2p's column rows: `column_checks::column_rows` (after the check), and
 `passed_rows` called directly by the gossip-accept path and by this node's own fulu columns. See
 [`docs/telemetry.md`](docs/telemetry.md).
@@ -987,7 +1010,14 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   unguarded. The client checks every beacon node against the chain it runs on
   (`chain_check`, `FallbackBeaconNode::establish`/`check_nodes`): the reference is
   the first node that answers at startup (startup waits, retrying every 2 s,
-  while none does), and a node whose genesis, preset, slot
+  while none does). Optional `--network` (resolved by the binary's `network`
+  module, as `beacon --network` is, into a `chain_check::ExpectedNetwork`)
+  narrows that to the first node on the named network by
+  `first_identity_difference` (preset, genesis, slot duration, genesis fork
+  version; `establish_on`), failing when every node answered off it; the fork
+  schedule is never held to it, only compared once an epoch
+  (`warn_if_schedule_differs`), so a stale binary cannot go offline at a fork.
+  A node whose genesis, preset, slot
   duration or any active fork's epoch and version differs is skipped by every call
   until a later check finds it compatible again. A background task re-asks
   every node every slot, judging and merging each answer as it arrives, at the
@@ -1182,6 +1212,10 @@ behavior.
   reloaded on resume for the unfinalized window; the PTC vote vectors are
   reseeded empty and each payload gets a verdict seeded for the execution
   client to promote. Adding them did not bump `DB_VERSION`.
+- `Metadata` keys `validator_custody_count`, `custodied_group_count` and
+  `custody_since_slot` (validator custody, see Networking) are optional rows:
+  absent in an older directory, read as nothing recorded. Adding them did not
+  bump `DB_VERSION` either.
 - A restart of a beacon data directory currently hits
   `SpecAssert("block_root in store.unrealized_justifications")` in head
   computation until lambdaclass/ethlambda#628 (persists unrealized

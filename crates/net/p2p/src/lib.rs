@@ -1564,6 +1564,17 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 genesis_validators_root: beacon.genesis_validators_root,
                 metadata_seq_number: 0,
                 custody_columns: beacon.custody_columns,
+                custody_group_count: beacon.custody_group_count,
+                custody_since_slot: beacon.custody_since_slot,
+                // The startup count's sampling size: the same computation
+                // `custody_columns` came from, so the ceiling a runtime raise
+                // respects is exactly the set this node holds.
+                validator_custody: beacon::validator_custody::ValidatorCustody::new(
+                    beacon.attached_validators,
+                    ethlambda_state_transition::beacon::das::sampling_size(
+                        beacon.custody_group_count,
+                    ),
+                ),
                 attestation_subnets: beacon.attestation_subnets,
                 sync_committee_subnets: std::collections::BTreeMap::new(),
                 metadata: MetaDataController::default(),
@@ -1723,6 +1734,7 @@ impl P2P {
         };
         let scores_peers = server.peer_scoring.is_some();
         let discovery_enabled = server.discovery.is_some();
+        let runs_validator_custody = server.wire.beacon().is_some();
         let handle = server.start();
         // At once rather than a slot in: the swarm starts on placeholder
         // topic scores, and the head's are already known.
@@ -1738,6 +1750,14 @@ impl P2P {
             handle.context(),
             p2p_protocol::LeaveExpiredAggregatorSubnets,
         );
+        // Validator custody's first check, which then keeps itself scheduled.
+        if runs_validator_custody {
+            send_after(
+                Duration::ZERO,
+                handle.context(),
+                p2p_protocol::RefreshValidatorCustody,
+            );
+        }
         // The refresh timer's first tick. A peer is first due an interval
         // after its handshake, which `peer_heads` tracks per peer.
         send_after(
@@ -2112,6 +2132,19 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn advance_fork_schedule(&self) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn refresh_peer_scoring(&self) -> Result<(), ActorError>;
+    /// Run validator custody when the wall clock has entered an epoch it has
+    /// not run in yet. Beacon only, checked once a slot; see
+    /// [`beacon::validator_custody::refresh`].
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn refresh_validator_custody(&self) -> Result<(), ActorError>;
+    /// A validator custody run's blocking task is done: act on what it
+    /// concluded. See [`beacon::validator_custody::finish`].
+    #[allow(dead_code)] // sent by the run's blocking task
+    fn validator_custody_computed(
+        &self,
+        epoch: u64,
+        run: beacon::validator_custody::CustodyRun,
+    ) -> Result<(), ActorError>;
     /// Re-ask the connected peers that are due for their `Status`; see
     /// [`peer_heads`].
     #[allow(dead_code)] // invoked via send_after, not called directly
@@ -2298,6 +2331,35 @@ impl P2PServer {
         // Riding the same once-a-slot tick: held column verdicts are
         // otherwise swept only when another is held or settled.
         beacon::deferred_columns::report_expired(self, Instant::now());
+    }
+
+    /// Check once a slot whether a new epoch's validator custody run is due.
+    /// Beacon only: never scheduled on lean.
+    #[send_handler]
+    async fn handle_refresh_validator_custody(
+        &mut self,
+        _msg: p2p_protocol::RefreshValidatorCustody,
+        ctx: &Context<Self>,
+    ) {
+        let Some(wire) = self.wire.beacon() else {
+            return;
+        };
+        let slot = Duration::from_millis(wire.config.slot_duration_ms);
+        send_after(slot, ctx.clone(), p2p_protocol::RefreshValidatorCustody);
+        beacon::validator_custody::refresh(self, ctx);
+    }
+
+    /// A validator custody run's state read and computation, done off the
+    /// actor, came back.
+    #[send_handler]
+    async fn handle_validator_custody_computed(
+        &mut self,
+        msg: p2p_protocol::ValidatorCustodyComputed,
+        _ctx: &Context<Self>,
+    ) {
+        if let Wire::Beacon(wire) = &mut self.wire {
+            beacon::validator_custody::finish(wire, msg.epoch, msg.run);
+        }
     }
 
     /// Re-ask the connected peers whose `Status` is an interval old, so the
@@ -4103,6 +4165,9 @@ pub(crate) mod test_support {
                 genesis_time: config.genesis_time,
                 genesis_validators_root: Root::ZERO,
                 custody_columns: Vec::new(),
+                custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+                custody_since_slot: 0,
+                attached_validators: Default::default(),
                 attestation_subnets: Vec::new(),
             })),
         })
@@ -4675,6 +4740,9 @@ mod tests {
                     genesis_time: config.genesis_time,
                     genesis_validators_root: Root::ZERO,
                     custody_columns: Vec::new(),
+                    custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+                    custody_since_slot: 0,
+                    attached_validators: Default::default(),
                     attestation_subnets: Vec::new(),
                 })),
             })
@@ -4815,6 +4883,9 @@ mod tests {
                     genesis_time: 0,
                     genesis_validators_root: Root::ZERO,
                     custody_columns: Vec::new(),
+                    custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+                    custody_since_slot: 0,
+                    attached_validators: Default::default(),
                     attestation_subnets: Vec::new(),
                 })),
             })
@@ -5939,6 +6010,9 @@ mod tests {
                 genesis_time: 0,
                 genesis_validators_root: Root::ZERO,
                 custody_columns: Vec::new(),
+                custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+                custody_since_slot: 0,
+                attached_validators: Default::default(),
                 attestation_subnets: Vec::new(),
             })),
         })

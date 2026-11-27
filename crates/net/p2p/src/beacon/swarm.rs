@@ -9,10 +9,11 @@
 
 use std::time::Duration;
 
+use ethlambda_network_api::AttachedValidators;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
-use ethlambda_types::beacon::primitives::{ForkDigest, Root};
+use ethlambda_types::beacon::primitives::{ForkDigest, Root, Slot};
 
 /// How long gossipsub remembers a message id, so a duplicate arriving late is
 /// dropped rather than re-forwarded.
@@ -164,6 +165,15 @@ pub struct BeaconWireConfig {
     /// node id. Both the subnet subscription and the availability check read
     /// this, so the node cannot subscribe to one set and require another.
     pub custody_columns: Vec<u64>,
+    /// The custody group count `custody_columns` was computed for, which the
+    /// ENR's `cgc` and `MetaData` v3 both advertise.
+    pub custody_group_count: u64,
+    /// The first slot from which every column in `custody_columns` is held.
+    /// See [`BeaconWire::custody_since_slot`](crate::beacon::BeaconWire).
+    pub custody_since_slot: Slot,
+    /// The validators a validator client has named to the Beacon API, which
+    /// validator custody reads once an epoch. Shared with the API's handlers.
+    pub attached_validators: AttachedValidators,
     /// The attestation subnets this node backbones, computed once at startup
     /// from the same node id.
     ///
@@ -283,6 +293,9 @@ mod tests {
                 genesis_time: 1_606_824_023,
                 genesis_validators_root: Root::ZERO,
                 custody_columns: custody_columns.clone(),
+                custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+                custody_since_slot: 0,
+                attached_validators: Default::default(),
                 attestation_subnets: Vec::new(),
             })),
         })

@@ -2943,9 +2943,11 @@ async fn handle_data_column_sidecars_by_root_request(
 /// code the specification names for exactly that peer, and the honest answer
 /// for a node that started custodying at a checkpoint rather than at genesis.
 ///
-/// The floor is where this directory's chain begins rather than the lowest
-/// slot a sidecar was actually written at, so it matches the
-/// `earliest_available_slot` this node advertises in `Status`. The two differ
+/// The floor is where this directory's chain begins, or the later slot from
+/// which a custody set grown at startup is complete, rather than the lowest
+/// slot a sidecar was actually written at: the same
+/// `earliest_available_slot` this node advertises in `Status`
+/// ([`beacon_handler::earliest_available_slot`]). The two differ
 /// only in the window between the anchor and the first column this node
 /// custodied, where a request is answered with an empty list rather than
 /// refused; a node that range-synced has already backfilled columns alongside
@@ -2971,7 +2973,10 @@ async fn handle_data_column_sidecars_by_range_request(
         return;
     }
 
-    let earliest = server.store.anchor_slot();
+    let earliest = match server.wire.beacon() {
+        Some(wire) => beacon_handler::earliest_available_slot(&server.store, wire),
+        None => server.store.anchor_slot(),
+    };
     if request.start_slot < earliest {
         debug!(
             %peer,

@@ -212,8 +212,11 @@ pub struct BlockRequest {
     /// This proposer's reveal for the slot's epoch, which the node needs
     /// before it can build a body.
     pub randao_reveal: BlsSignature,
-    /// Thirty-two bytes consensus never reads.
-    pub graffiti: Bytes32,
+    /// Thirty-two bytes consensus never reads, or `None` to send no
+    /// `graffiti` at all, so the beacon node applies its own default. 32 zero
+    /// bytes are a graffiti chosen to be empty, which a node may treat
+    /// differently.
+    pub graffiti: Option<Bytes32>,
     /// The `builder_boost_factor` to send, or `None` when builder proposals are
     /// off before gloas. `None` sends `0` and refuses a blinded answer; `Some`
     /// sends the factor and accepts one. From gloas the factor travels in
@@ -357,6 +360,9 @@ pub struct ValidatorEntry {
     pub index: ValidatorIndex,
     pub pubkey: BlsPubkey,
     pub status: String,
+    /// Whether the chain reports the validator slashed, which `status` stops
+    /// saying once it reaches `withdrawal_possible`. See [`crate::slashed`].
+    pub slashed: bool,
 }
 
 /// Whether the node saw one validator act in the epoch asked about. See
@@ -871,6 +877,20 @@ pub trait BeaconNodeApi: Send + Sync {
     /// [`health`] probe reported syncing or optimistic, and answers
     /// `Err(BeaconNodeSyncing)` when that leaves no node to ask.
     async fn head_block_root(&self) -> Result<Root>;
+
+    /// The root of the block at `slot` on the node's canonical chain, or
+    /// `None` when that chain has no block there (the endpoint's 404, or a
+    /// node answering with the last block before the slot).
+    /// `GET /eth/v1/beacon/headers/{slot}`, which the proposal check in
+    /// [`crate::performance`] reads a few slots after a block is published.
+    ///
+    /// # Contract: the answer is about `slot`, or it is an `Err`
+    ///
+    /// The header names its own slot. One at an earlier slot says the slot
+    /// is empty; one at a later slot is
+    /// [`crate::error::Error::InconsistentResponse`] rather than a root to
+    /// compare: a block after this slot says nothing about it.
+    async fn canonical_block_root(&self, slot: Slot) -> Result<Option<Root>>;
 
     /// Submit signed sync committee messages to the node's pool. Returns how
     /// many it accepted, with the same partial-success reading as

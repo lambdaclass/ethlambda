@@ -1,12 +1,17 @@
 //! `ethlambda validator`: the beacon-chain validator client.
 //!
-//! It talks to a beacon node over the standard REST Beacon API and depends on
-//! nothing else in this binary, so it runs against any conformant node.
+//! It talks to a beacon node over the standard REST Beacon API, so it runs
+//! against any conformant node. The one thing it takes from the rest of this
+//! binary is `--network`'s resolution, the same `network` module `ethlambda
+//! beacon` resolves its own `--network` with.
 
 use std::path::PathBuf;
 
 use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
+use ethlambda_validator::beacon_node::Genesis;
 use ethlambda_validator::beacon_node::fallback::BroadcastTopic;
+use ethlambda_validator::chain_check::{ChainId, ExpectedNetwork};
+use ethlambda_validator::graffiti_file::GraffitiFile;
 use ethlambda_validator::proposer_settings::{
     DEFAULT_GAS_LIMIT, GRAFFITI_BYTES, graffiti_from_text,
 };
@@ -15,6 +20,7 @@ use eyre::WrapErr as _;
 use tokio::sync::oneshot;
 use tracing::info;
 
+use crate::network::{NetworkSource, NetworkSpec};
 use crate::shutdown::ShutdownSignals;
 
 /// An execution address is exactly this wide.
@@ -32,6 +38,27 @@ pub(crate) struct ValidatorOptions {
     /// preference, not a load-balancing policy.
     #[arg(long, value_delimiter = ',', required = true)]
     pub(crate) beacon_nodes: Vec<String>,
+
+    /// The network every beacon node must be on: a built-in name (`mainnet`,
+    /// `sepolia`, `hoodi`, `plataberget`) or a path to a directory of
+    /// published network files, as `ethlambda beacon --network` takes.
+    ///
+    /// Optional, with no default. Without it the client runs on the chain of
+    /// the first beacon node that answers. With it, a node whose preset,
+    /// genesis, slot duration or genesis fork version differs from the
+    /// network's is never used. Startup fails once every configured node has
+    /// answered and none is on the network, and waits while one has not
+    /// answered. A directory is resolved whole, as for `beacon`: its
+    /// `genesis.ssz` is decoded and its bootnodes file read.
+    ///
+    /// The fork schedule still comes from the beacon nodes. One that differs
+    /// from this network's config is warned about once an epoch, never
+    /// refused, so a fork the network schedules or moves needs the beacon
+    /// nodes upgraded for the client to follow it. Nor does it pick which
+    /// node the client starts from: this binary's copy of the network's
+    /// config may be the stale side.
+    #[arg(long)]
+    pub(crate) network: Option<String>,
 
     /// Signed messages to send to every beacon node at once rather than to
     /// the first that accepts them, comma-separated: `attestations`
@@ -78,17 +105,30 @@ pub(crate) struct ValidatorOptions {
     pub(crate) metrics_port: u16,
 
     /// Text to put in the graffiti field of every block this client proposes,
-    /// unless the keymanager API gives a validator its own.
+    /// unless the keymanager API gives a validator its own. Cannot be given
+    /// with `--graffiti-file`, as in Lighthouse.
     ///
     /// At most 32 bytes once encoded as UTF-8, right-padded with zeros.
     /// Consensus never reads it.
     ///
-    /// Empty by default. An ethlambda beacon node appends its own and its
-    /// execution client's codes and commits to whatever this is, so an empty
-    /// graffiti still names both clients; other beacon nodes apply their own
-    /// policy.
-    #[arg(long, default_value = "")]
-    pub(crate) graffiti: String,
+    /// Unset by default, and then a block request carries no graffiti and the
+    /// beacon node applies its own default. An ethlambda beacon node appends
+    /// its own and its execution client's codes and commits to whatever the
+    /// graffiti is, and an absent one is empty there, so the block still names
+    /// both clients; other beacon nodes apply their own policy.
+    #[arg(long)]
+    pub(crate) graffiti: Option<String>,
+
+    /// A file of per-validator graffiti, read again before every proposal:
+    /// `default: <text>` and `<0xpubkey>: <text>` lines, Lighthouse's format.
+    ///
+    /// Read ahead of the keymanager API's per-validator graffiti: the file's
+    /// line for a validator wins, then its `default` line, then the
+    /// validator's own. Cannot be given with `--graffiti`, as in Lighthouse. A
+    /// file that does not parse refuses startup; once running, a bad read logs
+    /// a warning and the validator's own graffiti applies, else none.
+    #[arg(long, conflicts_with = "graffiti")]
+    pub(crate) graffiti_file: Option<PathBuf>,
 
     /// Execution address to receive block rewards from blocks this client
     /// proposes, as `0x`-prefixed hex, for every validator the keymanager API
@@ -222,6 +262,20 @@ pub(crate) struct ValidatorOptions {
     #[arg(long, default_value = "false")]
     pub(crate) enable_doppelganger_protection: bool,
 
+    /// Stop when the chain reports one of the loaded validators slashed, and
+    /// exit with code 3, which a supervisor should be told not to restart on
+    /// (systemd: `RestartPreventExitStatus=3`).
+    ///
+    /// Without it a slashed key is logged at error, counted in
+    /// `ethlambda_validator_validators_slashed` and given no more proposer,
+    /// attester or attestation aggregation duties (its sync committee and
+    /// payload timeliness committee duties go on), while the other keys go
+    /// on. A slashing usually means the setup
+    /// is broken (a key running in a second place, slashing protection
+    /// bypassed, a leaked key), and the keys that share it are next: do not
+    /// restart until the cause is found.
+    #[arg(long, default_value = "false")]
+    pub(crate) shut_down_when_slashed: bool,
     /// Read no beacon node's event stream: every attestation and sync
     /// committee message waits for its offset into the slot, and every
     /// payload timeliness committee vote for its deadline, even when the
@@ -235,8 +289,8 @@ pub(crate) struct ValidatorOptions {
 }
 
 impl ValidatorOptions {
-    /// The graffiti bytes, or an error naming the limit if the text is too
-    /// long.
+    /// The graffiti bytes, `None` when the flag is absent, or an error naming
+    /// the limit if the text is too long.
     ///
     /// Truncating instead would be worse than refusing: the operator asked for
     /// a string, and a silently clipped one appears in every block they
@@ -245,13 +299,17 @@ impl ValidatorOptions {
     /// Measured in bytes rather than characters, because that is what the field
     /// holds. A 32-character string of anything outside ASCII does not fit, and
     /// saying so in bytes is the only way the message helps.
-    pub(crate) fn graffiti(&self) -> eyre::Result<Bytes32> {
-        graffiti_from_text(&self.graffiti).ok_or_else(|| {
+    pub(crate) fn graffiti(&self) -> eyre::Result<Option<Bytes32>> {
+        let Some(text) = &self.graffiti else {
+            return Ok(None);
+        };
+        let graffiti = graffiti_from_text(text).ok_or_else(|| {
             eyre::eyre!(
                 "--graffiti is {} bytes encoded as UTF-8; the field holds {GRAFFITI_BYTES}",
-                self.graffiti.len()
+                text.len()
             )
-        })
+        })?;
+        Ok(Some(graffiti))
     }
 
     /// The configured fee recipient, or `None` if the operator named none.
@@ -298,6 +356,38 @@ impl ValidatorOptions {
         }
     }
 
+    /// Resolve `--network`, or `None` when it is absent.
+    ///
+    /// Must run before anything reads a preset value: resolving selects the
+    /// network's preset, as it does for `ethlambda beacon`, and the client
+    /// later refuses to start if a read froze one first
+    /// (`require_unread_preset`).
+    pub(crate) fn network(&self) -> eyre::Result<Option<ExpectedNetwork>> {
+        let Some(value) = &self.network else {
+            return Ok(None);
+        };
+        let spec = NetworkSpec::parse(value)?;
+        let source = NetworkSource::resolve(&spec)
+            .wrap_err_with(|| format!("failed to resolve --network {value}"))?;
+        let genesis = source.genesis();
+        // A directory's `config.yaml` may omit `CONFIG_NAME`; the flag's value
+        // then names the network in logs and errors instead of nothing.
+        let name = match source.name() {
+            "" => value.clone(),
+            name => name.to_string(),
+        };
+        Ok(Some(ExpectedNetwork {
+            name,
+            chain: ChainId {
+                genesis: Genesis {
+                    genesis_time: genesis.genesis_time,
+                    genesis_validators_root: genesis.genesis_validators_root,
+                },
+                config: source.config().clone(),
+            },
+        }))
+    }
+
     /// Reject a port clash before anything binds, the way the node's own
     /// options do.
     pub(crate) fn validate_ports(&self) -> eyre::Result<()> {
@@ -309,6 +399,36 @@ impl ValidatorOptions {
         }
         Ok(())
     }
+}
+
+/// Run the client until it stops, and exit with the code its reason has, when
+/// it has one of its own.
+///
+/// Only a slashed key under `--shut-down-when-slashed` has one (see
+/// [`exit_code`]). Any other failure is returned, for `main` to report and
+/// exit with 1, as every sub-command's is.
+pub(crate) fn run(options: ValidatorOptions) -> eyre::Result<()> {
+    let stopped = run_on_own_runtime(options);
+    if let Err(err) = &stopped
+        && let Some(code) = exit_code(err)
+    {
+        // Reported as `main` would report it, since `exit` never returns to
+        // `main`. The runtime is already shut down by now.
+        eprintln!("Error: {err:?}");
+        std::process::exit(code);
+    }
+    stopped
+}
+
+/// The exit code `err` stops the process with, when it has one other than
+/// the 1 every failure exits with: [`ethlambda_validator::slashed::EXIT_CODE`]
+/// for a slashed key under `--shut-down-when-slashed`.
+fn exit_code(err: &eyre::Report) -> Option<i32> {
+    let slashed = matches!(
+        err.downcast_ref::<ethlambda_validator::Error>(),
+        Some(ethlambda_validator::Error::ValidatorSlashed { .. })
+    );
+    slashed.then_some(ethlambda_validator::slashed::EXIT_CODE)
 }
 
 /// Boot its own tokio runtime and run until the process is stopped.
@@ -325,7 +445,7 @@ impl ValidatorOptions {
 ///
 /// The runtime is built here rather than by `#[tokio::main]` so its teardown
 /// is bounded (see [`RUNTIME_SHUTDOWN`]).
-pub(crate) fn run(options: ValidatorOptions) -> eyre::Result<()> {
+fn run_on_own_runtime(options: ValidatorOptions) -> eyre::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -349,7 +469,7 @@ pub(crate) fn run(options: ValidatorOptions) -> eyre::Result<()> {
 /// place, and that write takes milliseconds when the disk answers.
 const RUNTIME_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// [`run`]'s body, on the runtime it builds.
+/// [`run_on_own_runtime`]'s body, on the runtime it builds.
 async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
     // First, so that no point of startup leaves a signal its default action,
     // which for a container's PID 1 is to be ignored.
@@ -362,13 +482,22 @@ async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
     // with `EMFILE` once several signers are busy at once, and every
     // signature those requests were for fails with it.
     crate::fd_limit::raise_fd_limit().wrap_err("failed to raise RLIMIT_NOFILE")?;
+    let network = options.network()?;
     let graffiti = options.graffiti()?;
+    // Read once here, so a file every proposal would skip refuses startup,
+    // and one read more slowly than a proposal waits for is warned about.
+    let graffiti_file = options
+        .graffiti_file
+        .as_deref()
+        .map(GraffitiFile::open)
+        .transpose()?;
     let suggested_fee_recipient = options.suggested_fee_recipient()?;
     let builder = options.builder();
     let gloas_boost_factor = options.boost_factor();
     let config = ValidatorConfig {
         beacon_nodes: options.beacon_nodes,
         graffiti,
+        graffiti_file,
         suggested_fee_recipient,
         validators_dir: options.validators_dir,
         secrets_dir: options.secrets_dir,
@@ -385,7 +514,9 @@ async fn run_client(options: ValidatorOptions) -> eyre::Result<()> {
         self_build_only: options.self_build_only,
         init_slashing_protection: options.init_slashing_protection,
         doppelganger_protection: options.enable_doppelganger_protection,
+        network,
         broadcast: options.broadcast.into_iter().collect(),
+        shut_down_when_slashed: options.shut_down_when_slashed,
         event_stream: !options.disable_event_stream,
     };
     ethlambda_validator::run(config, || stop.start())
@@ -515,6 +646,7 @@ mod tests {
     fn options(graffiti: &str) -> ValidatorOptions {
         ValidatorOptions {
             beacon_nodes: vec!["http://localhost:5052".to_string()],
+            network: None,
             broadcast: Vec::new(),
             validators_dir: PathBuf::from("/tmp/validators"),
             secrets_dir: PathBuf::from("/tmp/secrets"),
@@ -522,7 +654,8 @@ mod tests {
             keymanager_port: 5062,
             keymanager_token_file: None,
             metrics_port: 5064,
-            graffiti: graffiti.to_string(),
+            graffiti: Some(graffiti.to_string()),
+            graffiti_file: None,
             suggested_fee_recipient: None,
             gas_limit: DEFAULT_GAS_LIMIT,
             enable_keymanager: false,
@@ -534,6 +667,7 @@ mod tests {
             self_build_only: false,
             init_slashing_protection: false,
             enable_doppelganger_protection: false,
+            shut_down_when_slashed: false,
             disable_event_stream: false,
         }
     }
@@ -614,6 +748,98 @@ mod tests {
         parse(&["--gas-limit", "30000000"]).expect("parses alone");
     }
 
+    /// Absent, the client takes its chain from the beacon nodes alone, as it
+    /// did before the flag existed.
+    #[test]
+    fn the_network_is_optional() {
+        let options = parse(&[]).expect("parses");
+        assert_eq!(options.network, None);
+        assert_eq!(options.network().expect("nothing to resolve"), None);
+
+        let options = parse(&["--network", "hoodi"]).expect("parses");
+        assert_eq!(options.network.as_deref(), Some("hoodi"));
+    }
+
+    /// A built-in network resolves to the genesis values and config the
+    /// beacon node runs it on, so the two are compared like for like.
+    #[test]
+    fn a_built_in_network_resolves_to_its_genesis_and_config() {
+        let mut options = options("");
+        options.network = Some("hoodi".to_string());
+        let network = options
+            .network()
+            .expect("hoodi resolves")
+            .expect("a network was named");
+
+        assert_eq!(network.name, "hoodi");
+        assert_eq!(network.chain.genesis.genesis_time, 1_742_213_400);
+        assert_eq!(
+            hex::encode(network.chain.genesis.genesis_validators_root.0),
+            "212f13fc4df078b6cb7db228f1c8307566dcecf900867401a92023d7ba99cb5f"
+        );
+        assert_eq!(network.chain.config.preset_base.as_str(), "mainnet");
+        assert_eq!(network.chain.config.slot_duration_ms, 12_000);
+        assert_eq!(
+            network.chain.config.genesis_fork_version,
+            [0x10, 0, 0x09, 0x10]
+        );
+    }
+
+    /// A network directory resolves to its own genesis state and config, and
+    /// is named by its `CONFIG_NAME`.
+    #[test]
+    fn a_network_directory_resolves_to_its_genesis_and_config() {
+        let dir = crate::network::dir::tests::complete_dir();
+        let mut options = options("");
+        options.network = Some(dir.path().display().to_string());
+        let network = options
+            .network()
+            .expect("the directory resolves")
+            .expect("a network was named");
+
+        let state = crate::beacon::mainnet_genesis_state().expect("fixture state");
+        assert_eq!(network.name, "ethlambda-devnet");
+        assert_eq!(network.chain.genesis.genesis_time, state.genesis_time());
+        assert_eq!(
+            network.chain.genesis.genesis_validators_root,
+            state.genesis_validators_root()
+        );
+        assert_eq!(network.chain.config.preset_base.as_str(), "mainnet");
+    }
+
+    /// A directory whose `config.yaml` has no `CONFIG_NAME` is named by the
+    /// flag's value, so logs and errors still say which network it is.
+    #[test]
+    fn a_network_directory_without_a_config_name_is_named_by_its_path() {
+        let dir = crate::network::dir::tests::complete_dir();
+        let config = dir.path().join("config.yaml");
+        let text = std::fs::read_to_string(&config).expect("fixture config");
+        let unnamed: String = text
+            .lines()
+            .filter(|line| !line.starts_with("CONFIG_NAME:"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(unnamed.len(), text.len(), "the fixture names itself");
+        std::fs::write(&config, unnamed).expect("rewrite config");
+
+        let value = dir.path().display().to_string();
+        let mut options = options("");
+        options.network = Some(value.clone());
+        let network = options
+            .network()
+            .expect("the directory resolves")
+            .expect("a network was named");
+        assert_eq!(network.name, value);
+    }
+
+    #[test]
+    fn an_unknown_network_name_is_refused_at_startup() {
+        let mut options = options("");
+        options.network = Some("hodi".to_string());
+        let err = options.network().expect_err("no such network");
+        assert!(err.to_string().contains("unknown network"), "{err}");
+    }
+
     /// Without the flag the token stays in `--validators-dir`. With it the path
     /// is taken as given, and, like `--keymanager-port`, accepted without
     /// `--enable-keymanager`, which is what decides whether it is read.
@@ -645,6 +871,37 @@ mod tests {
         assert!(!parse(&[]).expect("parses").enable_doppelganger_protection);
         let options = parse(&["--enable-doppelganger-protection"]).expect("parses");
         assert!(options.enable_doppelganger_protection);
+    }
+
+    /// Opt-in, as Teku's `--shut-down-when-validator-slashed-enabled` is:
+    /// without it a slashed key stops proposing and attesting and the others
+    /// go on.
+    #[test]
+    fn stopping_when_slashed_is_off_unless_asked_for() {
+        assert!(!parse(&[]).expect("parses").shut_down_when_slashed);
+        let options = parse(&["--shut-down-when-slashed"]).expect("parses");
+        assert!(options.shut_down_when_slashed);
+    }
+
+    /// The stop `--shut-down-when-slashed` makes exits with its own code, the
+    /// one `--help` and `docs/cli.md` name, and no other failure does: a
+    /// supervisor told not to restart on it must still restart on those.
+    #[test]
+    fn a_slashed_stop_exits_with_its_own_code() {
+        use ethlambda_validator::Error;
+        use ethlambda_validator::slashed::EXIT_CODE;
+
+        assert_eq!(EXIT_CODE, 3, "--help and docs/cli.md name 3");
+        let slashed = eyre::Report::from(Error::ValidatorSlashed {
+            validators: vec![22],
+        });
+        assert_eq!(exit_code(&slashed), Some(EXIT_CODE));
+
+        let detected = eyre::Report::from(Error::DoppelgangerDetected {
+            validators: vec![22],
+        });
+        assert_eq!(exit_code(&detected), None);
+        assert_eq!(exit_code(&eyre::eyre!("any other failure")), None);
     }
 
     /// Nothing is broadcast unless asked for, as in Lighthouse; topics are
@@ -799,15 +1056,30 @@ mod tests {
         .expect_err("the two say different things");
     }
 
+    /// No flag is no graffiti, so the beacon node's own default applies; an
+    /// empty one is a graffiti chosen to be empty.
     #[test]
-    fn the_default_graffiti_is_empty() {
+    fn the_graffiti_is_unset_by_default_and_an_empty_one_is_zeros() {
+        assert_eq!(parse(&[]).expect("parses").graffiti().expect("valid"), None);
         let bytes = options("").graffiti().expect("valid");
-        assert_eq!(bytes, Bytes32::ZERO);
+        assert_eq!(bytes, Some(Bytes32::ZERO));
+    }
+
+    /// Refused together, as Lighthouse refuses them: beside a file,
+    /// `--graffiti` would apply only to a validator the file has no line for
+    /// and no `default` line covers, or when a read of the file fails.
+    #[test]
+    fn a_graffiti_file_conflicts_with_the_graffiti_flag() {
+        let options = parse(&["--graffiti-file", "/tmp/g.txt"]).expect("parses");
+        assert_eq!(options.graffiti_file, Some(PathBuf::from("/tmp/g.txt")));
+        assert_eq!(parse(&[]).expect("parses").graffiti_file, None);
+        parse(&["--graffiti", "fallback", "--graffiti-file", "/tmp/g.txt"])
+            .expect_err("the two conflict");
     }
 
     #[test]
     fn graffiti_text_is_right_padded_with_zeros() {
-        let bytes = options("hello").graffiti().expect("valid");
+        let bytes = options("hello").graffiti().expect("valid").expect("set");
         assert_eq!(&bytes.0[..5], b"hello");
         assert!(
             bytes.0[5..].iter().all(|byte| *byte == 0),
@@ -819,7 +1091,7 @@ mod tests {
     fn graffiti_of_exactly_the_field_width_is_accepted() {
         let text = "a".repeat(GRAFFITI_BYTES);
         let bytes = options(&text).graffiti().expect("32 bytes fits exactly");
-        assert_eq!(bytes.0, text.as_bytes());
+        assert_eq!(bytes.expect("set").0, text.as_bytes());
     }
 
     #[test]

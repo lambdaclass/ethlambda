@@ -55,6 +55,7 @@ use crate::beacon_node::dto::{SyncDutyDto, parse_pubkey};
 use crate::beacon_node::{BeaconNodeApi, validate_sync_contribution};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
+use crate::performance::{Batch, Duty, Performance};
 use crate::signing::{SigningContext, sign_all};
 
 /// How many slots of dedup history are kept.
@@ -97,6 +98,9 @@ pub struct SyncCommitteeService<B> {
     context: Arc<SigningContext>,
     /// Which (validator, slot) pairs already produced a message signature.
     done: std::sync::Mutex<HashSet<(ValidatorIndex, Slot)>>,
+    /// Where each validator's message outcome is counted. `None` counts
+    /// nothing.
+    performance: Option<Arc<Performance>>,
 }
 
 impl<B: BeaconNodeApi> SyncCommitteeService<B> {
@@ -105,7 +109,14 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
             beacon_node,
             context,
             done: std::sync::Mutex::new(HashSet::new()),
+            performance: None,
         }
+    }
+
+    /// Count each message duty's outcome per validator in `performance`.
+    pub fn with_performance(mut self, performance: Arc<Performance>) -> Self {
+        self.performance = Some(performance);
+        self
     }
 
     /// Sign and submit this client's sync committee messages for `slot`.
@@ -119,19 +130,28 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         duties: &[SyncDutyDto],
         store: &RwLock<ValidatorStore>,
     ) -> Result<Option<Root>> {
-        if self.pending(slot, duties).is_empty() {
+        let pending = self.pending(slot, duties);
+        if pending.is_empty() {
             return Ok(None);
         }
+        // Counted from before the root is fetched: a fetch that fails, or one
+        // the duty loop drops at the end of the slot (a hung node), counts
+        // every pending duty failed.
+        let mut outcomes = self.batch(slot, &pending);
 
         let root = match self.head_block_root().await {
             Ok(root) => root,
             Err(Error::BeaconNodeSyncing) => {
+                // Not a failure: nothing may be signed over this head, so
+                // nothing is counted.
+                outcomes.skip_all();
                 warn!(%slot, "Head is optimistic or the node is syncing; not signing sync committee messages");
                 return Ok(None);
             }
             Err(err) => return Err(err),
         };
-        self.publish_messages_over(slot, duties, store, root).await
+        self.publish_counted(slot, pending, store, root, outcomes)
+            .await
     }
 
     /// The head root a message would sign, with nothing recorded and nothing
@@ -158,7 +178,34 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
         if pending.is_empty() {
             return Ok(None);
         }
+        let outcomes = self.batch(slot, &pending);
+        self.publish_counted(slot, pending, store, root, outcomes)
+            .await
+    }
 
+    /// Where the `pending` duties' outcomes at `slot` are counted.
+    fn batch(&self, slot: Slot, pending: &[&SyncDutyDto]) -> Batch {
+        Batch::new(
+            self.performance.as_ref(),
+            Duty::SyncCommitteeMessage,
+            slot,
+            pending.iter().map(|duty| duty.validator_index),
+        )
+    }
+
+    /// Sign and submit the `pending` duties' messages over `root`, counting
+    /// into `outcomes`, which the caller created for exactly those duties
+    /// before it fetched `root`. Each counts once, published or failed,
+    /// however this call ends: an early `?` or the duty loop's deadline
+    /// counts it failed.
+    async fn publish_counted(
+        &self,
+        slot: Slot,
+        pending: Vec<&SyncDutyDto>,
+        store: &RwLock<ValidatorStore>,
+        root: Root,
+        mut outcomes: Batch,
+    ) -> Result<Option<Root>> {
         // Recorded one by one, then signed all at once, each within the
         // signing budget: a hung remote signer costs only its own keys'
         // messages, not the whole batch's.
@@ -210,6 +257,8 @@ impl<B: BeaconNodeApi> SyncCommitteeService<B> {
             .beacon_node
             .submit_sync_committee_messages(&messages)
             .await?;
+        let sent: Vec<_> = messages.iter().map(|m| m.validator_index).collect();
+        outcomes.submitted(&sent, published);
         if published < submitted {
             warn!(%slot, published, submitted, "Some sync committee messages in this slot's batch were rejected");
         }

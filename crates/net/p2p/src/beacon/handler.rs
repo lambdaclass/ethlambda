@@ -18,7 +18,7 @@ use super::messages::{
     AttnetsBits, BeaconMetaData, BeaconStatus, MetaDataV1, MetaDataV2, MetaDataV3, StatusV1,
     StatusV2, SyncnetsBits,
 };
-use super::{BeaconWire, constants, protocols};
+use super::{BeaconWire, protocols};
 use crate::P2PServer;
 use crate::ReqRespProtocol;
 use crate::req_resp::Request;
@@ -61,6 +61,14 @@ pub fn build_status_v2(store: &Store, wire: &BeaconWire) -> StatusV2 {
     status_at_head(store, wire, store.beacon_head())
 }
 
+/// The first slot from which this node holds every column it custodies: the
+/// later of where its chain begins and where its custody set became complete
+/// (see [`BeaconWire::custody_since_slot`]). What `Status` v2 advertises, and
+/// the floor `DataColumnSidecarsByRange` refuses below, so the two agree.
+pub fn earliest_available_slot(store: &Store, wire: &BeaconWire) -> u64 {
+    store.anchor_slot().max(wire.custody_since_slot)
+}
+
 /// [`build_status_v2`] off a head already read through
 /// [`Store::beacon_head`]: `None` gives the all-zero `Status` of a store with
 /// no head block yet.
@@ -74,7 +82,12 @@ pub fn status_at_head(store: &Store, wire: &BeaconWire, head: Option<(u64, Root)
                 // finalization, after which the finalized slot climbs away
                 // from the anchor and would understate, by a growing margin,
                 // the range this node can still serve.
-                let earliest_available_slot = store.anchor_slot();
+                //
+                // And no earlier than its custody set is complete: a node
+                // started with more custody groups than its directory held
+                // has the new groups' columns only from then on, and nothing
+                // backfills the older ones.
+                let earliest_available_slot = earliest_available_slot(store, wire);
                 (
                     finalized.root,
                     finalized.epoch,
@@ -139,11 +152,14 @@ impl StatusVersion {
 /// `syncnets` names the sync committee subnets joined on a validator client's
 /// request (see [`BeaconWire::sync_committee_subnets`]), so it is all-zero
 /// until one asks.
-/// `custody_group_count` is `CUSTODY_REQUIREMENT`, the floor a peer may demand,
-/// not this node's actual custody: `sampling_size` raises what it stores and
-/// serves (`BeaconWire::custody_columns`) to cover at least `SAMPLES_PER_SLOT`
-/// groups, so `cgc` can only understate this node's real coverage, never
-/// overstate it.
+///
+/// `custody_group_count` is [`BeaconWire::custody_group_count`]: the count the
+/// ENR's `cgc` carries, unless validator custody has raised it since startup.
+/// It used to be `CUSTODY_REQUIREMENT` whatever `--custody-group-count` said,
+/// so a node started with a higher count told peers two different numbers.
+/// It never overstates what the node holds: `sampling_size` makes what it
+/// stores and serves (`BeaconWire::custody_columns`) cover at least the
+/// advertised count, and at least `SAMPLES_PER_SLOT` groups.
 pub fn build_metadata(wire: &BeaconWire, protocol: &str) -> Option<BeaconMetaData> {
     let seq_number = wire.metadata_seq_number;
     let attnets = attnets(wire);
@@ -162,7 +178,7 @@ pub fn build_metadata(wire: &BeaconWire, protocol: &str) -> Option<BeaconMetaDat
             seq_number,
             attnets,
             syncnets,
-            custody_group_count: constants::CUSTODY_REQUIREMENT,
+            custody_group_count: wire.custody_group_count,
         })),
         _ => None,
     }
@@ -175,6 +191,7 @@ pub(crate) fn advertised_metadata(wire: &BeaconWire) -> AdvertisedMetaData {
         seq_number: wire.metadata_seq_number,
         attnets: attnets(wire).to_ssz(),
         syncnets: syncnets(wire).to_ssz(),
+        custody_group_count: wire.custody_group_count,
     }
 }
 
@@ -266,7 +283,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::beacon::topics;
+    use crate::beacon::{constants, topics};
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::{SignedBeaconBlock, phase0};
@@ -290,6 +307,14 @@ mod tests {
             metadata_seq_number: 0,
             metadata: Default::default(),
             custody_columns: Vec::new(),
+            custody_group_count: constants::CUSTODY_REQUIREMENT,
+            custody_since_slot: 0,
+            validator_custody: crate::beacon::validator_custody::ValidatorCustody::new(
+                Default::default(),
+                ethlambda_state_transition::beacon::das::sampling_size(
+                    constants::CUSTODY_REQUIREMENT,
+                ),
+            ),
             attestation_subnets: Vec::new(),
             sync_committee_subnets: Default::default(),
         }
@@ -434,6 +459,40 @@ mod tests {
         };
         assert_eq!(v3.custody_group_count, constants::CUSTODY_REQUIREMENT);
         assert!(build_metadata(&wire, protocols::PING_V1).is_none());
+    }
+
+    /// `MetaData` v3 carries the node's own count, the one its ENR's `cgc`
+    /// carries, not `CUSTODY_REQUIREMENT` whatever the node runs with. The
+    /// Beacon API's copy reports the same count.
+    #[test]
+    fn metadata_reports_the_custody_group_count_the_node_runs_with() {
+        let mut wire = wire();
+        wire.custody_group_count = 32;
+        let Some(BeaconMetaData::V3(v3)) = build_metadata(&wire, protocols::METADATA_V3) else {
+            panic!("v3 requested");
+        };
+        assert_eq!(v3.custody_group_count, 32);
+
+        wire.publish_metadata();
+        assert_eq!(wire.metadata.get().custody_group_count, 32);
+    }
+
+    /// A custody set raised past what the directory held is complete only
+    /// from the slot it took effect at, so `Status` names that slot rather
+    /// than the anchor's; one that has been complete since before the anchor
+    /// leaves the anchor's.
+    #[test]
+    fn earliest_available_slot_waits_for_the_custody_set() {
+        let (store, anchor_slot, _) = anchored_store();
+        let mut wire = wire();
+
+        wire.custody_since_slot = anchor_slot + 100;
+        let status = build_status_v2(&store, &wire);
+        assert_eq!(status.earliest_available_slot, anchor_slot + 100);
+
+        wire.custody_since_slot = anchor_slot.saturating_sub(1);
+        let status = build_status_v2(&store, &wire);
+        assert_eq!(status.earliest_available_slot, anchor_slot);
     }
 
     #[test]
