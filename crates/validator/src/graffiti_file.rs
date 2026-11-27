@@ -58,6 +58,14 @@
 //! caller asked. At startup, [`GraffitiFile::open`] gives its read
 //! [`OPEN_TIMEOUT`] and refuses startup past it.
 //!
+//! The price of one read at a time: a read that never returns, as one of a
+//! FIFO nothing writes to or of a hung network mount does, turns the file off
+//! until it returns or the client restarts. Every caller meanwhile joins it
+//! and is given up on, so every proposal skips the file with a warning, even
+//! once the file is put right, since the stuck read is still the running one.
+//! Starting a second read beside a stuck one would end that, at the cost of a
+//! thread per stuck read; one read at a time is the choice made here.
+//!
 //! [`ProposerSettings::next_graffiti`]: crate::proposer_settings::ProposerSettings::next_graffiti
 
 use std::collections::HashMap;
