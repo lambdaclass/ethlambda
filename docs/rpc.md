@@ -732,11 +732,15 @@ which is before the chain actor has imported it; a block still unknown after
 that is a `400` (`unknown block`). The envelope must fulfill the block's bid
 (builder index and block hash), the blobs must match the bid's commitments, the
 signature must verify under `DOMAIN_BEACON_BUILDER` against the block's
-post-state, and every data column built from the blobs must verify against the
-commitments, and against the cell proofs when the blobs came in the body; any
-failure is a `400`. The cached blobs' proofs are not verified again: this node's
-own execution client computed them, and Lighthouse and Prysm publish their own
-columns unverified too. A success is `200` once the
+post-state, and every data column built from the blobs must carry one cell and
+one proof per commitment; when the blobs came in the body, its cell proofs must
+also verify against the commitments. Any failure is a `400`. The cached blobs'
+proofs are not verified here: they came from this node's own execution client
+(`engine_getPayload`'s blobs bundle), which checked them when it admitted their
+blob transactions, and Lighthouse and Prysm publish their own columns unverified
+too. They are verified once, after gossip: this node's own copy of each column
+goes through p2p's chain checks, KZG proofs included, before it is stored
+(`column_checks.rs`). A success is `200` once the
 envelope and all `NUMBER_OF_COLUMNS` gloas data column sidecars are handed to
 P2P, which gossips them together. A node that does not subscribe to a column's
 subnet publishes through gossipsub fanout.

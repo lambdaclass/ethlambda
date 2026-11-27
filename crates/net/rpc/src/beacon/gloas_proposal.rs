@@ -1172,15 +1172,19 @@ async fn post_envelope_emitting(
                 .map_err(|_| {
                     ApiError::BadRequest("the blobs and proofs do not form valid columns")
                 })?;
-            // The cell proofs of cached blobs are not verified again: this
-            // node's execution client computed them (`engine_getPayload`'s
-            // blobs bundle), and Lighthouse and Prysm trust their own when
+            // The cell proofs of cached blobs are not verified here: they came
+            // from this node's own execution client (`engine_getPayload`'s
+            // blobs bundle), which checked them when it admitted their blob
+            // transactions (EIP-7594 has the sender compute them and the node
+            // verify them), and Lighthouse and Prysm trust their own when
             // they publish. Verifying them, one batch per column, is nearly
             // all of what publishing costs: 0.5 s for one blob and 1.3 s for
             // eight on a laptop, against milliseconds to build the columns,
-            // and it held pq-devnet-0's envelopes back 1.3 to 3.4 s. Blobs
-            // sent in the body are another party's, and their proofs are
-            // still verified.
+            // and it held pq-devnet-0's envelopes back 1.3 to 3.4 s. They are
+            // still verified once, after they are gossiped: p2p puts this
+            // node's own copy of each column through the chain checks, KZG
+            // proofs included, before it is stored. Blobs sent in the body
+            // come from the caller, and their proofs are verified here.
             let verified = sidecars.iter().all(|sidecar| {
                 gloas_verify_data_column_sidecar(sidecar, &commitments)
                     && (!supplied_in_body
