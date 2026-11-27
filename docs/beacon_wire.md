@@ -451,8 +451,13 @@ A vote is parked once: its second check reports whatever it answers. One
 still parked 2.5 s after it arrived gets its first verdict, since gossipsub
 drops a message awaiting a verdict as early as 3.5 s in (6 heartbeats of
 700 ms of history). The queue holds at most 16,384 votes, lighthouse's own
-cap, since nothing about a parked vote has been verified; past it, a vote
-gets its first verdict at once. Unlike lighthouse, a vote for a block this
+cap, since nothing about a parked vote has been verified, and at most 2,048
+aggregates among them, since an aggregate's bits can reach 16 KiB before its
+signature is checked; past either, a vote gets its first verdict at once.
+Released votes are checked again on a permit pool of their own, so a big
+release takes no permit from the votes arriving meanwhile. A vote whose block
+was imported but whose state has left the cache is checked once more at once
+and not parked, since no release would come for it. Unlike lighthouse, a vote for a block this
 node has never seen does not start a lookup for that block: it waits for
 gossip or sync to bring it. See `crates/net/p2p/src/beacon/parked_votes.rs`.
 

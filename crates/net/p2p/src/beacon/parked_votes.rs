@@ -430,9 +430,10 @@ mod tests {
 
     #[test]
     fn the_deadline_leaves_room_for_a_sweep_inside_gossipsubs_window() {
-        // Gossipsub drops a message awaiting its verdict as early as five
-        // heartbeats of 700 ms after it arrived.
-        let earliest_eviction = Duration::from_millis(5 * 700);
+        // Gossipsub drops a message awaiting its verdict as early as one
+        // heartbeat short of its history after it arrived: five of 700 ms.
+        let heartbeats = u32::try_from(crate::GOSSIPSUB_HISTORY_LENGTH - 1).expect("small");
+        let earliest_eviction = crate::GOSSIPSUB_HEARTBEAT * heartbeats;
         assert!(PARKED_VOTE_DEADLINE + PARKED_VOTE_SWEEP_INTERVAL < earliest_eviction);
     }
 }

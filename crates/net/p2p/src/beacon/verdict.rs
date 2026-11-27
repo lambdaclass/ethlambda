@@ -817,7 +817,7 @@ fn spawn_recheck_batch(
             return;
         };
         let in_use = metrics::PoolInUse::new(RECHECK_POOL);
-        let task = metrics::BlockingTask::new(kind);
+        let task = metrics::BlockingTask::new(recheck_task_kind(kind));
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let _in_use = in_use;
@@ -861,6 +861,17 @@ fn recheck(store: &Store, vote: ParkedVote, now: Instant) -> GossipVerdict {
 /// The label of [`P2PServer::recheck_permits`] (see
 /// [`metrics::VALIDATION_POOLS`]).
 const RECHECK_POOL: &str = "recheck";
+
+/// The `kind` a batch of rechecked votes is timed under: its own, so the
+/// blocking-task histograms keep a batch of up to [`RECHECK_BATCH`] checks
+/// apart from the single checks of first arrivals.
+fn recheck_task_kind(kind: &'static str) -> &'static str {
+    match kind {
+        "beacon_attestation" => "beacon_attestation_recheck",
+        "beacon_aggregate_and_proof" => "beacon_aggregate_and_proof_recheck",
+        other => other,
+    }
+}
 
 /// How many released votes one blocking task checks again.
 const RECHECK_BATCH: usize = 64;
@@ -971,20 +982,26 @@ pub(crate) fn spawn_stateful_checks(
         let _in_use = in_use;
         let _run = task.start();
         let mut object = object;
-        let mut outcome = guarded(|| object.stateful_checks(&store));
         let mut parkable = true;
-        // A missing post-state means the block is still importing only when
-        // it has no stored state either. With one, it was imported: its state
-        // left the cache since, and no release will come for it, or it landed
-        // while this check ran, and its release may already be gone. Either
-        // way the vote is checked once more now and not parked.
-        if outcome == Outcome::Ignore(IgnoreReason::StateUnavailable)
-            && parkable_root(&object, outcome)
-                .is_some_and(|root| store.has_state(&root).unwrap_or(false))
-        {
-            outcome = guarded(|| object.stateful_checks(&store));
+        // One `guarded` around the probe too: `has_state` panics, rather
+        // than returning an error, on a storage failure.
+        let outcome = guarded(|| {
+            let outcome = object.stateful_checks(&store);
+            // A missing post-state means the block is still importing only
+            // when it has no stored state either. With one, it was imported:
+            // its state left the cache since, and no release will come for
+            // it, or it landed while this check ran, and its release may
+            // already be gone. Either way the vote is checked once more now
+            // and not parked.
+            let imported = outcome == Outcome::Ignore(IgnoreReason::StateUnavailable)
+                && parkable_root(&object, outcome)
+                    .is_some_and(|root| store.has_state(&root).is_ok_and(|stored| stored));
+            if !imported {
+                return outcome;
+            }
             parkable = false;
-        }
+            object.stateful_checks(&store)
+        });
         let _ = actor
             .send(GossipVerdict {
                 id,

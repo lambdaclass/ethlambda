@@ -295,6 +295,14 @@ const ATTESTATION_VALIDATION_PERMITS: usize = 128;
 /// than failing without one.
 const RECHECK_PERMITS: usize = 32;
 
+/// Gossipsub's heartbeat. With [`GOSSIPSUB_HISTORY_LENGTH`] it bounds how long
+/// gossipsub holds a message awaiting its verdict, which parked votes must
+/// stay inside (see `beacon::parked_votes`).
+pub(crate) const GOSSIPSUB_HEARTBEAT: Duration = Duration::from_millis(700);
+
+/// How many heartbeats of message history gossipsub keeps.
+pub(crate) const GOSSIPSUB_HISTORY_LENGTH: usize = 6;
+
 /// How many `execution_payload_bid` and `proposer_preferences` stateful checks
 /// may run at once. A pool of its own, so a burst of bids (each costs a BLS
 /// verification) cannot starve blocks, columns or attestations of permits.
@@ -1237,9 +1245,9 @@ pub(crate) fn gossipsub_config(
         .mesh_n_high(12)
         // d_lazy
         .gossip_lazy(6)
-        .heartbeat_interval(Duration::from_millis(700))
+        .heartbeat_interval(GOSSIPSUB_HEARTBEAT)
         .fanout_ttl(Duration::from_secs(60))
-        .history_length(6)
+        .history_length(GOSSIPSUB_HISTORY_LENGTH)
         .history_gossip(3)
         .prune_backoff(PRUNE_BACKOFF)
         .unsubscribe_backoff(PRUNE_BACKOFF)
