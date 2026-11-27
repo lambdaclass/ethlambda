@@ -1363,15 +1363,14 @@ warns only at the first of a run of failed reads, so a client polling it does
 not repeat the warning. A read that takes longer than 250 ms is given up on
 the same way, so a stalled mount cannot cost a proposal its slot; the read
 runs alongside the RANDAO signature, so it adds nothing when that takes as
-long. Each read runs on a thread of its own, at most four at once, so a
-stalled file holds four threads at most and never the ones slashing
-protection runs on. A UTF-8 byte-order mark at the start of the file is
-ignored.
+long. Each read runs on a thread of its own, and only one runs at a time: a
+proposal or `GET graffiti` that comes while one runs takes that read's answer
+rather than starting another. So a stalled file holds one thread, and never
+one slashing protection runs on. A UTF-8 byte-order mark at the start of the
+file is ignored.
 
-Two things differ from Lighthouse besides the reload. `--graffiti-file` and
-`--graffiti` may be given together, since the flag is where the file's misses
-fall through to. And the keymanager API's graffiti routes stay open while the
-file is set: a `POST graffiti` is written to `validator_definitions.yml` and
+One thing differs from Lighthouse besides the reload: the keymanager API's
+graffiti routes stay open while the file is set: a `POST graffiti` is written to `validator_definitions.yml` and
 applied as usual, and shows in proposals and in `GET graffiti` whenever the
 file names neither the key nor a `default`. Until then `GET graffiti` keeps
 answering the file's text, since that is what the next proposal carries.
