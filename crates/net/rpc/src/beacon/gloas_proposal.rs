@@ -1026,7 +1026,8 @@ async fn wait_for_block(
 /// from the body (`Eth-Blob-Data-Included: true`) or from what
 /// `produceBlockV4` cached (`false`). The data columns are built from the
 /// blobs, checked against the bid's commitments, and gossiped with the
-/// envelope.
+/// envelope. Their cell proofs are verified only when the blobs came in the
+/// body: cached ones are this node's own execution client's (see the check).
 async fn post_envelope(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
@@ -1136,6 +1137,7 @@ async fn post_envelope_emitting(
             .into_response();
     }
 
+    let supplied_in_body = supplied.is_some();
     let (blobs, cell_proofs) = match supplied {
         Some(supplied) => supplied,
         None => match cache.get(block_slot, block_root) {
@@ -1170,10 +1172,20 @@ async fn post_envelope_emitting(
                 .map_err(|_| {
                     ApiError::BadRequest("the blobs and proofs do not form valid columns")
                 })?;
+            // The cell proofs of cached blobs are not verified again: this
+            // node's execution client computed them (`engine_getPayload`'s
+            // blobs bundle), and Lighthouse and Prysm trust their own when
+            // they publish. Verifying them, one batch per column, is nearly
+            // all of what publishing costs: 0.5 s for one blob and 1.3 s for
+            // eight on a laptop, against milliseconds to build the columns,
+            // and it held pq-devnet-0's envelopes back 1.3 to 3.4 s. Blobs
+            // sent in the body are another party's, and their proofs are
+            // still verified.
             let verified = sidecars.iter().all(|sidecar| {
                 gloas_verify_data_column_sidecar(sidecar, &commitments)
-                    && gloas_verify_data_column_sidecar_kzg_proofs(sidecar, &commitments)
-                        .unwrap_or(false)
+                    && (!supplied_in_body
+                        || gloas_verify_data_column_sidecar_kzg_proofs(sidecar, &commitments)
+                            .unwrap_or(false))
             });
             if !verified {
                 return Err(ApiError::BadRequest(
@@ -2054,7 +2066,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_envelope_with_blobs_gossips_every_column_and_a_tampered_blob_is_refused() {
+    async fn an_envelope_with_blobs_gossips_every_column_and_verifies_only_blobs_in_the_body() {
         let WithBlob {
             state,
             produced,
@@ -2130,12 +2142,34 @@ mod tests {
             CachedPayload {
                 envelope: produced.envelope.clone(),
                 blobs: vec![blob],
-                cell_proofs: proofs,
+                cell_proofs: proofs.clone(),
             },
         );
         let response = post_envelope_waiting(&store, &p2p, &cache, &headers, &body, wait).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(rejected.envelopes.lock().unwrap().len(), 1);
+
+        // A cached blob is this node's execution client's: its proofs are not
+        // verified again, so even the tampered one is gossiped as built.
+        let trusted = Arc::new(RecordingNetwork::default());
+        let p2p: RpcToP2PRef = trusted.clone();
+        let cache = PayloadCache::default();
+        cache.insert(
+            produced.block.slot,
+            root,
+            CachedPayload {
+                envelope: produced.envelope.clone(),
+                blobs: vec![tampered],
+                cell_proofs: proofs,
+            },
+        );
+        let response = post_envelope_waiting(&store, &p2p, &cache, &headers, &body, wait).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let published = trusted.envelopes.lock().unwrap();
+        assert_eq!(
+            published[0].1.len(),
+            ethlambda_types::beacon::preset::NUMBER_OF_COLUMNS
+        );
     }
 }
 

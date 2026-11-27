@@ -733,7 +733,10 @@ that is a `400` (`unknown block`). The envelope must fulfill the block's bid
 (builder index and block hash), the blobs must match the bid's commitments, the
 signature must verify under `DOMAIN_BEACON_BUILDER` against the block's
 post-state, and every data column built from the blobs must verify against the
-commitments and cell proofs; any failure is a `400`. A success is `200` once the
+commitments, and against the cell proofs when the blobs came in the body; any
+failure is a `400`. The cached blobs' proofs are not verified again: this node's
+own execution client computed them, and Lighthouse and Prysm publish their own
+columns unverified too. A success is `200` once the
 envelope and all `NUMBER_OF_COLUMNS` gloas data column sidecars are handed to
 P2P, which gossips them together. A node that does not subscribe to a column's
 subnet publishes through gossipsub fanout.
