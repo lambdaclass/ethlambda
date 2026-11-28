@@ -3841,11 +3841,31 @@ impl BlockChainServer {
         metrics::set_blocks_held_for_columns(self.blocks_awaiting_columns.len() as u64);
     }
 
-    /// Recursively discard a block and all its pending descendants.
+    /// Discard a block and all its pending descendants.
     ///
     /// Used when a block is rejected (e.g., at/below finalized slot) to clean up
     /// children that would otherwise remain stuck in the pending maps indefinitely.
+    ///
+    /// Walks the subtree with an explicit stack, like
+    /// `fork_choice::invalidate_subtree`: nothing bounds how deep a pending
+    /// chain gets, and recursing once per descendant could overflow the chain
+    /// actor's stack.
     pub(crate) fn discard_pending_subtree(&mut self, block_root: H256) {
+        let mut stack = vec![block_root];
+        while let Some(root) = stack.pop() {
+            if let Some(child_roots) = self.discard_pending_block(root) {
+                for child_root in &child_roots {
+                    self.pending_block_parents.remove(child_root);
+                }
+                stack.extend(child_roots);
+            }
+        }
+    }
+
+    /// The per-block part of [`Self::discard_pending_subtree`]: forget
+    /// `block_root` everywhere it may be held, and hand back its pending
+    /// children, if it had any.
+    fn discard_pending_block(&mut self, block_root: H256) -> Option<HashSet<H256>> {
         // A block held for its custody columns already had a known parent
         // when it was held (see `hold_block_for_columns`), so it carries no
         // entry of its own in `pending_blocks` and would not be reached by
@@ -3867,13 +3887,7 @@ impl BlockChainServer {
         // keeps `held_timings` from outliving the blocks it describes.
         self.held_timings.remove(&block_root);
 
-        let Some(child_roots) = self.pending_blocks.remove(&block_root) else {
-            return;
-        };
-        for child_root in child_roots {
-            self.pending_block_parents.remove(&child_root);
-            self.discard_pending_subtree(child_root);
-        }
+        self.pending_blocks.remove(&block_root)
     }
 
     /// Drop every held block whose slot is now at or below the finalized
@@ -5562,6 +5576,85 @@ mod tests {
     /// store on, so `block_timeliness` saw zero milliseconds into the slot and
     /// called every current-slot block timely. Advancing the clock to the
     /// arrival puts the store past the deadline that verdict is read against.
+    /// Discarding the root of a deep pending chain, on a thread with the
+    /// stack `std::thread::spawn` gives by default, which is what the chain
+    /// actor's thread runs on.
+    ///
+    /// A discard that recursed once per descendant overflowed that stack long
+    /// before this depth. A stack overflow aborts the whole test binary rather
+    /// than failing this test alone, so a run that loses every test at once
+    /// points here.
+    #[test]
+    fn discarding_a_deep_pending_chain_does_not_overflow_a_default_stack() {
+        const DEPTH: u64 = 100_000;
+        // `std::thread`'s documented default, unless `RUST_MIN_STACK` says
+        // otherwise. Set explicitly so the environment cannot hide a
+        // regression.
+        const DEFAULT_THREAD_STACK: usize = 2 * 1024 * 1024;
+
+        let discard = std::thread::Builder::new()
+            .name("deep-pending-discard".into())
+            .stack_size(DEFAULT_THREAD_STACK)
+            .spawn(|| {
+                let root = |n: u64| {
+                    let mut bytes = [0u8; 32];
+                    bytes[..8].copy_from_slice(&n.to_be_bytes());
+                    H256(bytes)
+                };
+                let mut server = beacon_server(beacon_store_at_slot_10());
+                // One chain, each block pending on the one before it, the
+                // shape `process_or_pend_block` leaves behind a missing parent.
+                for n in 0..DEPTH {
+                    let (parent, child) = (root(n), root(n + 1));
+                    server.pending_blocks.insert(parent, HashSet::from([child]));
+                    server.pending_block_parents.insert(child, parent);
+                }
+
+                server.discard_pending_subtree(root(0));
+
+                (
+                    server.pending_blocks.len(),
+                    server.pending_block_parents.len(),
+                )
+            })
+            .expect("spawns the discard thread");
+
+        let (pending_blocks, pending_block_parents) =
+            discard.join().expect("the discard thread does not panic");
+        assert_eq!(pending_blocks, 0, "every pending block is discarded");
+        assert_eq!(pending_block_parents, 0, "every parent link is dropped");
+    }
+
+    /// A branching subtree goes in full, children of every branch included,
+    /// and a pending chain hanging off another root is left alone.
+    #[test]
+    fn discarding_a_subtree_leaves_unrelated_pending_blocks() {
+        let mut server = beacon_server(beacon_store_at_slot_10());
+        let [root, left, right, grandchild, other, other_child] =
+            [1, 2, 3, 4, 5, 6].map(H256::repeat_byte);
+        let edges = [
+            (root, left),
+            (root, right),
+            (right, grandchild),
+            (other, other_child),
+        ];
+        for (parent, child) in edges {
+            server
+                .pending_blocks
+                .entry(parent)
+                .or_default()
+                .insert(child);
+            server.pending_block_parents.insert(child, parent);
+        }
+
+        server.discard_pending_subtree(root);
+
+        let pending: HashSet<_> = server.pending_blocks.keys().copied().collect();
+        assert_eq!(pending, HashSet::from([other]));
+        let children: HashSet<_> = server.pending_block_parents.keys().copied().collect();
+        assert_eq!(children, HashSet::from([other_child]));
+    }
+
     #[test]
     fn a_late_arrival_moves_the_store_clock_past_the_attestation_deadline() {
         let mut server = beacon_server(beacon_store_at_slot_10());
