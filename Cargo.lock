@@ -3884,7 +3884,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "clap",
  "ethlambda-blockchain",
@@ -3926,7 +3926,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-blockchain"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "datatest-stable",
  "ethlambda-crypto",
@@ -3954,7 +3954,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-crypto"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "blst",
  "ethlambda-metrics",
@@ -3971,7 +3971,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-engine"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3993,7 +3993,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-ethrex"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "axum 0.8.9",
  "bytes",
@@ -4018,14 +4018,14 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-fork-choice"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "ethlambda-types",
 ]
 
 [[package]]
 name = "ethlambda-metrics"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "prometheus",
  "thiserror 2.0.18",
@@ -4033,7 +4033,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-network-api"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "ethlambda-types",
  "spawned-concurrency",
@@ -4041,7 +4041,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-p2p"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "either",
  "ethlambda-metrics",
@@ -4075,7 +4075,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-rpc"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "axum 0.8.9",
  "bs58",
@@ -4109,7 +4109,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-ssz-tree"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
@@ -4122,7 +4122,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-state-transition"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "blst",
  "c-kzg",
@@ -4154,7 +4154,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-storage"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "blst",
  "ethlambda-crypto",
@@ -4175,7 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-telemetry"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "axum 0.8.9",
  "ethlambda-metrics",
@@ -4189,7 +4189,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-test-fixtures"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "ethlambda-state-transition",
  "ethlambda-types",
@@ -4202,7 +4202,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-types"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "datatest-stable",
  "ethlambda-ssz-tree",
@@ -4223,7 +4223,7 @@ dependencies = [
 
 [[package]]
 name = "ethlambda-validator"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "aes",
  "async-trait",
