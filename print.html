@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c85cf60d.js";
+            window.path_to_searchindex_js = "searchindex-cab15cc6.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-26bf4b2e.js"></script>
@@ -4605,6 +4605,12 @@ body.</p>
 <pre><code class="language-bash">cargo build --release --features include-ethrex
 docker build --build-arg FEATURES=include-ethrex -t ethlambda:ethrex .
 </code></pre>
+<p>Every release artifact is this build, and has a <code>-minimal</code> twin without ethrex:
+the binaries <code>ethlambda-&lt;platform&gt;</code> and <code>ethlambda-minimal-&lt;platform&gt;</code>, the
+images <code>ghcr.io/lambdaclass/ethlambda:&lt;tag&gt;</code> and <code>&lt;tag&gt;-minimal</code>, and the
+Homebrew formulas <code>ethlambda</code> and <code>ethlambda-minimal</code> (see
+<a href="https://github.com/lambdaclass/ethlambda/blob/main/RELEASE.md#release-binaries"><code>RELEASE.md</code></a>).
+Up to v1.0.0, every artifact was the build without ethrex.</p>
 <h2 id="choosing-the-execution-client"><a class="header" href="#choosing-the-execution-client">Choosing the execution client</a></h2>
 <div class="table-wrapper">
 <table>
